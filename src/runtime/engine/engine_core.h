@@ -304,9 +304,25 @@ public:
         return Submission(*this, std::move(request));
     }
 
+    // The gauges a monitor reads, from the copy the worker published with the stats.
+    //
+    // This used to take execution_mutex_, which the worker holds for a whole execution round. A
+    // long prefill runs many chunks inside ONE round, so /monitor/snapshot answered only after it
+    // finished: measured 4.4 s in a 6.0 s prefill round, and a 163k-token prompt (~108 s) made the
+    // console's 1 Hz poll time out, which it drew as a gap in the curve. The numbers were already
+    // stale-by-design (a 1 Hz poll of a 5 s stats interval), so reading the published copy costs
+    // nothing a reader had before and never waits for the GPU work.
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.program->memory_summary();
+        MemorySummary out;
+        bool published = false;
+        {
+            std::lock_guard lock(stats_mutex_);
+            published = memory_published_;
+            if (published) { out = published_memory_; }
+        }
+        // Before the first publication (a monitor poll between construction and the first round)
+        // there is no copy yet; the engine cannot be busy then, so the live read cannot block.
+        if (!published) { out = instance_.program->memory_summary(); }
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
         // 13.4: the program reports the pool's LIVE edge (a runtime shrink/grow moves it); the
@@ -3868,6 +3884,10 @@ private:
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
     std::vector<RequestSnapshot> published_requests_;
+    // The memory gauges published with published_stats_ (see memory_summary). Written by the
+    // worker at publication, read by the monitor threads under stats_mutex_.
+    MemorySummary published_memory_;
+    bool memory_published_ = false;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

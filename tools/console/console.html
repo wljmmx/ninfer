@@ -1502,7 +1502,8 @@ function renderFleetLive(){
 
   const alerts = [];
   if (!ENGINE.ready) alerts.push('引擎状态 ' + (((ENGINE.snap || {}).engine || {}).status || '?') + '：暂不接受工作');
-  if (ENGINE.health && ENGINE.health.gaps) alerts.push('引擎采样 gap ' + ENGINE.health.gaps + ' 段（断线期间曲线分段，未插值）');
+  if (ENGINE.health && ENGINE.health.gaps) alerts.push('引擎采样 gap ' + ENGINE.health.gaps + ' 段（断线期间曲线分段，未插值）' +
+    (ENGINE.health.gap_reason ? ' · 最近一次：' + ENGINE.health.gap_reason : ''));
   if (ENGINE.health && ENGINE.health.event_ok === false) alerts.push('事件流断开：' + ENGINE.health.event_reason);
   if (rt.waiting_requests) alerts.push('等待准入请求 ' + rt.waiting_requests + ' 个');
   if (GPU.ok && GPU.cur){

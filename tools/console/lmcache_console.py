@@ -313,10 +313,17 @@ class EngineCollector:
     EVENT_TAIL = 64      # events handed to the page per poll
     INFO_EVERY = 1.0     # /monitor/info is static; still polled at the same 1 Hz cadence
     WINDOW = 5.0         # engine's own throughput log uses a 5 s interval
-    # A single missed poll is normal (a 2.5 s timeout, a busy control path). Breaking on it used
-    # to cost more than the miss: _failed clears the rate history, so the next success needed a
-    # full 5 s window again - one lost sample became a 6-7 s hole in the curve.
-    FAILURES_BEFORE_BREAK = 2
+    # A single missed poll is normal (a busy control path). Breaking on it used to cost more than
+    # the miss: _failed clears the rate history, so the next success needed a full 5 s window
+    # again - one lost sample became a 6-7 s hole in the curve.
+    FAILURES_BEFORE_BREAK = 3
+    # /monitor/snapshot copies published counters and answers in single-digit milliseconds on an
+    # idle engine, but it used to queue behind the worker's whole execution round: measured 4.4 s
+    # inside a 6.0 s prefill and ~100 s for a 163k-token prompt. A 2.5 s budget turned that into a
+    # false "engine down" and a blank block in the curve. The engine now publishes the gauges with
+    # the stats (EngineCore::memory_summary), so this budget is a real timeout again - long enough
+    # to absorb a stalled control path, short enough that three of them still fit in one 12 s gap.
+    SNAPSHOT_TIMEOUT = 4.0
 
     def __init__(self, base: str, interval: float = 1.0, api_key: str | None = None):
         self.base = base.rstrip("/")
@@ -335,6 +342,8 @@ class EngineCollector:
         self.failures = 0
         self.ok = False
         self.reason = "尚未采样"
+        self.last_gap_reason = ""
+        self.last_gap_reason = ""
         self.gaps = 0
         self.gap_seconds = 0.0
         self.last_success = 0.0
@@ -383,7 +392,9 @@ class EngineCollector:
         while not self._stop.is_set():
             at = time.monotonic()
             try:
-                snapshot = self._get_json("/monitor/snapshot")
+                # The engine publishes the memory gauges with the stats, so this read no longer
+                # waits for the execution round (see SNAPSHOT_TIMEOUT).
+                snapshot = self._get_json("/monitor/snapshot", timeout=self.SNAPSHOT_TIMEOUT)
                 if not isinstance(snapshot, dict):
                     raise ValueError("snapshot is not an object")
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
@@ -543,6 +554,7 @@ class EngineCollector:
                 "recent_ttft_ms": self._recent_ttft_ms(),
                 "health": {"samples": self.samples, "failures": self.failures,
                            "gaps": self.gaps, "gap_seconds": round(self.gap_seconds, 1),
+                           "gap_reason": self.last_gap_reason or None,
                            "last_success_seconds_ago":
                                round(time.monotonic() - self.last_success, 1)
                                if self.last_success else None,
@@ -575,6 +587,7 @@ class EngineCollector:
     def _failed(self, reason: str, at: float) -> None:
         self.failures += 1
         self.reason = reason
+        self.last_gap_reason = reason
         if self.failures < self.FAILURES_BEFORE_BREAK:
             # One miss: keep the last good payload (ok stays true, counters stay put) so the page
             # holds the previous point. The health block is refreshed on the held copy, so
@@ -616,6 +629,7 @@ class EngineCollector:
                 "recent_ttft_ms": [],
                 "health": {"samples": self.samples, "failures": self.failures,
                            "gaps": self.gaps, "gap_seconds": round(self.gap_seconds, 1),
+                           "gap_reason": self.last_gap_reason or None,
                            "last_success_seconds_ago":
                                round(time.monotonic() - self.last_success, 1)
                                if self.last_success else None,

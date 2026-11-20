@@ -265,9 +265,15 @@ void EngineCore<Instance>::publish_runtime_stats() {
     phase_range.reset();
     finish_engine_phase(measurement, EngineHostPhase::Maintenance);
     snapshot.host_work = cumulative_stats_.host_work;
+    // The monitor's memory gauges ride the same publication. Taken on the worker, where
+    // program::memory_summary is a plain struct copy of single-writer state, so /monitor/snapshot
+    // never has to queue behind an execution round (see EngineCore::memory_summary).
+    const MemorySummary memory = instance_.program->memory_summary();
     std::lock_guard lock(stats_mutex_);
     published_stats_    = snapshot;
     published_requests_ = std::move(rows);
+    published_memory_   = memory;
+    memory_published_   = true;
 }
 
 template <class Instance>
