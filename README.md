@@ -5,14 +5,16 @@
 **English** · [简体中文](README.zh-CN.md)
 
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
-single NVIDIA GeForce RTX 5090 (Blackwell, `sm_120a`) or RTX 4090 (Ada, `sm_89`). It runs text,
-image, and video prompts through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The
-runtime is deliberately specialized: one GPU, one resident model, and one to eight execution
-lanes fixed at startup.
+single NVIDIA GeForce RTX 5090 (Blackwell, `sm_120a`) or RTX 4090 (Ada, `sm_89`); the RTX 2080 Ti
+(Turing, `sm_75`) target is wired into the build system, runtime gate, and presets on the
+`sm75-2080ti` branch, with the Turing kernel port in progress. It runs text, image, and video
+prompts through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is
+deliberately specialized: one GPU, one resident model, and one to eight execution lanes fixed at
+startup.
 
 Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4; on
-RTX 4090 load the groupwise-int artifact instead (`qwen3_8_27b.ninfer`), because NVFP4 tensor
-core paths are Blackwell-only.
+RTX 4090 or RTX 2080 Ti load the groupwise-int artifact instead (`qwen3_8_27b.ninfer`),
+because NVFP4 tensor core paths are Blackwell-only.
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|
@@ -75,7 +77,8 @@ The Windows RTX 4090 line ships as a source build **and** a runnable release fol
 
 ## Quick start
 
-NInfer runs on two single-GPU targets:
+NInfer runs on two single-GPU targets, with a third in progress on the `sm75-2080ti`
+branch:
 
 - **RTX 5090 (Blackwell, `sm_120a`)** — 64-bit Linux (validated) and the full format matrix,
   including NVFP4 weights and NVFP4 KV.
@@ -85,12 +88,21 @@ NInfer runs on two single-GPU targets:
   (rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, rk4v2-e8). The measured per-layout table is in
   docs/zh-CN/kv-cache-and-eviction.md. NVFP4 weights and NVFP4 KV require Blackwell tensor
   cores and are rejected with an explicit error; load a groupwise-int artifact on RTX 4090.
+- **RTX 2080 Ti (Turing, `sm_75`)** — in progress on the `sm75-2080ti` branch: the
+  `rtx2080ti` build target, the `win-2080ti-release` preset, and the runtime capability
+  gate are landed, but the Turing tensor-core kernel port is not complete (Turing has no
+  BF16/FP8 tensor cores or `cp.async`). Selecting the target fails configure with an
+  explicit guard until the port lands; the gap analysis and work items are in
+  [docs/maintainer/sm75-port-plan.md](docs/maintainer/sm75-port-plan.md). When complete it
+  will run the same paths as the RTX 4090 target, with the groupwise-int artifact as the
+  primary 2080 Ti artifact (22 GB card).
 
-Both targets need a CUDA toolkit of 12.8 or newer that supports the selected architecture,
-CMake 3.28 or newer, a C++20 host compiler, Ninja, FFmpeg development libraries (`libavformat`,
-`libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`. CUDA 13.1 is the validated
-development toolkit for `sm_120a`; CUDA 13.x is validated for `sm_89`. The build accepts only
-`CMAKE_CUDA_ARCHITECTURES=89` or `120a` (default `89`).
+The shipped targets need a CUDA toolkit of 12.8 or newer that supports the selected
+architecture, CMake 3.28 or newer, a C++20 host compiler, Ninja, FFmpeg development
+libraries (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
+CUDA 13.1 is the validated development toolkit for `sm_120a`; CUDA 13.x is validated for
+`sm_89`. The build accepts `CMAKE_CUDA_ARCHITECTURES=89` or `120a` (default `89`); the
+`rtx2080ti` preset additionally selects `75` while the port is in progress.
 
 Build the product binaries:
 
@@ -126,8 +138,10 @@ cmake ... -DFFMPEG_INCLUDE_DIRS=<ffmpeg>/include `
 
 Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
 the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
-Python 3 interpreter. The `win-release` / `win-dev` presets select the RTX 4090 MSVC layout.
-Both presets use `build/` (or `build-win/`) and explicitly reset the build options.
+Python 3 interpreter. The `win-release` / `win-dev` presets select the RTX 4090 MSVC layout,
+`win-2080ti-release` the RTX 2080 Ti layout, and `win-5090-release` the RTX 5090 layout.
+The presets use `build/` (or `build-win/`, `build-win-2080ti/`, `build-win-5090/`) and
+explicitly reset the build options.
 Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
 See [build organization and configuration](docs/maintainer/build-system.md) for details.
 

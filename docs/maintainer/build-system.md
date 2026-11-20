@@ -1,7 +1,8 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+The supported architectures are `sm_120a`, `sm_89` and `sm_75`; CUDA 13.1 is the validated
+development toolkit.
 Product commands and prerequisites are in the
 [README](../../README.md#quick-start); test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
@@ -34,7 +35,12 @@ media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`
 The checked-in `CMakePresets.json` provides:
 
 - `release`: Release product binaries, tests and benchmarks disabled;
-- `dev`: Release products, tests and benchmarks enabled;
+- `win-release`: Windows MSVC RTX 4090 (sm_89) build;
+- `win-2080ti-release`: Windows MSVC RTX 2080 Ti (sm_75) build — skeleton target on
+  the `sm75-2080ti` branch, configure fails with an explicit guard until the Turing
+  kernel port lands (see [sm75-port-plan.md](sm75-port-plan.md));
+- `win-5090-release`: Windows MSVC RTX 5090 (sm_120a) build;
+- `dev` / `win-dev`: the same targets with tests and benchmarks enabled;
 - matching build presets and a `dev` test preset with failure output enabled.
 
 Both configure presets use `build/`. Switching between them explicitly resets all three build

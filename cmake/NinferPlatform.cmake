@@ -1,28 +1,49 @@
 # Build-target selection, adapted from upstream's separate per-device targets
-# (upstream 8ed68325 splits rtx5090 and dgx_spark). This tree ships the two
-# single-GPU Windows targets instead: RTX 4090 class Ada (sm_89) and RTX 5090
-# class Blackwell (sm_120a). There is no DGX Spark target here.
+# (upstream 8ed68325 splits rtx5090 and dgx_spark). This tree ships the three
+# single-GPU Windows targets instead: RTX 4090 class Ada (sm_89), RTX 5090
+# class Blackwell (sm_120a), and RTX 2080 Ti class Turing (sm_75). There is no
+# DGX Spark target here.
 
 # Honour an explicit architecture so existing configure lines keep working.
 if(NOT DEFINED NINFER_TARGET)
   if(DEFINED CMAKE_CUDA_ARCHITECTURES AND CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
     set(_ninfer_target_from_arch rtx5090)
+  elseif(DEFINED CMAKE_CUDA_ARCHITECTURES AND CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+    set(_ninfer_target_from_arch rtx2080ti)
   else()
     set(_ninfer_target_from_arch rtx4090)
   endif()
   set(NINFER_TARGET ${_ninfer_target_from_arch} CACHE STRING "NInfer execution target")
   unset(_ninfer_target_from_arch)
 endif()
-set_property(CACHE NINFER_TARGET PROPERTY STRINGS rtx4090 rtx5090)
+set_property(CACHE NINFER_TARGET PROPERTY STRINGS rtx4090 rtx2080ti rtx5090)
 
 if(NINFER_TARGET STREQUAL "rtx4090")
   set(NINFER_CUDA_ARCHITECTURE 89)
+elseif(NINFER_TARGET STREQUAL "rtx2080ti")
+  set(NINFER_CUDA_ARCHITECTURE 75)
 elseif(NINFER_TARGET STREQUAL "rtx5090")
   set(NINFER_CUDA_ARCHITECTURE 120a)
 else()
   message(FATAL_ERROR
-    "Unknown NINFER_TARGET '${NINFER_TARGET}'; NInfer supports rtx4090 (sm_89, Ada) "
-    "and rtx5090 (sm_120a, Blackwell)")
+    "Unknown NINFER_TARGET '${NINFER_TARGET}'; NInfer supports rtx4090 (sm_89, Ada), "
+    "rtx2080ti (sm_75, Turing) and rtx5090 (sm_120a, Blackwell)")
+endif()
+
+# The rtx2080ti (sm_75, Turing) target is wired into the build system, the runtime
+# capability gate and the CMake presets on this branch, but the Turing tensor-core
+# kernel port is not complete: the Op kernel family is built on BF16/FP8
+# mma.sync (sm_80+/sm_89+) and cp.async (sm_80+), none of which Turing has. The
+# configure-time guard keeps a selected-but-incomplete target from producing a
+# build that fails deep in ptxas; the port status and work items live in
+# docs/maintainer/sm75-port-plan.md.
+if(NINFER_TARGET STREQUAL "rtx2080ti")
+  message(FATAL_ERROR
+    "NINFER_TARGET=rtx2080ti (sm_75, Turing) is a skeleton target on this branch: "
+    "the Turing tensor-core kernel port is not complete. The engine's GEMM/attention/MoE "
+    "kernels use BF16/FP8 mma.sync and cp.async, which Turing (sm_75) does not implement. "
+    "See docs/maintainer/sm75-port-plan.md for the gap analysis and port work items. "
+    "Select rtx4090 (sm_89) or rtx5090 (sm_120a) to build and run.")
 endif()
 
 # CUDA compiler detection must see the selected architecture, not a host default.
@@ -39,7 +60,7 @@ function(ninfer_validate_cuda_architecture)
   endif()
 endfunction()
 
-# One build directory compiles one target: sm_89 and sm_120a objects must not be
+# One build directory compiles one target: sm_75, sm_89 and sm_120a objects must not be
 # mixed in a single tree. Toolchain files can also change the architecture during
 # project() initialization, so the check runs again after project().
 function(ninfer_validate_target)
