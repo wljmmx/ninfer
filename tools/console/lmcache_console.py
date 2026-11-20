@@ -363,6 +363,17 @@ class EngineCollector:
         return float(value) if isinstance(value, (int, float)) else 0.0
 
     # -- snapshot polling ------------------------------------------------
+    def _sleep_until(self, deadline: float) -> None:
+        """Sleep to a fixed phase so the cadence stays 1 Hz instead of 1 Hz + request time.
+
+        Sleeping interval seconds AFTER the work makes every period longer than the interval; the
+        page samples at a fixed 1 Hz, so the two clocks drift apart and the points the page draws
+        stop lining up with the samples the console took.
+        """
+        delay = deadline - time.monotonic()
+        if delay > 0:
+            self._stop.wait(delay)
+
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
             at = time.monotonic()
@@ -372,7 +383,7 @@ class EngineCollector:
                     raise ValueError("snapshot is not an object")
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
                 self._failed(f"/monitor/snapshot: {exc}", at)
-                time.sleep(self.interval)
+                self._sleep_until(at + self.interval)
                 continue
 
             runtime = (snapshot.get("engine") or {}).get("runtime") or {}
@@ -445,18 +456,31 @@ class EngineCollector:
             self.samples += 1
             self._refresh_info(at)
             self._publish(snapshot, counters, service, window, rate_1s, raw)
-            time.sleep(self.interval)
+            self._sleep_until(at + self.interval)
 
     def _window_rate(self) -> dict:
-        """Rate over the newest ~5 s of 1 Hz points, plus the band of the 1 Hz points."""
+        """Rate over the newest WINDOW seconds of 1 Hz points, plus the band of those points.
+
+        The window is a TIME window, never a count of points. The deque holds more points than
+        the window needs precisely so that a slow poll cannot silently stretch "5 s" into 11-13 s:
+        with a count window every extra second of history drags a finished burst along, so the
+        board reads near zero for several seconds while the engine is decoding at full speed, and
+        keeps reading a decaying value after it stopped. Both read as "the page is not live".
+        """
         if len(self.history) < 2:
             return {"window_seconds": None, "decode_tps": None, "prefill_tps": None,
                     "ttft_ms": None, "band": {"decode": None, "prefill": None, "ttft": None}}
         newest = self.history[-1]
-        oldest = self.history[0]
-        span = newest["at"] - oldest["at"]
-        decode_band = [p["decode_rate"] for p in self.history if p["decode_rate"] is not None]
-        prefill_band = [p["prefill_rate"] for p in self.history if p["prefill_rate"] is not None]
+        cutoff = newest["at"] - self.WINDOW
+        window = [p for p in self.history if p["at"] >= cutoff]
+        # Cover the whole window: start at the newest point that is at or before the cutoff, so the
+        # reported span is the declared 5 s and never a shorter stretch that would over-read a burst.
+        earlier = [p for p in self.history if p["at"] <= cutoff]
+        if earlier:
+            window = [earlier[-1], *window]
+        span = (newest["at"] - window[0]["at"]) if len(window) > 1 else 0.0
+        decode_band = [p["decode_rate"] for p in window if p["decode_rate"] is not None]
+        prefill_band = [p["prefill_rate"] for p in window if p["prefill_rate"] is not None]
         band = {
             "decode": [min(decode_band), max(decode_band)] if decode_band else None,
             "prefill": [min(prefill_band), max(prefill_band)] if prefill_band else None,
@@ -466,6 +490,7 @@ class EngineCollector:
             # Not enough of a window yet: report nothing rather than a 1-point "5 s" rate.
             return {"window_seconds": span if span else None, "decode_tps": None,
                     "prefill_tps": None, "ttft_ms": None, "band": band}
+        oldest = window[0]
         return {
             "window_seconds": span,
             "decode_tps": (newest["decode"] - oldest["decode"]) / span,
