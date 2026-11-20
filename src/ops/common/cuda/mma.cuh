@@ -3,6 +3,8 @@
 #include "ops/common/cuda/memory.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 
+#include <cuda_fp16.h>
+
 namespace ninfer::ops::common {
 
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
