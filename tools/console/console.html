@@ -700,7 +700,7 @@ Object.values(INSTANCES).forEach(rebase);
 
 function setMode(m){
   if (!MODES[m] || m === ctlMode) return;
-  if (engineLive()){ postControl('/api/control/mode', {mode: m}); return; }
+  if (engineLive()){ postControl('/api/control/mode', {mode: engineModeName(m)}); return; }
   const from = MODES[ctlMode].name, to = MODES[m].name;
   ctlMode = m;
   document.querySelectorAll('.segbtn').forEach(el => el.classList.toggle('on', el.getAttribute('data-m') === m));
@@ -723,6 +723,9 @@ function setMode(m){
    /api/control/*）。判据归引擎：页面只下发并回显引擎自报的状态（/monitor/info 的 controller
    块），不本地推算；被拒绝（typo/越界/无核心）按错误显示，不假装成功。 */
 function engControl(){ return (ENGINE.info && ENGINE.info.controller) || ENGINE.control || null; }
+// The page's own keys are auto|perf|stable; the engine's control plane is spoken to by name
+// (auto|stable|performance) and refuses anything else with 400. One mapping, both directions.
+function engineModeName(key){ return key === 'perf' ? 'performance' : key; }
 function modeKey(engineMode){
   if (engineMode === 'performance') return 'perf';
   if (engineMode === 'stable') return 'stable';
