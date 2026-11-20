@@ -1008,6 +1008,10 @@ class Launcher:
                 "model": self.model,
                 "uptime_seconds": round(time.time() - self.started_at, 1) if running else None,
                 "command": subprocess.list2cmdline(self.args) if self.args else "",
+                # The exact argv the engine was started with, kept after exit so a page
+                # reload (or a stop followed by a start) can refill the form instead of
+                # resetting it to the HTML defaults.
+                "argv": list(self.args) if self.args else [],
                 "log": self.log_tail()}
 
 

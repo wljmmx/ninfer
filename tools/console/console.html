@@ -2329,6 +2329,31 @@ $('clock').textContent = new Date().toLocaleTimeString();
     return out;
   }
   let dir='', model='';
+  // 页面刷新 / 停止后再启动都不该把表单打回 HTML 默认值：把引擎真正的 argv 回填到表单，
+  // 这是"正在跑的配置"唯一可信的来源（/api/launch/status.json 的 argv 由启动器记录，停止后仍保留）。
+  function applyLaunchArgs(args){
+    if(!Array.isArray(args) || args.length < 2) return;
+    L('lModel').value = args[1]; model = args[1];
+    const vals={}, flags=new Set();
+    for(let i=2;i<args.length;i++){
+      const a=String(args[i]); if(a.slice(0,2)!=='--') continue;
+      const next=args[i+1];
+      if(next!==undefined && String(next).slice(0,2)!=='--'){ vals[a]=String(next); i++; } else { flags.add(a); }
+    }
+    if(vals['--port']) L('lPort').value = vals['--port'];
+    if(vals['--max-context']) L('lCtx').value = vals['--max-context'];
+    if(vals['--max-concurrency']) L('lConc').value = vals['--max-concurrency'];
+    if(vals['--prefill-chunk']) L('lChunk').value = vals['--prefill-chunk'];
+    if(vals['--kv-dtype']) L('lKv').value = vals['--kv-dtype'];
+    L('lOpts').querySelectorAll('.optrow').forEach(r=>{
+      const f=r.dataset.flag, cb=r.querySelector('input[type=checkbox]');
+      const c=r.querySelector('input:not([type=checkbox]),select');
+      const has=Object.prototype.hasOwnProperty.call(vals,f)||flags.has(f);
+      cb.checked=has; if(c) c.disabled=!has;
+      if(has && vals[f]!==undefined && c) c.value=vals[f];
+    });
+  }
+  let appliedArgs='';
   function crumbs(path){ L('lCrumbs').textContent = path || '根目录'; }
   async function loadDir(d){
     const box=L('lBrowser'); box.innerHTML='<div class="sub">读取中…</div>';
@@ -2364,6 +2389,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
     try{ const s=await (await fetch('/api/launch/status.json')).json();
       L('lState').textContent = s.running ? ('运行中 pid '+s.pid) : (s.exit_code!=null?('已退出('+s.exit_code+')'):'未启动');
       L('lStart').disabled=!!s.running; L('lStop').disabled=!s.running;
+      const argvKey=(s.argv||[]).join(' '); if(argvKey && argvKey!==appliedArgs){ appliedArgs=argvKey; applyLaunchArgs(s.argv); }
       const log=s.log||[]; L('lLog').textContent = (s.started && log.length) ? log.slice(-12).join('\n') : '—';
     }catch(e){}
   }
