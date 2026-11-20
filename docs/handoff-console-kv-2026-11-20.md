@@ -145,3 +145,27 @@ localStorage，实测刷新后仍勾选。
 2. P7：目录默认值、日志框外的宽度对齐、配色与中英混排。
 
 已完成并从计划里移除：MoE draft 标定、TTFT 三档、LMCache 勾选持久化、`resident_tokens` 发布。
+## 8. 决策（2026-11-20 定稿）：保留 KV 分层
+
+**结论：不拆步内取页，保留 `--kv-evict` 与 absent-page 机制。**
+
+原因是一次读代码纠正了此前的错误前提：
+
+- `engine_core.h:2597` 与 `2612` 的两处 `refuse_kv_residency*` **不是步内拷贝**，而是
+  worker 准入循环里的守卫（单请求 + 聚合各一处）。注释写明：没有聚合守卫，两个各自合法的
+  请求会互相抢占、彼此暂停、永不恢复（作者实测过非终止）。删掉它等于重新引入死锁。
+- 真正的逐页取页在 program 的 sequence/attention 路径（absent page 的 copy），它是一个
+  **特性**，不是缺陷路径。
+
+因此“运行期零缺页”只能通过取消分层实现，而那是一次产品决策（放弃超额订阅），不是补丁。
+本日选择保留分层：
+
+| 后果 | 说明 |
+|---|---|
+| 长请求必须独占驻留 | 256k × 4 在这张卡上同时只跑 1 条，其余排队 |
+| 分层时图被跳过 | 已实测；全驻留配置（`--kv-capacity <tokens>`）才能 captured |
+| 超配额请求在准入被拒 | `464a0b2b`（单请求）+ `engine_core.h` 守卫（聚合） |
+| 输出预算按剩余空间截断 | `10c68b9f`，日志 `[budget] output budget clamped` |
+
+若将来要改为“取消分层”（工作点 B），必须一次做完：删 `--kv-evict` 的 on/auto、删 absent-page
+机制与 eviction window 安装、删两处 `refuse_kv_residency*` 守卫——中间状态会死锁。
