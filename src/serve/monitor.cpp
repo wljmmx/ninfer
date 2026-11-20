@@ -321,6 +321,7 @@ void HttpServer::register_monitor_routes() {
         out["model"]        = {{"id", public_model_id_},
                                {"architecture", load.architecture},
                                {"ffn", ffn_form_of(load.architecture)},
+                               {"resident_tokens", service_->resident_token_capacity()},
                                {"name", load.model_name},
                                {"max_context", engine.max_context},
                                {"max_concurrency", engine.max_concurrency},

@@ -137,6 +137,9 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] CacheGeometry cache_geometry() const;
     [[nodiscard]] MemorySummary memory_summary() const;
+    // Tokens the Device KV pool actually holds (resident pages x tokens per page), the number a
+    // single request can use. Equals max_context when the plan is fully resident.
+    [[nodiscard]] std::uint32_t resident_token_capacity() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     // One row per live request: state, identity, restoration route and frontiers, and when it last
     // committed a token. Copied under the engine lock, so a monitor can read it at any time; the

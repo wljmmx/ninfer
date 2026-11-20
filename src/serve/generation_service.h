@@ -138,6 +138,9 @@ public:
     [[nodiscard]] ninfer::CacheGeometry cache_geometry() const { return engine_->cache_geometry(); }
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] std::uint32_t resident_token_capacity() const {
+        return engine_->resident_token_capacity();
+    }
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 

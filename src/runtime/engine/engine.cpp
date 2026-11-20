@@ -215,6 +215,15 @@ Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
+std::uint32_t Engine::resident_token_capacity() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const auto& resolution = impl_->active->kv_capacity_resolution;
+    if (resolution.main_page_groups == 0) { return impl_->active->capacity; }
+    const std::uint64_t per_page = resolution.resolved_tokens / resolution.main_page_groups;
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(per_page * resolution.resident_page_groups, impl_->active->capacity));
+}
+
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
