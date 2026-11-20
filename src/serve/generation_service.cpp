@@ -1072,6 +1072,21 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                 callback(first);
             };
         }
+        // 生成预算不能越过驻留池的剩余空间：prompt 已经占掉 prompt_tokens，而 full-attention
+        // 的一步要寻址整段历史，越过就必然在运行期缺页。超出时按剩余空间截断，并明确记一行。
+        {
+            const std::uint32_t resident  = engine_->resident_token_capacity();
+            const std::uint32_t prompt_tk = prompt.summary().prompt_tokens;
+            const std::uint32_t room = resident > prompt_tk ? resident - prompt_tk : 0U;
+            if (request_options.execution.requested_output_tokens > room) {
+                std::fprintf(stderr,
+                             "[budget] output budget clamped %u -> %u (resident %u, prompt %u)\n",
+                             request_options.execution.requested_output_tokens, room, resident,
+                             prompt_tk);
+                std::fflush(stderr);
+                request_options.execution.requested_output_tokens = room;
+            }
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
