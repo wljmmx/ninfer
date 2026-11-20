@@ -1087,6 +1087,26 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                 request_options.execution.requested_output_tokens = room;
             }
         }
+        // 队列窗口按"一条满长请求的服务时间"给。容量只够一条车道时，前面最多压着一条请求，
+        // 所以等待上界就是它跑完的时间；用保守速率折算，宁可多等一点也不要 30 s 就 503。
+        // 短请求不受影响：它们本来就装得进剩余驻留，直接并行准入，不会走到这里排队。
+        {
+            const std::uint32_t prompt_tk = prompt.summary().prompt_tokens;
+            const std::uint32_t budget_tk = request_options.execution.requested_output_tokens;
+            const double seconds = prompt_tk / 1200.0 + budget_tk / 60.0;   // 保守 prefill/解码速率
+            // 上限 15 分钟：再长的等待对客户端没有意义，不如早点给出可判定的失败。
+            const auto want_ms = std::min<long long>(900000, static_cast<long long>(seconds * 1000.0 * 1.2));
+            const auto want = Clock::now() + std::chrono::milliseconds(std::max<long long>(0, want_ms));
+            if (prepared.lifetime->deadline < want) {
+                const auto before =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(prepared.lifetime->deadline - Clock::now()).count();
+                prepared.lifetime->deadline = want;
+                std::fprintf(stderr,
+                             "[queue] deadline extended %lld ms -> %lld ms (prompt %u, budget %u)\n",
+                             static_cast<long long>(before), want_ms, prompt_tk, budget_tk);
+                std::fflush(stderr);
+            }
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
