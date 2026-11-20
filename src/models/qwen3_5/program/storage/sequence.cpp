@@ -974,7 +974,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
                     "the selector's keep set) and the unit's own growth; that set does not fit the "
                     "pool, so no page could be restored for it. Shorten the window "
                     "(NINFER_KV_EVICT_WINDOW / NINFER_KV_EVICT_KEEP_FROM_SCORES), lower "
-                    "max_concurrency, or give the pool more pages (NINFER_KV_RESIDENCY_SLACK_MB).");
+                    "max_concurrency, or give the pool more pages (--kv-residency-slack-mib).");
             }
             // V10-79: the two arms say different things because they are different states. With the
             // page-in leg off the pages on the Host tier have no reader at all; with it on they do
@@ -992,7 +992,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
                        "every layer's planes, so it cannot make the step address fewer pages. "
                        "Bound the read set with NINFER_KV_EVICT_WINDOW (sink + newest window + the "
                        "selector's keep set is what a step addresses then), or give the pool more "
-                       "pages (NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context)."
+                       "pages (--kv-residency-slack-mib, or a smaller max_context)."
                      : "it cannot be streamed out of the Host tier (the page-in leg would copy a "
                        "page back from Host; NINFER_KV_PAGE_IN=0 or NINFER_KV_NO_PAGE_IN=1 turned "
                        "it off for this run)."));

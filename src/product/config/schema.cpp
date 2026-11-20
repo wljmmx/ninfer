@@ -30,6 +30,12 @@ constexpr FieldSpec kFields[] = {
      "to whole bytes. KV sizing only; it is not the startup planning reserve.",
      Scope::Serve, ConfigurationUnit::Bytes, "engine.kv_capacity_headroom_mib",
      "--kv-capacity-headroom-mib"},
+    {Field::KvResidencySlack, "engine.kv_residency_slack_mib", "--kv-residency-slack-mib", "", "", "",
+     "MIB|auto",
+     "Room left free on the Device when the KV pool is tiered, so the desktop, the driver and " 
+     "WDDM still have somewhere to go. auto derives device/12 clamped to 512 MiB..4 GiB; " 
+     "pinning it smaller buys KV pages at a measured cost in prefill speed.", Scope::Common,
+     ConfigurationUnit::Bytes},
     {Field::StartupPlanningHeadroom, "engine.startup_planning_headroom_mib",
      "--startup-planning-headroom-mib", "", "", "", "MIB",
      "Per-startup planning allowance held back from the expert pool (default 1024 MiB); Graph "
@@ -317,6 +323,9 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     const auto* string = std::get_if<std::string>(&value);
     const auto is      = [&](std::string_view word) { return string && *string == word; };
     switch (field) {
+    case Field::KvResidencySlack:
+        if (is("auto")) return DefaultValue{};
+        return whole_mib_bytes(value, true);
     case Field::KvSizingHeadroom:
     case Field::StartupPlanningHeadroom:
     case Field::HostContext:
@@ -488,6 +497,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     }
     case Field::KvSizingHeadroom:
     case Field::StartupPlanningHeadroom:
+    case Field::KvResidencySlack:
     case Field::HostContext:
     case Field::MediaCache:
     case Field::MediaLive:

@@ -31,6 +31,7 @@ enum class Field {
     KvCapacity,
     KvSizingHeadroom,
     StartupPlanningHeadroom,
+    KvResidencySlack,
     PrefillChunk,
     CudaGraph,
     MaxConcurrency,

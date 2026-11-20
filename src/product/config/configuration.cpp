@@ -159,6 +159,13 @@ StartupConfigurationView view(const LaunchOptions& launch, const CliOptions* cli
         case Field::StartupPlanningHeadroom:
             value = std::uint64_t{e.startup_planning_headroom_bytes};
             break;
+        case Field::KvResidencySlack:
+            if (const char* slack = std::getenv("NINFER_KV_RESIDENCY_SLACK_MB");
+                slack != nullptr && *slack != '\\0')
+                value = std::string(slack) + " MiB";
+            else
+                value = std::string("auto (device/12)");
+            break;
         case Field::PrefillChunk:
             value = std::uint64_t{e.prefill_chunk};
             break;

@@ -9,6 +9,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::product {
@@ -380,6 +381,17 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry) {
         case Field::StartupPlanningHeadroom:
             engine.startup_planning_headroom_bytes = static_cast<std::size_t>(u64());
             break;
+        case Field::KvResidencySlack: {
+            // The pool plan reads this one number before any Engine object exists, so the
+            // flag is published into the variable that plan already consults - the same
+            // bridge the resolved eviction window uses. The flag (or the panel field built on
+            // it) stays the only thing a user touches; nothing here needs an outer shell.
+            const std::string mib = std::to_string(u64() >> 20);
+            if (_putenv_s("NINFER_KV_RESIDENCY_SLACK_MB", mib.c_str()) != 0) {
+                throw std::runtime_error("cannot publish --kv-residency-slack-mib");
+            }
+            break;
+        }
         case Field::PrefillChunk:
             engine.prefill_chunk = u32();
             break;

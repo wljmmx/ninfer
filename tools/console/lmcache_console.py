@@ -702,6 +702,7 @@ class Launcher:
         "--device-state-slots": ("int", 0, 64),
         "--host-context-mib": ("int", 0, 1 << 20),
         "--kv-evict": ("enum", ("off", "on", "auto")),
+        "--kv-residency-slack-mib": ("text", re.compile(r"^(auto|[0-9]{1,5})$")),
         "--kv-idle-reclaim-ms": ("int", 0, 86400000),
         "--no-thinking": ("flag",),
         "--preserve-thinking": ("flag",),

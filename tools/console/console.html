@@ -2297,7 +2297,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
   const LOPTS = [
     {g:'推测解码', items:[['--spec','推测后端','enum',['none','mtp','dflash','dflash2'],'mtp'],['--draft-tokens','草稿窗口1..15','int',[1,15],5],['--lm-head-draft','优化提案头','flag']]},
     {g:'执行与排队', items:[['--no-cuda-graph','关闭图','flag'],['--max-pending-requests','排队容量','int',[1,64],16],['--controller-mode','控制器','enum',['auto','stable','performance'],'auto']]},
-    {g:'KV 与上下文', items:[['--kv-capacity','KV 容量(N/auto)','text','auto'],['--no-prefix-reuse','关闭前缀复用','flag'],['--host-context-mib','Host 上下文 MiB','int',[0,1048576],0],['--kv-evict','驱逐契约','enum',['off','on','auto'],'auto']]},
+    {g:'KV 与上下文', items:[['--kv-capacity','KV 容量(N/auto)','text','auto'],['--no-prefix-reuse','关闭前缀复用','flag'],['--host-context-mib','Host 上下文 MiB','int',[0,1048576],0],['--kv-residency-slack-mib','显存预留余量','enum',['auto','256','512','1024','2048'],'auto'],['--kv-evict','驱逐契约','enum',['off','on','auto'],'auto']]},
     {g:'生成默认值', items:[['--no-thinking','关闭思考','flag'],['--preserve-thinking','保留思考','flag'],['--default-max-tokens','输出上限','int',[1,1048576],8192],['--temperature','温度','text','0.6'],['--top-p','top-p','text','0.95'],['--greedy','argmax','flag']]},
     {g:'日志', items:[['--log-level','日志级别','enum',['trace','debug','info','warning','error','critical','off'],'info'],['--log-stats-interval-ms','吞吐日志间隔','int',[0,3600000],5000],['--vision','加载视觉','flag']]}
   ];

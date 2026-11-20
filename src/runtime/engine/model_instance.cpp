@@ -1452,12 +1452,43 @@ bool kv_host_residency_requested(const EngineOptions& options) {
 // Device memory (the "the desktop took it after startup" case) the 512 MiB arm is consistently slower:
 // 16K-token prefill 1,998 tok/s against 2,392 at 2 GiB held by that process, and 457 against 788 tok/s
 // at 12 GiB held. Hence 2 GiB as the default; NINFER_KV_RESIDENCY_SLACK_MB still overrides it.
-std::size_t kv_residency_slack_bytes() {
-    constexpr std::size_t kDefault = 2048ULL << 20;
-    const char* value              = std::getenv("NINFER_KV_RESIDENCY_SLACK_MB");
-    if (value == nullptr || *value == '\0') { return kDefault; }
-    const auto mib = std::strtoull(value, nullptr, 10);
-    return static_cast<std::size_t>(mib) << 20;
+struct KvResidencySlackChoice {
+    std::size_t bytes = 0;
+    std::string source;
+};
+
+// Room the plan leaves free on the Device. It is priced BEFORE any allocation, so it cannot be a
+// controller decision: the KV dial is a one-way shrink actuator inside [floor, hi], and hi is this
+// figure. It also guards memory the process does not control (desktop, driver, WDDM), which no
+// runtime signal can predict.
+//
+// port (sm_89), measured on the 24 GB 4090 with the 173k arm (rk4v4-e8, MTP, same prompts):
+//   slack 2048 MiB ->   904 resident pages,  57,856 tokens, prefill 2,888-2,941 tok/s
+//   slack 1024 MiB -> 3,511 resident pages, 224,704 tokens, prefill 1,599-1,912 tok/s
+//   slack  512 MiB -> 4,025 resident pages, 257,600 tokens, prefill   876-898 tok/s
+//   slack  256 MiB -> 4,282 resident pages, 274,048 tokens, prefill 919-1,026 plus one 243 s
+//                     page-out storm (66 tok/s) - the WDDM eviction the floor exists for
+// The knee sits between 1 and 2 GiB, so auto takes device/12 (24 GiB -> 2 GiB), floor 512 MiB,
+// ceiling 4 GiB. An explicit --kv-residency-slack-mib is the caller's trade, and the log names it.
+KvResidencySlackChoice kv_residency_slack_bytes() {
+    if (const char* text = std::getenv("NINFER_KV_RESIDENCY_SLACK_MB");
+        text != nullptr && *text != '\0') {
+        const auto mib = std::strtoull(text, nullptr, 10);
+        return {static_cast<std::size_t>(mib) << 20, "NINFER_KV_RESIDENCY_SLACK_MB"};
+    }
+    constexpr std::size_t kFloor = 512ULL << 20;
+    constexpr std::size_t kCeil  = 4096ULL << 20;
+    std::size_t free_bytes       = 0;
+    std::size_t total_bytes      = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || total_bytes == 0) {
+        return {kFloor, "default (device query failed, floor 512 MiB)"};
+    }
+    const std::size_t derived = total_bytes / 12;
+    const std::size_t bytes   = std::min(kCeil, std::max(kFloor, derived));
+    char source[96];
+    std::snprintf(source, sizeof(source), "derived: device/12 of %zu MiB, floor 512 MiB",
+                  total_bytes >> 20);
+    return {bytes, source};
 }
 
 // The residency contract is read from the environment while the decoder layout is planned
@@ -1856,7 +1887,8 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
     const bool tiering_allowed = kv_host_residency_requested(options) && host_kv_budget != 0;
     const bool tiered_mode =
         tiering_allowed && strides.payload_bytes_per_resident_page_group != 0;
-    const std::size_t residency_slack = tiered_mode ? kv_residency_slack_bytes() : 0;
+    const KvResidencySlackChoice slack_choice = kv_residency_slack_bytes();
+    const std::size_t residency_slack = tiered_mode ? slack_choice.bytes : 0;
     // V10-01 (T156): the StateImage geometry already exists before the Program does - it is the
     // planner's `PersistentLayout::state_images` - so the context pool's three ledgers are sized
     // together here instead of being quoted after the allocation they did not shape. The anchor
@@ -2262,9 +2294,7 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
                      "[kv-residency] slack=%.0f MiB (%s) usable=%.0f MiB logical=%u page(s) "
                      "resident=%u page(s) (%.1f%%) device_kv=%.1f MiB host_kv=%.1f MiB\n",
                      static_cast<double>(resolution.residency_slack_bytes) / kMib,
-                     std::getenv("NINFER_KV_RESIDENCY_SLACK_MB") != nullptr
-                         ? "NINFER_KV_RESIDENCY_SLACK_MB"
-                         : "default",
+                     slack_choice.source.c_str(),
                      static_cast<double>(resolution.available_after_weights_bytes) / kMib,
                      resolution.logical_page_groups, resolution.resident_page_groups,
                      100.0 * static_cast<double>(resolution.resident_page_groups) /

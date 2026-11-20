@@ -1068,7 +1068,7 @@ private:
                 "eviction window masks - so each lane is priced by that set plus the pages its own "
                 "unit writes, and the pool edge has to cover their sum. Shorten the window "
                 "(NINFER_KV_EVICT_WINDOW / NINFER_KV_EVICT_KEEP_FROM_SCORES), lower "
-                "max_concurrency, or give the KV leg more pages (NINFER_KV_RESIDENCY_SLACK_MB).");
+                "max_concurrency, or give the KV leg more pages (--kv-residency-slack-mib).");
         }
         const bool leg = [] {
             // P8: same tri-state the Program uses - the leg is on by default, and either variable
@@ -1089,13 +1089,13 @@ private:
                          "still has to cover the live history itself. Bound the read set with "
                          "NINFER_KV_EVICT_WINDOW - sink + newest window + the selector's keep set "
                          "is what a step addresses then - or give the KV leg more pages "
-                         "(NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).")
+                         "(--kv-residency-slack-mib, or a smaller max_context).")
                    : std::string(
                          " (the Device KV pool is tiered: it holds the resident part of "
                          "max_context, and the full-attention layers read the whole history every "
                          "step, so the history cannot be streamed from the Host tier). Shorten the "
                          "prompt, or leave more Device memory to the pool "
-                         "(NINFER_KV_RESIDENCY_SLACK_MB, or a smaller max_context).");
+                         "(--kv-residency-slack-mib, or a smaller max_context).");
     }
 
     // port (sm_89): refuse a request that DOES fit on its own but not beside the lanes already
@@ -1180,12 +1180,12 @@ private:
                   "pool is tiered and shared, so the sum over the live lanes has to fit it. "
                   "Shorten "
                   "the window, lower max_concurrency, or leave more Device memory to the pool "
-                  "(NINFER_KV_RESIDENCY_SLACK_MB).)"
+                  "(--kv-residency-slack-mib).)"
                 : " (growth_pages_needed is this lane's whole demand after the step, in the pool's "
                   "page groups; the Device KV pool is tiered and shared, and every live lane's "
                   "history has to stay in it at every step, so the growth cannot be served by "
                   "pausing a lane of the same batch. Shorten the prompt, lower max_concurrency, or "
-                  "leave more Device memory to the pool (NINFER_KV_RESIDENCY_SLACK_MB, or a "
+                  "leave more Device memory to the pool (--kv-residency-slack-mib, or a "
                   "smaller "
                   "max_context).)";
         complete_error(
