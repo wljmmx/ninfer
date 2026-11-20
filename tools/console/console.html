@@ -41,7 +41,7 @@
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
   .card h3{margin:0 0 8px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:8px}
   .card h3 .r{margin-left:auto;font-size:11px;letter-spacing:0;text-transform:none;color:var(--dim)}
-  .metric{font-family:var(--mono);font-size:25px;font-weight:600;line-height:1.1}
+  .metric{font-family:var(--mono);font-size:25px;font-weight:600;line-height:1.1;color:#cfe3ff;font-variant-numeric:tabular-nums}
   .metric small{font-size:11.5px;color:var(--muted);font-weight:400;margin-left:4px}
   .sub{color:var(--muted);font-size:11.5px}
   .row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px dashed var(--line);font-size:12.5px;gap:8px}
@@ -93,7 +93,7 @@
   .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px}
   .kvbox{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
   .kvbox .t{font-size:10.5px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
-  .kvbox .v{font-family:var(--mono);font-size:15px;margin-top:2px}
+  .kvbox .v{font-family:var(--mono);font-size:15px;margin-top:2px;color:#bcd3ee;font-variant-numeric:tabular-nums}
   .gauge{display:flex;gap:10px;margin-top:10px}
   .gauge .g{flex:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 4px}
   .gauge .g .n{font-family:var(--mono);font-size:16px;font-weight:600}
@@ -260,7 +260,7 @@
         <thead><tr><th></th><th>实例 / 档位</th><th>状态</th><th class="n">decode</th><th class="n">TTFT p99</th><th class="n">覆盖</th><th class="n">capt</th><th>趋势</th></tr></thead>
         <tbody id="fleetRows"></tbody>
       </table>
-      <div class="note">stopped 档不占显存，仅作跨档对比与冷备；fused 比 e2 低约 3%，只作对照臂。</div>
+      <div class="note">已停档不占显存，仅作跨档对比与冷备。</div>
     </div>
   </div>
 
@@ -448,8 +448,8 @@
       <div class="row"><span>溢出环（池侧 S）</span><b id="c-spill">—</b></div>
       <div class="row"><span>预取有用率</span><b id="c-pfu">—</b></div>
       <div class="kv">
-        <div class="kvbox"><div class="t">KV 设备</div><div class="v" id="kv-dev">—</div><div class="sub">paged</div></div>
-        <div class="kvbox"><div class="t">KV 主机</div><div class="v" id="kv-host">—</div><div class="sub">arena</div></div>
+        <div class="kvbox"><div class="t">KV 设备</div><div class="v" id="kv-dev">—</div><div class="sub">分页</div></div>
+        <div class="kvbox"><div class="t">KV 主机</div><div class="v" id="kv-host">—</div><div class="sub">分配区</div></div>
         <div class="kvbox"><div class="t">KV 盘级</div><div class="v" id="kv-disk">—</div><div class="sub">LMCache / checkpoint</div></div>
       </div>
       <div class="gauge">
@@ -1397,7 +1397,7 @@ function renderFleetLive(){
 
   $('f-ram').innerHTML = '—<small>GiB</small>';
   $('f-ram-bar').innerHTML = '';
-  $('f-ram-sub').textContent = 'serve 不发布进程 RSS / 主机 arena 读数';
+  $('f-ram-sub').textContent = 'serve 不发布进程 RSS / 主机分配区读数';
   $('f-disk').innerHTML = LC.ok ? fmtGiB(LC.l1mem) : '—<small>GiB</small>';
   $('f-disk-bar').innerHTML = LC.ok && LC.ratio != null
     ? '<i style="width:' + Math.min(100, LC.ratio * 100).toFixed(0) + '%;background:var(--accent2)"></i>' : '';
@@ -1441,8 +1441,8 @@ function renderFleetLive(){
     }).join(' ');
     return '<tr class="pick cur" onclick="enterInstance(\'' + inst.id + '\')">'
       + '<td><input type="checkbox" checked onclick="event.stopPropagation()"></td>'
-      + '<td>' + inst.id + '<br><span class="sub">' + (ENGINE.model || '') + ' · :' + ENGINE.port + ' · live</span></td>'
-      + '<td><span class="tag eng">engine</span></td>'
+      + '<td>' + inst.id + '<br><span class="sub">' + (ENGINE.model || '') + ' · :' + ENGINE.port + ' · 在线</span></td>'
+      + '<td><span class="tag eng">引擎</span></td>'
       + '<td class="n">' + fmtNum(latest(inst, 'decode'), 1) + '</td>'
       + '<td class="n">' + (p50 == null ? '—' : fmtMs(p50)) + '</td>'
       + '<td class="n">—</td><td class="n">—</td>'
@@ -1604,7 +1604,7 @@ function renderFleet(){
   const ramPct = ram/32*100;
   $('f-ram').innerHTML = ram.toFixed(1) + '<small>GiB</small>';
   $('f-ram-bar').innerHTML = '<i style="width:' + ramPct.toFixed(0) + '%;background:' + (ramPct>92?'var(--bad)':ramPct>80?'var(--warn)':'var(--cyan)') + '"></i>';
-  $('f-ram-sub').textContent = 'KV arena 8.0 · 温区 ' + (running.length ? (running.reduce((s,i)=>s+warmMiB(i.pool),0)/1024).toFixed(1) : '0') + '（显存补集）';
+  $('f-ram-sub').textContent = 'KV 分配区 8.0 · 温区 ' + (running.length ? (running.reduce((s,i)=>s+warmMiB(i.pool),0)/1024).toFixed(1) : '0') + '（显存补集）';
 
   const disk = 12.4;
   $('f-disk').innerHTML = disk.toFixed(1) + '<small>GiB</small>';
@@ -1643,8 +1643,8 @@ function renderFleet(){
       const py = 22 - Math.min(22, (x[0]/(base*1.4))*22);
       return px.toFixed(1)+','+py.toFixed(1);
     }).join(' ');
-    const st = inst.state==='running' ? '<span class="tag run">running</span>'
-             : inst.state==='starting' ? '<span class="tag start">starting</span>'
+    const st = inst.state==='running' ? '<span class="tag run">运行中</span>'
+             : inst.state==='starting' ? '<span class="tag start">启动中</span>'
              : '<span class="tag stop">stopped</span>';
     return '<tr class="pick ' + (inst.id===current?'cur':'') + '" onclick="enterInstance(\'' + inst.id + '\')">'
       + '<td><input type="checkbox" ' + (inst.sel?'checked':'') + ' onclick="event.stopPropagation()" onchange="toggleSelect(\'' + inst.id + '\')"></td>'
@@ -1952,8 +1952,8 @@ function renderInstance(){
   const d = latest(inst,'decode'), p = latest(inst,'prefill'), t = latest(inst,'ttft');
   const on = inst.state === 'running';
   const pol = inst.policy;
-  $('i-state').innerHTML = on ? '<span class="tag run">running</span>'
-                    : inst.state === 'starting' ? '<span class="tag start">starting</span>'
+  $('i-state').innerHTML = on ? '<span class="tag run">运行中</span>'
+                    : inst.state === 'starting' ? '<span class="tag start">启动中</span>'
                     : '<span class="tag stop">stopped</span>';
   $('i-art').innerHTML = '<span class="tag">' + (inst.model || '—') + '</span> · ' + (inst.pool/1024).toFixed(0) + ' GiB 池 · ' + (inst.kv/1024|0) + ' GiB 主机 KV · 温区补集 ' + (warmMiB(inst.pool)/1024).toFixed(1) + ' GiB';
   $('i-up').textContent = ':' + inst.port + ' · ' + uptime(inst);
@@ -2025,7 +2025,7 @@ function startStopInstance(){
     inst.active = [];
     inst.note = '已手动停止';
     inst.op = false;
-    feedAdd(inst.id + ' 手动停止（观测归零，stopped 档不占显存）', 'info');
+    feedAdd(inst.id + ' 手动停止（观测归零，已停档不占显存）', 'info');
   } else if (inst.state === 'stopped'){
     inst.op = true;
     inst.state = 'starting';
