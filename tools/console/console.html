@@ -28,7 +28,7 @@
   .mlbl{font-size:12px;color:var(--muted)}
   .seg{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px;gap:3px}
   .segbtn{padding:4px 13px;border-radius:6px;font-size:12.5px;color:var(--muted);cursor:pointer;user-select:none}
-  .segbtn.on{background:rgba(76,154,255,.16);color:var(--ink);box-shadow:inset 0 0 0 1px var(--accent)}
+  .segbtn.on{background:rgba(76,154,255,.16);color:#cfe3ff;box-shadow:inset 0 0 0 1px var(--accent)}
 
   .plan-strip{margin-top:10px;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--muted);flex-wrap:wrap;
     background:linear-gradient(90deg,rgba(76,154,255,.10),rgba(124,92,255,.06));border:1px solid var(--line);border-radius:8px;padding:7px 12px}
@@ -53,11 +53,30 @@
   select,input,button{font:12.5px var(--mono)}
   select,input[type=number],input[type=text]{background:var(--panel2);border:1px solid var(--line2);color:var(--ink);border-radius:6px;padding:5px 8px}
   select:focus,input:focus{outline:1px solid var(--accent);border-color:var(--accent)}
-  .btn{background:var(--accent);color:#04121f;border:none;border-radius:6px;padding:7px 13px;font-weight:650;cursor:pointer;font-family:inherit}
+  /* 所有按钮统一到控制器档位那套语言：透明底 + 1px 边 + 弱化文字，主行动才用强调色内嵌。 */
+  button{background:transparent;color:var(--muted);border:1px solid var(--line2);border-radius:6px;padding:5px 12px;font:inherit;font-size:12.5px;cursor:pointer}
+  button:hover:not(:disabled){color:var(--ink);border-color:var(--accent)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .btn{padding:5px 12px;font-size:12.5px;font-weight:500;background:transparent;color:var(--muted);border:1px solid var(--line2)}
+  .btn.primary{background:rgba(76,154,255,.16);color:#cfe3ff;border-color:var(--accent);font-weight:600}
+  .btn.primary:hover:not(:disabled){background:rgba(76,154,255,.24)}
   .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line2);font-weight:500}
   .btn.ghost:hover{color:var(--ink);border-color:var(--accent)}
   .btn.sm{padding:4px 9px;font-size:11.5px}
   .btn.stop{background:transparent;color:var(--bad);border:1px solid rgba(248,81,73,.5);font-weight:600}
+  .primary{background:rgba(76,154,255,.16);color:#cfe3ff;border-color:var(--accent);font-weight:600}
+  .primary:hover:not(:disabled){background:rgba(76,154,255,.24)}
+  #lStop,#lcStopBtn{color:var(--bad);border-color:rgba(248,81,73,.5)}
+  /* 滚动条统一到面板配色 */
+  *{scrollbar-width:thin;scrollbar-color:#2e3948 transparent}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#2e3948;border-radius:6px;border:2px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:#3b4859;background-clip:content-box}
+  /* 行标签退到次要色，数值承担强调 */
+  .row > span{color:var(--muted)}
+  .n{color:#cfe3ff;font-variant-numeric:tabular-nums}
+  pre{color:#c9d6e6}
 
   table{width:100%;border-collapse:collapse;font-size:12.5px}
   th,td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
@@ -839,7 +858,7 @@ function renderSrcBar(){
     const fresh = stale == null || stale < 3;
     bar.className = 'srcbar ' + (fresh ? 'live' : 'bad');
     dot.className = 'dot ' + (fresh ? '' : 'warn');
-    $('srcTitle').textContent = '数据源：引擎 ' + (ENGINE.base || '') + (ENGINE.ready ? ' · ready' : ' · 未就绪');
+    $('srcTitle').textContent = '数据源：引擎 ' + (ENGINE.base || '') + (ENGINE.ready ? ' · 就绪' : ' · 未就绪');
     $('srcDetail').textContent = 'decode / prefill / TTFT 为引擎自报计数的差分（1 Hz，5 s 窗口）· 控制台数字仅作观测，门禁与调优以引擎自报为准';
     $('srcGap').textContent = 'gap ' + (ENGINE.gaps || 0) + ' 段' +
       (ENGINE.health && ENGINE.health.event_ok === false ? ' · 事件流断开' : ' · 事件流在线') +
@@ -2390,6 +2409,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
     catch(e){ box.innerHTML='<div class="sub">读取失败</div>'; return; }
     if(!r.ok){ box.innerHTML='<div class="sub">'+(r.error||'读取失败')+'</div>'; return; }
     dir=r.path||''; crumbs(dir); box.innerHTML='';
+    try{ if(dir) localStorage.setItem('ninfer.dir', dir); }catch(e){}
     if(!dir){ (r.roots||[]).forEach(x=>{ const e=document.createElement('div'); e.innerHTML='<span>'+x.name+'</span><span class="n">root</span>'; e.onclick=()=>loadDir(x.path); box.appendChild(e); }); return; }
     (r.dirs||[]).forEach(x=>{ const e=document.createElement('div'); e.innerHTML='<span>'+x.name+'\\</span><span class="n">目录</span>'; e.onclick=()=>loadDir(x.path); box.appendChild(e); });
     (r.models||[]).forEach(x=>{ const e=document.createElement('div'); e.innerHTML='<span>'+x.name+'</span><span class="n">'+x.size_gib+' GiB</span>';
@@ -2459,7 +2479,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
     L('lLmcache').addEventListener('change', () =>
       localStorage.setItem('ninfer.lmcache', L('lLmcache').checked ? '1' : '0'));
   }
-  buildOpts(); loadDir(''); tickLaunch(); tickLc();
+  buildOpts(); loadDir((()=>{try{return localStorage.getItem('ninfer.dir')||'';}catch(e){return '';}})()); tickLaunch(); tickLc();
   setInterval(tickLaunch, 1000); setInterval(tickLc, 2000);
 })();
 </script>
