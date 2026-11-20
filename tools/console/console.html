@@ -2361,7 +2361,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
     try{ const s=await (await fetch('/api/launch/status.json')).json();
       L('lState').textContent = s.running ? ('运行中 pid '+s.pid) : (s.exit_code!=null?('已退出('+s.exit_code+')'):'未启动');
       L('lStart').disabled=!!s.running; L('lStop').disabled=!s.running;
-      const log=s.log||[]; L('lLog').textContent = s.running && log.length ? log.slice(-10).join('\n') : '—';
+      const log=s.log||[]; L('lLog').textContent = (s.started && log.length) ? log.slice(-12).join('\n') : '—';
     }catch(e){}
   }
   async function tickLc(){

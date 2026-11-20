@@ -42,6 +42,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -860,6 +861,15 @@ class Launcher:
                     continue
                 flat.extend([flag, value])
             argv = [str(self.exe), str(model)] + flat + extra
+            # A stale engine on this port is the most common startup failure; say so instead of
+            # letting the child fail with "cannot bind" 20 lines into its config dump.
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.settimeout(0.3)
+            in_use = probe.connect_ex(("127.0.0.1", port)) == 0
+            probe.close()
+            if in_use:
+                return {"ok": False, "error": f"port {port} is already in use (an engine from an earlier run is probably still listening); stop it or pick another port"}
+
             env = os.environ.copy()
             for key in ("NINFER_MODEL", "NINFER_QSA_SPARSE_GQA_QUANT_KV",
                         "NINFER_LMCACHE_RESTORE", "NINFER_LMCACHE_ENDPOINT",
@@ -940,6 +950,8 @@ class Launcher:
         return {"ok": True, "running": running,
                 "pid": proc.pid if proc else None,
                 "alive": running,
+                # `started` survives the exit: the page keeps a failed run's log on screen.
+                "started": proc is not None,
                 "exit_code": self.exit_code,
                 "port": self.port,
                 "model": self.model,
