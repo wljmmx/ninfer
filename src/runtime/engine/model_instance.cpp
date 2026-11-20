@@ -1547,15 +1547,15 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     // P1c: --host-context-mib is optional. Unset derives a Host arena budget from free physical
     // memory, because a tiered plan needs a real figure to be solved against and the fixed
     // "8 GiB + 8 StateImages" the layout used to invent was unrelated to the box it ran on. The
-    // fraction is deliberately conservative - ONE EIGHTH of free physical RAM, floored at 2 GiB -
-    // because the arena is committed, not reserved: HostContextArena pins it when the driver grants
-    // the lock and otherwise pageable-allocates and zero-fills the whole thing. Causal scoring keeps
-    // its named 0 (no Host backing) and is therefore untouched.
+    // fraction is HALF of free physical RAM, floored at 4 GiB. It is a cap, not a commitment: since
+    // the arena pins 64 MiB extents on demand (host_context_arena.cpp), a budget the run never uses
+    // costs nothing. The old one-eighth assumed the arena was committed up front. Causal scoring
+    // keeps its named 0 (no Host backing) and is therefore untouched.
     if (!cache.host_capacity_bytes.has_value() && options.purpose == EnginePurpose::Generation) {
         const auto free_host = current_free_host_bytes();
         if (free_host != 0) {
-            constexpr std::size_t kFloor   = 2ULL << 30;
-            constexpr std::size_t kDivisor = 8;
+            constexpr std::size_t kFloor   = 4ULL << 30;
+            constexpr std::size_t kDivisor = 2;
             const std::size_t budget       = std::max(kFloor, free_host / kDivisor);
             cache.host_capacity_bytes      = budget;
             constexpr double kMib          = 1024.0 * 1024.0;
