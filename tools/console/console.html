@@ -2297,7 +2297,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
   const LOPTS = [
     {g:'推测解码', items:[['--spec','推测后端','enum',['none','mtp','dflash','dflash2'],'mtp'],['--draft-tokens','草稿窗口1..15','int',[1,15],5],['--lm-head-draft','优化提案头','flag']]},
     {g:'执行与排队', items:[['--no-cuda-graph','关闭图','flag'],['--max-pending-requests','排队容量','int',[1,64],16],['--controller-mode','控制器','enum',['auto','stable','performance'],'auto']]},
-    {g:'KV 与上下文', items:[['--kv-capacity','KV 容量(N/auto)','text','auto'],['--no-prefix-reuse','关闭前缀复用','flag'],['--host-context-mib','Host 上下文 MiB','int',[0,1048576],0],['--kv-residency-slack-mib','显存预留余量','enum',['auto','256','512','1024','2048'],'auto'],['--kv-evict','驱逐契约','enum',['off','on','auto'],'auto'],['--wddm-evictable-budget','WDDM 可驱逐预算','flag']]},
+    {g:'KV 与上下文', items:[['--kv-capacity','KV 容量(N/auto)','text','auto'],['--no-prefix-reuse','关闭前缀复用','flag'],['--host-context-mib','Host 上下文 MiB','int',[0,1048576],0],['--kv-residency-slack-mib','显存预留余量(MiB|auto)','text','auto'],['--kv-evict','驱逐契约','enum',['off','on','auto'],'auto'],['--wddm-evictable-budget','WDDM 可驱逐预算','flag']]},
     {g:'生成默认值', items:[['--no-thinking','关闭思考','flag'],['--preserve-thinking','保留思考','flag'],['--default-max-tokens','输出上限','int',[1,1048576],8192],['--temperature','温度','text','0.6'],['--top-p','top-p','text','0.95'],['--greedy','argmax','flag']]},
     {g:'日志', items:[['--log-level','日志级别','enum',['trace','debug','info','warning','error','critical','off'],'info'],['--log-stats-interval-ms','吞吐日志间隔','int',[0,3600000],5000],['--vision','加载视觉','flag']]}
   ];
@@ -2350,7 +2350,14 @@ $('clock').textContent = new Date().toLocaleTimeString();
       const c=r.querySelector('input:not([type=checkbox]),select');
       const has=Object.prototype.hasOwnProperty.call(vals,f)||flags.has(f);
       cb.checked=has; if(c) c.disabled=!has;
-      if(has && vals[f]!==undefined && c) c.value=vals[f];
+      if(has && vals[f]!==undefined && c){
+        // 运行中的值可能不在下拉候选里（比如 slack=1280），补一个选项再选中，否则 select 会静默
+        // 变成空值，collect() 就会把下一个 flag 当成它的值。
+        if(c.tagName==='SELECT' && ![...c.options].some(o=>o.value===vals[f])){
+          const o=document.createElement('option'); o.value=vals[f]; o.textContent=vals[f]; c.appendChild(o);
+        }
+        c.value=vals[f];
+      }
     });
   }
   let appliedArgs='';
@@ -2372,15 +2379,32 @@ $('clock').textContent = new Date().toLocaleTimeString();
     L('lMsg').textContent = r.ok ? '已加入目录' : (r.cancelled ? '已取消' : ('失败：'+r.error)); if(r.ok) loadDir(r.path); };
   L('lUp').onclick=()=>loadDir(dir?dir.replace(/[\\/][^\\/]+$/,''):'');
   L('lRefresh').onclick=()=>loadDir(dir);
+  let launching=false;
+  // 运行中按“启动”= 按当前表单重启：先停旧的，等它真的退出，再起新的。原来按钮被置灰，
+  // 点了没有任何反应，看起来像“启动没效果”。
   L('lStart').onclick=async()=>{
+    if(launching) return;
     const body={model:model||L('lModel').value, port:Number(L('lPort').value), max_context:Number(L('lCtx').value),
       max_concurrency:Number(L('lConc').value), prefill_chunk:Number(L('lChunk').value), kv_dtype:L('lKv').value,
       lmcache:L('lLmcache').checked, extra_args:collect()};
     if(!body.model){ L('lMsg').textContent='先选一个 .ninfer'; return; }
     L('lStart').disabled=true; L('lMsg').textContent='启动中…';
-    const r=await (await fetch('/api/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-    L('lMsg').textContent = r.ok ? ('已启动 pid '+r.pid) : ('失败：'+r.error);
-    L('lStart').disabled=false;
+    launching=true; L('lMsg').textContent='启动中…';
+    try{
+      const before=await (await fetch('/api/launch/status.json',{cache:'no-store'})).json();
+      if(before.running){
+        L('lMsg').textContent='先停止 pid '+before.pid+'…';
+        const stop=await (await fetch('/api/launch/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+        if(!stop.ok){ L('lMsg').textContent='停止失败：'+stop.error; return; }
+        for(let i=0;i<60;i++){
+          await new Promise(r=>setTimeout(r,500));
+          const now=await (await fetch('/api/launch/status.json',{cache:'no-store'})).json();
+          if(!now.running) break;
+        }
+      }
+      const r=await (await fetch('/api/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+      L('lMsg').textContent = r.ok ? ('已启动 pid '+r.pid) : ('失败：'+r.error);
+    } finally { launching=false; }
   };
   L('lStop').onclick=async()=>{ L('lStop').disabled=true;
     const r=await (await fetch('/api/launch/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
@@ -2388,7 +2412,7 @@ $('clock').textContent = new Date().toLocaleTimeString();
   async function tickLaunch(){
     try{ const s=await (await fetch('/api/launch/status.json')).json();
       L('lState').textContent = s.running ? ('运行中 pid '+s.pid) : (s.exit_code!=null?('已退出('+s.exit_code+')'):'未启动');
-      L('lStart').disabled=!!s.running; L('lStop').disabled=!s.running;
+      L('lStart').disabled=launching; L('lStart').textContent=s.running?'重启':'启动'; L('lStop').disabled=!s.running;
       const argvKey=(s.argv||[]).join(' '); if(argvKey && argvKey!==appliedArgs){ appliedArgs=argvKey; applyLaunchArgs(s.argv); }
       const log=s.log||[]; L('lLog').textContent = (s.started && log.length) ? log.slice(-12).join('\n') : '—';
     }catch(e){}
