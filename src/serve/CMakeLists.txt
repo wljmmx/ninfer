@@ -22,6 +22,7 @@ add_library(ninfer_serve STATIC
   control.cpp
   metrics.cpp
   http_server.cpp
+  crash_dump.cpp
   openai_responses_http.cpp
 )
 ninfer_internal_includes(ninfer_serve)

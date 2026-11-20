@@ -3,6 +3,7 @@
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
 #include "serve/generation_service.h"
+#include "serve/crash_dump.h"
 #include "serve/http_server.h"
 
 #include <spdlog/logger.h>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <csignal>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -104,6 +106,8 @@ int main(int argc, char** argv) {
         std::signal(SIGBREAK, handle_signal);
 #endif
 
+        // A crash with a stopped log is unusable evidence: drop a minidump beside the exe.
+        ninfer::serve::install_crash_handler(std::filesystem::current_path());
         serving = true;
         operational_log.server_ready(options.host, options.port, server.public_model_id(),
                                      !options.api_key.empty());
