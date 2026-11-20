@@ -62,12 +62,48 @@ std::shared_ptr<MonitorEvents::Subscription> MonitorEvents::subscribe() {
     if (closed_) { return {}; }
     for (auto& weak : subscribers_) {
         if (weak.expired()) {
-            auto result = std::make_shared<Subscription>();
-            weak        = result;
+            auto result         = std::make_shared<Subscription>();
+            result->created_at_ = std::chrono::steady_clock::now();
+            weak                = result;
             return result;
         }
     }
-    return {};
+    // Every slot is held. Returning null here is what turned one wedged connection into a
+    // permanent outage: the monitor endpoint answered 503 with a single console client attached
+    // (2026-11-20, four slots held by connections whose peers were gone), and the panel reported
+    // "event stream offline" while the engine was healthy. A subscriber only frees its slot when
+    // its handler notices the peer left, and a client that vanished without closing - or a writer
+    // stalled against a half-open socket - can hold it far longer than a poll interval.
+    //
+    // Dropping the OLDEST connection instead degrades that case into one reconnect: the evicted
+    // reader sees its stream end and reconnects (the console retries after 1 s), so the panel keeps
+    // its live feed and the table can never be locked out again.
+    std::shared_ptr<Subscription> oldest;
+    std::size_t oldest_index = 0;
+    for (std::size_t index = 0; index < subscribers_.size(); ++index) {
+        auto live = subscribers_[index].lock();
+        if (live && (!oldest || live->created_at_ < oldest->created_at_)) {
+            oldest       = live;
+            oldest_index = index;
+        }
+    }
+    if (oldest) {
+        oldest->close();
+        ++evicted_;
+    }
+    auto result         = std::make_shared<Subscription>();
+    result->created_at_ = std::chrono::steady_clock::now();
+    subscribers_[oldest_index] = result;
+    return result;
+}
+
+MonitorEvents::SubscriberStats MonitorEvents::subscriber_stats() const {
+    std::lock_guard lock(mutex_);
+    SubscriberStats stats{.capacity = kMaxSubscribers, .evicted = evicted_};
+    for (const auto& weak : subscribers_) {
+        if (!weak.expired()) { ++stats.active; }
+    }
+    return stats;
 }
 
 void MonitorEvents::publish(const std::string& event) {

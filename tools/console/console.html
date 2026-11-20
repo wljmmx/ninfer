@@ -862,6 +862,9 @@ function renderSrcBar(){
     $('srcDetail').textContent = 'decode / prefill / TTFT 为引擎自报计数的差分（1 Hz，5 s 窗口）· 控制台数字仅作观测，门禁与调优以引擎自报为准';
     $('srcGap').textContent = 'gap ' + (ENGINE.gaps || 0) + ' 段' +
       (ENGINE.health && ENGINE.health.event_ok === false ? ' · 事件流断开' : ' · 事件流在线') +
+      (ENGINE.health && ENGINE.health.event_subscribers != null
+        ? ' ' + ENGINE.health.event_subscribers + '/' + (ENGINE.health.event_capacity || 4)
+        : '') +
       ' · ' + String(ENGINE.at || '').slice(11, 19) + (fresh ? '' : ' · 采样滞后');
   } else {
     const secs = ENGINE.gapFrom ? Math.round((Date.now() - ENGINE.gapFrom) / 1000) : 0;

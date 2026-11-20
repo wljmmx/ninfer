@@ -340,6 +340,12 @@ void HttpServer::register_monitor_routes() {
                                      {"adp", {{"rank", 0}, {"size", 1}}}}});
         out["placements"] = Json::array();
         out["resources"]  = resources_json(service_->memory_summary());
+        // The event fan-out's own state: a reader that cannot see "3 of 4 slots held" has to guess
+        // why /monitor/events answers 503 (see MonitorEvents::subscribe for the eviction rule).
+        const auto subscribers = observations_.events.subscriber_stats();
+        out["events"]          = Json{{"subscribers", subscribers.active},
+                                      {"capacity", subscribers.capacity},
+                                      {"evicted", subscribers.evicted}};
         out["load"]       = load_json(load);
         // T131: the control plane's in-force state, read-only here. The writes live on
         // /control/mode and /control/freeze; this panel shows the worker's own answer, so the

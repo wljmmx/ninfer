@@ -73,15 +73,26 @@ public:
         std::deque<std::string> queue_;
         std::size_t queued_bytes_ = 0;
         std::atomic<bool> closed_{false};
+        // When this connection took its slot, so a full table can drop the oldest instead of
+        // refusing the next client (see subscribe). Written and read under MonitorEvents::mutex_.
+        std::chrono::steady_clock::time_point created_at_{};
         friend class MonitorEvents;
+    };
+
+    struct SubscriberStats {
+        std::size_t active   = 0;
+        std::size_t capacity = kMaxSubscribers;
+        std::uint64_t evicted = 0;
     };
 
     [[nodiscard]] std::shared_ptr<Subscription> subscribe();
     void publish(const std::string& event);
     void close();
+    [[nodiscard]] SubscriberStats subscriber_stats() const;
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::array<std::weak_ptr<Subscription>, kMaxSubscribers> subscribers_;
+    std::uint64_t evicted_ = 0;
     bool closed_ = false;
 };
 

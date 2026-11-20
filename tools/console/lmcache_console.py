@@ -559,8 +559,20 @@ class EngineCollector:
                                round(time.monotonic() - self.last_success, 1)
                                if self.last_success else None,
                            "event_ok": self.event_ok, "event_reason": self.event_reason,
-                           "event_gaps": self.event_gaps},
+                           "event_gaps": self.event_gaps,
+                           "event_subscribers": self._event_slot("subscribers"),
+                           "event_capacity": self._event_slot("capacity")},
             }
+
+    def _event_slot(self, field: str):
+        """The event fan-out's own slot count, as the engine reports it.
+
+        Without it a 503 on /monitor/events has no explanation on screen: the panel can only say
+        "event stream offline" while the engine is healthy. The engine now publishes the count in
+        /monitor/info and evicts the oldest reader instead of refusing a fifth (see subscribe).
+        """
+        events = (self.info or {}).get("events") or {}
+        return events.get(field)
 
     def _recent_events(self) -> list:
         return list(self.events)[-self.EVENT_TAIL:]
@@ -634,7 +646,9 @@ class EngineCollector:
                                round(time.monotonic() - self.last_success, 1)
                                if self.last_success else None,
                            "event_ok": self.event_ok, "event_reason": self.event_reason,
-                           "event_gaps": self.event_gaps},
+                           "event_gaps": self.event_gaps,
+                           "event_subscribers": self._event_slot("subscribers"),
+                           "event_capacity": self._event_slot("capacity")},
             }
 
     # -- event subscription ----------------------------------------------
