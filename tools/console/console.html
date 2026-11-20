@@ -1484,7 +1484,7 @@ function renderInstanceLive(){
   $('inst').value = current;
   $('i-state').innerHTML = '<span class="tag eng">engine</span>' +
     (ENGINE.ready ? '' : ' <span class="tag start">未就绪</span>');
-  $('i-art').innerHTML = '<span class="tag e2">' + (m.architecture || 'model') + '</span> · ' +
+  $('i-art').innerHTML = '<span class="tag">' + (m.architecture || 'model') + '</span> · ' +
     (m.kv_cache || '—') + ' · max-context ' + fmtInt(m.max_context) + ' · 池未发布';
   $('i-up').textContent = ':' + ENGINE.port + ' · ' + uptime(inst);
   $('i-start').classList.add('hidden');
@@ -1648,7 +1648,7 @@ function renderFleet(){
              : '<span class="tag stop">stopped</span>';
     return '<tr class="pick ' + (inst.id===current?'cur':'') + '" onclick="enterInstance(\'' + inst.id + '\')">'
       + '<td><input type="checkbox" ' + (inst.sel?'checked':'') + ' onclick="event.stopPropagation()" onchange="toggleSelect(\'' + inst.id + '\')"></td>'
-      + '<td>' + inst.id + '<br><span class="sub">' + (inst.pool/1024|0) + ' GiB · :' + inst.port + ' · ' + inst.art + '</span></td>'
+      + '<td>' + inst.id + '<br><span class="sub">' + (inst.pool/1024|0) + ' GiB · :' + inst.port +  + '</span></td>'
       + '<td>' + st + '</td>'
       + '<td class="n">' + (d ? d.toFixed(1) : '—') + '</td>'
       + '<td class="n">' + (t ? t.toFixed(0)+' ms' : '—') + '</td>'
@@ -1955,7 +1955,7 @@ function renderInstance(){
   $('i-state').innerHTML = on ? '<span class="tag run">running</span>'
                     : inst.state === 'starting' ? '<span class="tag start">starting</span>'
                     : '<span class="tag stop">stopped</span>';
-  $('i-art').innerHTML = '<span class="tag ' + inst.art + '">' + inst.art + '</span> · ' + (inst.pool/1024).toFixed(0) + ' GiB 池 · ' + (inst.kv/1024|0) + ' GiB 主机 KV · 温区补集 ' + (warmMiB(inst.pool)/1024).toFixed(1) + ' GiB';
+  $('i-art').innerHTML = '<span class="tag">' + (inst.model || '—') + '</span> · ' + (inst.pool/1024).toFixed(0) + ' GiB 池 · ' + (inst.kv/1024|0) + ' GiB 主机 KV · 温区补集 ' + (warmMiB(inst.pool)/1024).toFixed(1) + ' GiB';
   $('i-up').textContent = ':' + inst.port + ' · ' + uptime(inst);
   $('i-start').classList.toggle('hidden', inst.state === 'running' || inst.state === 'starting');
   $('i-stop').classList.toggle('hidden', inst.state !== 'running');
