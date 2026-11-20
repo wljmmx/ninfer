@@ -30,6 +30,21 @@
       }
     },
     {
+      "name": "win-2080ti-release",
+      "displayName": "Windows MSVC build for RTX 2080 Ti (sm_75), vcpkg dependencies",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-win-2080ti",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NINFER_TARGET": "rtx2080ti",
+        "CMAKE_CUDA_ARCHITECTURES": "75",
+        "NINFER_BUILD_APPS": "ON",
+        "BUILD_TESTING": "OFF",
+        "NINFER_BUILD_BENCHMARKS": "OFF",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    },
+    {
       "name": "win-5090-release",
       "displayName": "Windows MSVC build for RTX 5090 (sm_120a), vcpkg dependencies",
       "generator": "Ninja",
@@ -65,6 +80,7 @@
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "win-release", "configurePreset": "win-release" },
+    { "name": "win-2080ti-release", "configurePreset": "win-2080ti-release" },
     { "name": "win-5090-release", "configurePreset": "win-5090-release" },
     { "name": "dev", "configurePreset": "dev" },
     { "name": "win-dev", "configurePreset": "win-dev" }

@@ -14,19 +14,31 @@ ninfer_validate_target()
 # sm_120a adds Blackwell-only execution paths: TMA bulk tensor copies, warp-specialized
 # producer/consumer kernels built on setmaxnreg + mbarrier, block-scaled
 # kind::mxf8f6f4 / kind::mxf4nvf4 tensor core MMA, and the NVFP4 weight codecs.
-# Ada (sm_89) implements none of those, so those paths are compiled out and dispatch
-# falls back to the cp.async + ldmatrix + mma.sync execution models that Ada supports
-# natively (including the plain E4M3 FP8 tensor core form). The K8V4 KV cache (FP8 keys
-# + NVFP4 value plane through the official CUDA 13 conversion intrinsics) runs on both
-# architectures, so its gate is defined unconditionally.
+# Ada (sm_89) and Turing (sm_75) implement none of those, so those paths are compiled
+# out and dispatch falls back to the cp.async + ldmatrix + mma.sync execution models
+# that both architectures support natively (including the plain E4M3 FP8 tensor core
+# form; the K8V4 KV cache's CUDA 13 conversion intrinsics run on both as well, so its
+# gate is defined unconditionally).
+#
+# sm_75 (RTX 2080 Ti, Turing) is a third target: on this branch it is a skeleton
+# (see cmake/NinferPlatform.cmake and docs/maintainer/sm75-port-plan.md). Turing has
+# no BF16/FP8 tensor cores and no cp.async (all sm_80+/sm_89+ features), so the sm_89
+# fallback kernels do not run on it until the port lands; when it does, the same
+# product surface as sm_89 applies, with the groupwise-int artifact as the primary
+# 2080 Ti artifact. NVFP4 artifacts and NVFP4 KV storage are rejected with explicit
+# errors, as on sm_89.
 if(NINFER_TARGET STREQUAL "rtx5090")
   add_compile_definitions(NINFER_ARCH_SM120=1 NINFER_ENABLE_TMA=1 NINFER_ENABLE_NVFP4=1
     NINFER_ENABLE_K8V4=1)
   # audit K6: NINFER_ENABLE_BLOCK_SCALED_MOE_MMA (the block-scaled NVFP4 MoE expert kernels,
   # src/ops/moe/kernels/cuda/block_scaled/nvfp4/launch.cu) deliberately stays off until those
   # kernels have been run on real Blackwell hardware; add it to the definitions above to compile
-  # them in. The sm_89 build never defines the NVFP4 feature macro, so it cannot reach them.
+  # them in. The sm_89/sm_75 builds never define the NVFP4 feature macro, so they cannot reach
+  # them.
   set(NINFER_ENABLE_NVFP4 ON)
+elseif(NINFER_TARGET STREQUAL "rtx2080ti")
+  add_compile_definitions(NINFER_ARCH_SM75=1 NINFER_ENABLE_K8V4=1)
+  set(NINFER_ENABLE_NVFP4 OFF)
 else()
   add_compile_definitions(NINFER_ARCH_SM89=1 NINFER_ENABLE_K8V4=1)
   set(NINFER_ENABLE_NVFP4 OFF)
