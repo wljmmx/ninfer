@@ -45,12 +45,13 @@ struct PrefixDigest {
     return digest;
 }
 
-[[nodiscard]] inline PrefixDigest prefix_digest(std::span<const std::int64_t> tokens,
+template <class Token>
+[[nodiscard]] inline PrefixDigest prefix_digest(std::span<const Token> tokens,
                                                 std::size_t frontier) noexcept {
     PrefixDigest digest{0xcbf29ce484222325ULL, 0x84222325cbf29ce4ULL};
     const std::size_t count = std::min(frontier, tokens.size());
     for (std::size_t index = 0; index < count; ++index) {
-        digest = prefix_digest_step(digest, tokens[index]);
+        digest = prefix_digest_step(digest, static_cast<std::int64_t>(tokens[index]));
     }
     return digest;
 }
@@ -76,15 +77,19 @@ public:
 
     // Longest recorded frontier that is a prefix of `tokens`, or nullopt. O(tokens) once, then a
     // lookup per recorded frontier on the way down - the number of recorded prefixes is small.
+    // Templated on the token element type so a caller holding 32-bit ids does not have to widen its
+    // whole prompt just to ask this question.
+    template <class Token>
     [[nodiscard]] std::optional<std::size_t>
-    longest_prefix(std::span<const std::int64_t> tokens) const {
+    longest_prefix(std::span<const Token> tokens) const {
         const auto found = candidates(tokens, 1);
         return found.empty() ? std::nullopt : std::optional<std::size_t>(found.front());
     }
 
     // Matching frontiers, longest first, at most `limit`. The caller probes in this order; the
     // first one the backend serves wins. Duplicate frontiers collapse.
-    [[nodiscard]] std::vector<std::size_t> candidates(std::span<const std::int64_t> tokens,
+    template <class Token>
+    [[nodiscard]] std::vector<std::size_t> candidates(std::span<const Token> tokens,
                                                       std::size_t limit) const {
         std::vector<std::size_t> result;
         if (tokens.empty() || limit == 0) { return result; }
@@ -105,7 +110,7 @@ public:
         PrefixDigest digest{0xcbf29ce484222325ULL, 0x84222325cbf29ce4ULL};
         std::size_t next = 0;
         for (std::size_t position = 1; position <= recorded.back().first; ++position) {
-            digest = prefix_digest_step(digest, tokens[position - 1]);
+            digest = prefix_digest_step(digest, static_cast<std::int64_t>(tokens[position - 1]));
             while (next < recorded.size() && recorded[next].first == position) {
                 if (recorded[next].second == digest) {
                     if (result.empty() || result.back() != position) { result.push_back(position); }

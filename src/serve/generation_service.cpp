@@ -192,7 +192,8 @@ public:
         std::vector<std::size_t> attempts;
         attempts.push_back(prompt_tokens.size());
         std::vector<std::int64_t> sequence(prompt_tokens.begin(), prompt_tokens.end());
-        for (const auto frontier : registry_.candidates(sequence, 3)) {
+        for (const auto frontier :
+             registry_.candidates(std::span<const std::int64_t>(sequence), 3)) {
             if (frontier >= chunk_tokens_ && frontier < prompt_tokens.size()) {
                 attempts.push_back(frontier);
             }
@@ -334,33 +335,55 @@ public:
             async_write_ = std::getenv("NINFER_LMCACHE_ASYNC_WRITE") != nullptr;
             if (async_write_) { writer_ = std::thread([this] { write_loop(); }); }
         });
+        // A record is chunk-addressed and a conversation only ever appends, so the chunks this turn
+        // shares with one already stored need not travel again. `registry_` is the index of exactly
+        // that: the longest prefix this process knows the cache can answer. Publishing only the tail
+        // turns a growth turn from "the whole run" into "the new chunk(s) plus the state image".
+        //
+        // A stale entry costs a miss, never wrong KV: the store names absolute chunk indices, and a
+        // retrieve still has to find every chunk of its key.
+        std::size_t first_chunk = 0;
+        if (const auto known = registry_.longest_prefix(prompt_tokens)) {
+            const auto chunk_tokens = static_cast<std::size_t>(chunk_tokens_);
+            if (chunk_tokens != 0) { first_chunk = *known / chunk_tokens; }
+        }
+        const auto total_chunks =
+            chunk_bytes_ == 0 ? 0 : checkpoint.kv_bytes.size() / chunk_bytes_;
+        if (first_chunk >= total_chunks) {
+            // Nothing new to say: the cache already holds every whole chunk this checkpoint has.
+            return;
+        }
         if (!async_write_) {
             const auto wal_path = wal_.append(prompt_tokens, checkpoint);
             const auto started  = std::chrono::steady_clock::now();
-            const bool written  = publish_job(prompt_tokens, checkpoint);
+            const bool written  = publish_job(prompt_tokens, checkpoint, first_chunk);
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             if (seconds >= 0.2) {
                 // The synchronous publish runs on the engine's own thread, so this number is time the
                 // request (or the boundary that produced the checkpoint) actually waits.
                 //
-                // The byte count is the WHOLE wire payload: the KV chunks plus the state image. The
-                // state image is ~147 MiB and does not shrink with the prefix, so counting only the KV
-                // (as this line used to) makes a small store look like a large fixed overhead - that
-                // is exactly how a 28 MiB store at 150 MB/s came to be read as "1.1 s of fixed cost".
+                // The byte count is the WHOLE wire payload: the KV chunks this call carries plus the
+                // state image. The state image is ~147 MiB and does not shrink with the prefix, so
+                // counting only the KV (as this line used to) makes a small store look like a large
+                // fixed overhead - that is exactly how a 28 MiB store at 150 MB/s came to be read as
+                // "1.1 s of fixed cost".
                 const auto state_bytes = [&checkpoint] {
                     std::size_t total = 0;
                     for (const std::string& shard : checkpoint.state_shards) { total += shard.size(); }
                     return total;
                 }();
-                const auto kv_mib    = static_cast<double>(checkpoint.kv_bytes.size()) / (1024.0 * 1024.0);
+                const auto sent_kv   = first_chunk < total_chunks
+                                           ? checkpoint.kv_bytes.size() - first_chunk * chunk_bytes_
+                                           : std::size_t{0};
+                const auto kv_mib    = static_cast<double>(sent_kv) / (1024.0 * 1024.0);
                 const auto state_mib = static_cast<double>(state_bytes) / (1024.0 * 1024.0);
                 const auto total_mib = kv_mib + state_mib;
                 std::fprintf(stderr,
                              "[lmcache] store %.1f MiB in %.3f s (%.0f MiB/s) | kv %.1f + state %.1f "
-                             "MiB | %zu token(s) | ok=%d\n",
+                             "MiB | chunk %zu of %zu | %zu token(s) | ok=%d\n",
                              total_mib, seconds, total_mib / std::max(seconds, 1e-6), kv_mib, state_mib,
-                             prompt_tokens.size(), written ? 1 : 0);
+                             first_chunk, total_chunks, prompt_tokens.size(), written ? 1 : 0);
                 std::fflush(stderr);
             }
             if (written) { wal_.complete(wal_path); }
@@ -378,7 +401,7 @@ public:
             // "recoverable" are the same instant. A crash between here and the publish leaves a
             // file that the next start replays.
             writes_.push_back(Job{std::vector<TokenId>(prompt_tokens.begin(), prompt_tokens.end()),
-                                  checkpoint, wal_.append(prompt_tokens, checkpoint)});
+                                  checkpoint, wal_.append(prompt_tokens, checkpoint), first_chunk});
         }
         write_cv_.notify_one();
     }
@@ -419,6 +442,7 @@ public:
         std::vector<TokenId> tokens;
         ninfer::CachedCheckpoint checkpoint;
         std::filesystem::path wal_path;
+        std::size_t first_chunk = 0;
     };
 
     void write_loop() {
@@ -467,8 +491,11 @@ public:
     // The body that used to be store(): unchanged, so the async path is the same code, on another
     // thread. Returns whether the server accepted the publish, which is also whether the WAL record
     // may be removed.
+    // `first_chunk` is the first chunk of this run the cache does not already hold; the payload then
+    // carries [first_chunk, end) and names those absolute indices. Zero means "publish the whole run",
+    // which is what every caller did before this parameter existed.
     bool publish_job(std::span<const TokenId> prompt_tokens,
-                     const ninfer::CachedCheckpoint& checkpoint) {
+                     const ninfer::CachedCheckpoint& checkpoint, std::size_t first_chunk = 0) {
         if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return false; }
         if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return false; }
 
@@ -538,9 +565,14 @@ public:
             valid_tokens, tail, chunk_bytes_total);
 
         std::lock_guard<std::mutex> guard(bridge_mutex_);
+        // Slice on a chunk boundary: `complete` is a whole number of chunks, and `first_chunk` counts
+        // them, so the span stays aligned and the indices handed to the server are its own.
+        const std::size_t skip_bytes = std::min(complete, first_chunk * chunk_bytes_total);
         const bool written = bridge_->publish(
-            key, std::span<const std::byte>(checkpoint.kv_bytes.data(), complete),
-            std::span<const std::byte>(payload.data(), payload.size()));
+            key, std::span<const std::byte>(checkpoint.kv_bytes.data() + skip_bytes,
+                                            complete - skip_bytes),
+            std::span<const std::byte>(payload.data(), payload.size()),
+            static_cast<std::int64_t>(first_chunk));
         if (!written) {
             // A publish that fails is invisible from the engine side: the request already answered,
             // and the next lookup simply misses. That is why "the cache never answers" survived this

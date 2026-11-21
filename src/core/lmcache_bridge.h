@@ -197,7 +197,8 @@ public:
         return pages / static_cast<std::size_t>(config_.pages_per_chunk);
     }
 
-    bool publish(const BridgeKey& key, std::span<const std::byte> kv, std::span<const std::byte> state) {
+    bool publish(const BridgeKey& key, std::span<const std::byte> kv, std::span<const std::byte> state,
+                 std::int64_t first_chunk = 0) {
         if (!pool_.size() || instance_id_ == 0) {
             error_ = "bridge is not open";
             return false;
@@ -232,7 +233,7 @@ public:
             return false;
         }
         const bool ok = lease->store(make_key(key), chunks, config_.kv.shape, payload,
-                                     config_.state.shape);
+                                     config_.state.shape, first_chunk, true);
         if (!ok) { error_ = lease->error(); }
         return ok;
     }
