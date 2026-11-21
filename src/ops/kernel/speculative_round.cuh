@@ -227,7 +227,16 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
             const float qd = speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
             const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
                                               kSamplePurposeSpeculativeAccept, 0);
-            reject         = !(pd >= qd || u * qd < pd);
+            // Rejection sampling accepts with probability min(1, pd/qd), which is zero whenever the
+            // draft is impossible under the target distribution - so `pd == 0` must reject. The
+            // `pd >= qd` shortcut alone accepted a draft the target cannot emit at all whenever the
+            // draft was also absent from the proposal's candidates (`qd == 0`), which happens on
+            // every constrained request whose draft is illegal under the grammar: the masked target
+            // distribution holds no such id (pd = 0) and the proposal head is deliberately unmasked
+            // (qd = 0), so the zero-vs-zero comparison kept the illegal draft. Measured 2026-11-21:
+            // a JSON-schema request at temperature 0.7 committed all seven drafts plus a token-0
+            // bonus, and the Host grammar rejected the run; at temperature 0 the same request passed.
+            reject = !(pd > 0.0f && (pd >= qd || u * qd < pd));
         }
     }
     const unsigned failures = __ballot_sync(0xffffffffU, reject);
