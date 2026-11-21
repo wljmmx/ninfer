@@ -342,14 +342,24 @@ public:
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             if (seconds >= 0.2) {
                 // The synchronous publish runs on the engine's own thread, so this number is time the
-                // request (or the boundary that produced the checkpoint) actually waits. The byte
-                // count is what to compare it against: a 163k prefix is ~2.4 GiB.
+                // request (or the boundary that produced the checkpoint) actually waits.
+                //
+                // The byte count is the WHOLE wire payload: the KV chunks plus the state image. The
+                // state image is ~147 MiB and does not shrink with the prefix, so counting only the KV
+                // (as this line used to) makes a small store look like a large fixed overhead - that
+                // is exactly how a 28 MiB store at 150 MB/s came to be read as "1.1 s of fixed cost".
+                const auto state_bytes = [&checkpoint] {
+                    std::size_t total = 0;
+                    for (const std::string& shard : checkpoint.state_shards) { total += shard.size(); }
+                    return total;
+                }();
+                const auto kv_mib    = static_cast<double>(checkpoint.kv_bytes.size()) / (1024.0 * 1024.0);
+                const auto state_mib = static_cast<double>(state_bytes) / (1024.0 * 1024.0);
+                const auto total_mib = kv_mib + state_mib;
                 std::fprintf(stderr,
-                             "[lmcache] store %.1f MiB in %.3f s (%.0f MiB/s) | %zu token(s) | ok=%d\n",
-                             static_cast<double>(checkpoint.kv_bytes.size()) / (1024.0 * 1024.0),
-                             seconds,
-                             (static_cast<double>(checkpoint.kv_bytes.size()) / (1024.0 * 1024.0)) /
-                                 std::max(seconds, 1e-6),
+                             "[lmcache] store %.1f MiB in %.3f s (%.0f MiB/s) | kv %.1f + state %.1f "
+                             "MiB | %zu token(s) | ok=%d\n",
+                             total_mib, seconds, total_mib / std::max(seconds, 1e-6), kv_mib, state_mib,
                              prompt_tokens.size(), written ? 1 : 0);
                 std::fflush(stderr);
             }
@@ -428,16 +438,25 @@ public:
             const bool written = publish_job(job.tokens, job.checkpoint);
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-            if (const auto mib = static_cast<double>(job.checkpoint.kv_bytes.size()) /
-                                 (1024.0 * 1024.0);
+            if (const auto state_bytes = [&job] {
+                    std::size_t total = 0;
+                    for (const std::string& shard : job.checkpoint.state_shards) {
+                        total += shard.size();
+                    }
+                    return total;
+                }();
                 seconds >= 0.2 || !written) {
-                // The async path has to report the same facts as the synchronous one, otherwise a
-                // background store that is slow - or that the server refused - is invisible.
+                // Same facts as the synchronous path, over the same payload: KV plus the state image,
+                // which is ~147 MiB whatever the prefix is.
+                const auto kv_mib    = static_cast<double>(job.checkpoint.kv_bytes.size()) /
+                                       (1024.0 * 1024.0);
+                const auto state_mib = static_cast<double>(state_bytes) / (1024.0 * 1024.0);
+                const auto total_mib = kv_mib + state_mib;
                 std::fprintf(stderr,
-                             "[lmcache] store(async) %.1f MiB in %.3f s (%.0f MiB/s) | %zu token(s) "
-                             "| ok=%d%s%s\n",
-                             mib, seconds, mib / std::max(seconds, 1e-6), job.tokens.size(),
-                             written ? 1 : 0, written ? "" : " | ",
+                             "[lmcache] store(async) %.1f MiB in %.3f s (%.0f MiB/s) | kv %.1f + "
+                             "state %.1f MiB | %zu token(s) | ok=%d%s%s\n",
+                             total_mib, seconds, total_mib / std::max(seconds, 1e-6), kv_mib,
+                             state_mib, job.tokens.size(), written ? 1 : 0, written ? "" : " | ",
                              written ? "" : bridge_->error().c_str());
                 std::fflush(stderr);
             }
