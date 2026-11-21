@@ -219,3 +219,34 @@ on store; 2.7-2.9 s to transfer the same block back), while the model prefills a
 ~2.4 GB/s. At 1916 tokens the restore is therefore slower than the prefill it
 replaces, and at 163k it would cost minutes. The engine side is correct now; the
 throughput is the cache's.
+
+## 10. Where the L3 cache actually lives (verified 2026-11-21)
+
+Question: is the checkpoint cache on an SSD? Answer: it is not on a disk at all, and the disk WSL
+does have is spinning rust.
+
+Evidence:
+
+* `tools/console/l3_lmcache.sh` starts the server with `--l1-size-gb 4` and no `--l2-adapter`. The
+  server log starts an `L2EvictionController` but no L2 connector is ever constructed.
+* After stores, there is no `~/.lmcache` and no `/tmp/lmcache*`; the server's RSS is 4.4 GiB, i.e.
+  the L1 arena. Restarting the server (or WSL) loses every record - only an engine restart keeps
+  them, because the server process survives it.
+* The WSL distro's disk is `H:\Vm_hosts\Vms\WSL\Ubuntu-26.04\ext4.vhdx`, and `H:` is the Storage
+  Space `Raid0` built from three `ST8000NM017B` SATA **HDD**s. So anything written under `$HOME`
+  inside WSL lands on a 3-disk HDD array.
+* The only NVMe visible here is `R:` (`ZHITAI TiPlus9100 2TB`). WSL reaches it as `9p` at
+  `/mnt/r`, measured `dd` 331-360 MB/s - the 9p bridge, not the device.
+* `dd` inside WSL on `$HOME` reports 3.7 GB/s buffered / "6.3 GB/s direct": the VHDX and the host
+  page cache absorb the write, so that number describes neither the HDD array nor what a cache
+  would see.
+
+Throughput measured end to end (engine `[lmcache] store`, 28.1 MiB block) with worker counts set by
+`L3_WORKERS`: 4 -> 12 MiB/s, 8 -> 20 MiB/s, 16 -> 11 MiB/s. No disk is involved in any of those runs
+(L1 only), so the ceiling is the engine<->server path (ZMQ framing plus the Python object handling),
+and raising workers does not move it reliably.
+
+Consequence for the next step: an SSD tier is a configuration change (`--l2-adapter` with
+`{"type": "fs_native", "base_path": ...}`), but it has to be a path that is actually on NVMe - a
+dedicated WSL disk on `R:` rather than `$HOME` (HDD) or `/mnt/r` (9p). Adding it without fixing the
+transport will make stores slower, not faster, because L1 is already the fast tier.
