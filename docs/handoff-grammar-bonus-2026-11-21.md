@@ -452,3 +452,35 @@ them and they default to today's behaviour.
 
 Consequence for the plan: item 3 is blocked on a protocol change, and item 1 (client side) is ready
 but useless until the engine tracks the published frontier.
+
+## 16. Verifying option C (`--enable-segmented-prefix`): it does not apply to this path
+
+C was the hope that a prefix could be stored as independent segments, making both directions
+parallel without touching the protocol. Two facts close it.
+
+1. **Chunk identity is chained to the prefix.** `token_hasher.py`:
+
+       def blake3_packed_hash(chunk, prefix_hash):
+           h.update(prefix_hash)
+           h.update(chunk)
+
+   so chunk i's hash depends on every chunk before it. A key that starts at 32k tokens hashes from a
+   different seed and can never match a lookup for the full 163k prefix. Storing a prefix as N
+   independent keys is therefore not equivalent to storing it as one.
+
+2. **The flag is not on our path.** `enable_segmented_prefix` lives in
+   `lmcache/v1/multiprocess/modules/blend/` and is consumed only there, where its documented meaning
+   is "retain the gapped prefix on a mid-prefix L2 retrieve failure" - not hash decoupling. Our server
+   composes five modules (`engine_driven_transfer, lookup, p2p_controller, kv_events, management`) and
+   does not load blend, so the flag is inert for the client we use. The content-addressed variant
+   (`--enable-dedup-content`, `BlendTokenRangeMatcher(dedup_content=...)`) is blend-only for the same
+   reason.
+
+Consequence: parallelism cannot come from key granularity. It has to come from the transfer protocol:
+
+* **restore**: a chunk range on `kPrepareRetrieve` (server + client), 8 connections x ~190 MiB/s
+  = ~1.5 GB/s, which puts a 163k restore at ~1.7 s;
+* **store**: concurrent partial stores for one key (currently serialized by the server, measured in
+  section 15).
+
+Both are server changes. Nothing client-side can work around them.
