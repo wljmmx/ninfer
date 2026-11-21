@@ -174,9 +174,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             .sampling                = frame.sampling,
             // The rectangle argmaxes under these bitmaps, so its bonus column answers with a token
             // the request's grammar admits. One bitmap position per column: `width` is `k + 1`,
-            // which is exactly the `draft_window + 1` positions `bind_grammar_mask` lays out.
-            .row_sampling   = std::span<const ops::SamplingConfig>(
-                state.host_ingress.sampling.data(), static_cast<std::size_t>(batch_size)),
+            // which is exactly the `draft_window + 1` positions the row's block holds. Every row is
+            // bound - an unconstrained one carries all ones, refreshed this round - so neither the
+            // pointer nor the decision to read it changes between requests of the same shape.
+            .row_masks      = std::span<const ops::SamplingMask>(
+                state.host_ingress.verify_masks.data(), static_cast<std::size_t>(batch_size)),
             .mask_positions = static_cast<std::int32_t>(k) + 1,
         };
         if (phase == SpeculativePhase::Forward) {

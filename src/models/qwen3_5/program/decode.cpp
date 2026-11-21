@@ -653,6 +653,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            mtp_host_ingress->verify_masks[row]            = bind_verify_mask(masks, row);
             if (const char* probe = std::getenv("NINFER_VERIFY_INGRESS_PROBE")) {
                 static bool told = false;
                 if (!told) {
@@ -882,6 +883,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             dflash_host_ingress->ple_slots[row] = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            dflash_host_ingress->verify_masks[row]            = bind_verify_mask(masks, row);
             if (const char* probe = std::getenv("NINFER_VERIFY_INGRESS_PROBE")) {
                 static bool told = false;
                 if (!told) {

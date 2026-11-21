@@ -514,6 +514,7 @@ public:
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;
     std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
     ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    ops::SamplingMask bind_verify_mask(runtime::TokenMaskProvider*, std::size_t row);
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;

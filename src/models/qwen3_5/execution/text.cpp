@@ -1428,7 +1428,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap,
-                                           std::span<const ops::SamplingConfig> row_sampling,
+                                           std::span<const ops::SamplingMask> row_masks,
                                            std::int32_t mask_positions) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
@@ -1570,29 +1570,24 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         // reads as the bonus is an ordinary member of it. A plain argmax there ignores the
         // request's grammar: measured 2026-11-21, a JSON-schema request committed token 0 (`!`) in
         // the bonus slot and the Host matcher rejected the whole run ("[grammar] rejected set:
-        // 1144 248045 74455 0"). A constrained row's bitmap holds one block per draft position and
-        // this rectangle's columns are that same (row, position) order, so the rectangle is
-        // argmaxed under the bitmap instead of over the raw logits.
+        // 1144 248045 74455 0"). A row's bitmap holds one block per draft position and this
+        // rectangle's columns are that same (row, position) order, so the rectangle is argmaxed
+        // under the bitmap instead of over the raw logits.
         //
-        // The path has no per-request branch on the *values*: a row whose request carries no
-        // grammar keeps an all-ones block, which is an exact copy of its logits and therefore the
-        // plain argmax bit for bit, so the mask is always applied and the PPL gate stays
-        // bit-exact. The one host value it does read is whether a row HAS a bitmap at all, and the
-        // addresses it reads from are fixed offsets of the persistent mask tensor, so what a
-        // captured graph bakes is limited to the presence of a row's bitmap and the source
-        // address: a row that was unconstrained when its shape was captured and is constrained
-        // later in the same shape would not be masked. With this engine's configuration the arena
-        // holds one full-length lane, so a round carries one row; a future resident-multi-row mode
-        // has to fill every row's region with ones per round instead of skipping it here.
+        // Every row is bound: a row whose request carries no grammar gets an all-ones block from
+        // `bind_verify_mask`, refreshed each round. That is an exact copy of its logits and
+        // therefore the plain argmax bit for bit, and it means neither the pointer nor the decision
+        // to read it depends on the request - which is what keeps a captured graph valid across
+        // requests of one shape, in a multi-row batch as much as in a single-row one.
         const auto token_domain = static_cast<std::int32_t>(
             dimension(parameters_.model.resources().public_token_count));
-        const auto vocabulary     = static_cast<std::int32_t>(flat_logits.ne[0]);
-        const auto words          = (static_cast<std::size_t>(vocabulary) + 31) / 32;
+        const auto vocabulary = static_cast<std::int32_t>(flat_logits.ne[0]);
+        const auto words      = (static_cast<std::size_t>(vocabulary) + 31) / 32;
         Tensor bitmap = work_.alloc(
             DType::I32, {static_cast<std::int32_t>(static_cast<std::size_t>(columns) * words)});
         CUDA_CHECK(cudaMemsetAsync(bitmap.data, 0xFF, bitmap.bytes(), stream));
-        if (!row_sampling.empty()) {
-            // Only the positions this row's bitmap was filled for are copied; a wider rectangle
+        if (!row_masks.empty()) {
+            // Only the positions the row's block actually holds are copied; a wider rectangle
             // leaves the remaining columns all-ones rather than reading past the row's region.
             const std::int32_t positions = std::min(width, mask_positions);
             if (std::getenv("NINFER_VERIFY_MASK_PROBE") != nullptr) {
@@ -1600,24 +1595,23 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                 if (told < 40) {
                     ++told;
                     std::fprintf(stderr, "[vmask] rows=%zu width=%d positions=%d words=%zu row0=%p",
-                                 row_sampling.size(), static_cast<int>(width),
+                                 row_masks.size(), static_cast<int>(width),
                                  static_cast<int>(positions), words,
-                                 static_cast<const void*>(row_sampling[0].mask.words));
-                    for (const auto& operand : row_sampling) {
-                        std::fprintf(stderr, " %p", static_cast<const void*>(operand.mask.words));
+                                 static_cast<const void*>(row_masks[0].words));
+                    for (const auto& operand : row_masks) {
+                        std::fprintf(stderr, " %p", static_cast<const void*>(operand.words));
                     }
                     std::fprintf(stderr, "\n");
                     std::fflush(stderr);
                 }
             }
             for (std::int32_t row = 0; row < batch; ++row) {
-                const auto& operands = row_sampling[static_cast<std::size_t>(row)];
-                if (operands.mask.words == nullptr) { continue; }
-                const auto copied = std::min(static_cast<std::size_t>(operands.mask.stride), words);
+                const auto& block = row_masks[static_cast<std::size_t>(row)];
+                if (block.words == nullptr) { continue; }
+                const auto copied = std::min(static_cast<std::size_t>(block.stride), words);
                 for (std::int32_t position = 0; position < positions; ++position) {
                     const auto* source =
-                        operands.mask.words +
-                        static_cast<std::ptrdiff_t>(position) * operands.mask.stride;
+                        block.words + static_cast<std::ptrdiff_t>(position) * block.stride;
                     auto* destination =
                         static_cast<std::uint32_t*>(bitmap.data) +
                         (static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
@@ -1685,12 +1679,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       std::span<const std::int32_t> ple_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                      std::span<const ops::SamplingConfig> row_sampling,
+                                      std::span<const ops::SamplingMask> row_masks,
                                       std::int32_t mask_positions) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, ple_slots, envelope, hidden, logits,
-                             target_tokens, tap, row_sampling, mask_positions);
+                             target_tokens, tap, row_masks, mask_positions);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -1701,11 +1695,11 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink,
-                                      std::span<const ops::SamplingConfig> row_sampling,
+                                      std::span<const ops::SamplingMask> row_masks,
                                       std::int32_t mask_positions) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, ple_slots, envelope, hidden, logits,
-                             target_tokens, sink, row_sampling, mask_positions);
+                             target_tokens, sink, row_masks, mask_positions);
 }
 
 void TextContext::ple_commit_verify(const Tensor& accepted_columns) {

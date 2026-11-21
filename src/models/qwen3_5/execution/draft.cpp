@@ -1188,9 +1188,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .replay_records  = state.execution.replay_records,
                 .sampling        = frame.sampling,
                 // The verify rectangle argmaxes under these bitmaps, so a constrained request's
-                // bonus column cannot commit a token its grammar forbids.
-                .row_sampling   = std::span<const ops::SamplingConfig>(
-                    state.host_ingress.sampling.data(), static_cast<std::size_t>(batch_size)),
+                // bonus column cannot commit a token its grammar forbids. Every row is bound; an
+                // unconstrained one carries all ones (see MtpDecodeIngress::verify_masks).
+                .row_masks      = std::span<const ops::SamplingMask>(
+                    state.host_ingress.verify_masks.data(), static_cast<std::size_t>(batch_size)),
                 .mask_positions = static_cast<std::int32_t>(k) + 1,
                 .feature_sink    = &sink,
             };

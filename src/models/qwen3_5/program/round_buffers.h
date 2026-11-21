@@ -86,6 +86,11 @@ struct MtpDecodeIngress {
     // OrdinaryDecodeIngress::ple_slots).
     std::array<std::int32_t, kMaximumConcurrency> ple_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // The verify rectangle's bitmap for each row, always bound: a row without a grammar keeps an
+    // all-ones block, refreshed every round, so the verify pass has one code path whose pointers
+    // never change and whose bits decide the answer. `sampling[row].mask` above stays null for such
+    // a row - that is what lets the acceptance kernel keep its unmasked fast path.
+    std::array<ops::SamplingMask, kMaximumConcurrency> verify_masks{};
 };
 
 struct MtpDecodeEgress {
@@ -126,6 +131,8 @@ struct DFlashDecodeIngress {
     // names one slot per row, and a slot is the sequence's lane, not its StateImage slot.
     std::array<std::int32_t, kMaximumConcurrency> ple_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // See MtpDecodeIngress::verify_masks: always bound, all-ones when the row carries no grammar.
+    std::array<ops::SamplingMask, kMaximumConcurrency> verify_masks{};
 };
 
 struct DFlashDecodeEgress {

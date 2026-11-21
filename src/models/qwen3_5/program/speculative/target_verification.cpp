@@ -16,12 +16,12 @@ void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVe
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
                                  frame.ple_slots, envelope, frame.target_hidden,
                                  frame.target_logits, frame.target_tokens, *frame.feature_sink,
-                                 frame.row_sampling, frame.mask_positions);
+                                 frame.row_masks, frame.mask_positions);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
                                  frame.ple_slots, envelope, frame.target_hidden,
-                                 frame.target_logits, frame.target_tokens, frame.row_sampling,
+                                 frame.target_logits, frame.target_tokens, frame.row_masks,
                                  frame.mask_positions);
     }
 }

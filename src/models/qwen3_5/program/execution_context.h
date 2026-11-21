@@ -156,8 +156,9 @@ struct TargetVerifyFrameView {
     // The Host mirror of the same sampling operands, one entry per row of this rectangle, plus the
     // number of grammar positions each row's bitmap holds (`draft_window + 1`). The verify pass
     // argmaxes its columns under those bitmaps, so the bonus column a constrained request commits
-    // is a legal token instead of whatever the raw argmax happened to pick.
-    std::span<const ops::SamplingConfig> row_sampling;
+    // is a legal token instead of whatever the raw argmax happened to pick. Every row is bound:
+    // a row without a grammar carries an all-ones block, so the pointers never move.
+    std::span<const ops::SamplingMask> row_masks;
     std::int32_t mask_positions            = 0;
     DFlashFeatureSink* feature_sink        = nullptr;
 };
