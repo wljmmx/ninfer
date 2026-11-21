@@ -200,7 +200,7 @@ public:
     }
 
     bool publish(const BridgeKey& key, std::span<const std::byte> kv, std::span<const std::byte> state,
-                 std::int64_t first_chunk = 0) {
+                 std::int64_t first_chunk = 0, bool with_state = true) {
         if (!pool_.size() || instance_id_ == 0) {
             error_ = "bridge is not open";
             return false;
@@ -210,7 +210,9 @@ public:
             error_ = "KV bytes are not a whole number of chunks";
             return false;
         }
-        if (state.size() != config_.state.object_bytes()) {
+        // A part that carries no state sends an empty payload; the server's grouped path accepts a
+        // group with no chunks and writes nothing for it.
+        if (with_state && state.size() != config_.state.object_bytes()) {
             error_ = "state image size does not match its registered shape";
             return false;
         }
@@ -220,7 +222,9 @@ public:
         for (std::size_t offset = 0; offset < kv.size(); offset += chunk_bytes()) {
             chunks.emplace_back(reinterpret_cast<const char*>(kv.data() + offset), chunk_bytes());
         }
-        const std::string payload(reinterpret_cast<const char*>(state.data()), state.size());
+        const std::string payload =
+            with_state ? std::string(reinterpret_cast<const char*>(state.data()), state.size())
+                       : std::string();
 
         // One turn is one call on one connection, and that connection is one ZMQ identity, which the
         // server pins to one worker thread (affinity_pool.py). Sharding a store across the pool was
@@ -235,7 +239,7 @@ public:
             return false;
         }
         const bool ok = lease->store(make_key(key), chunks, config_.kv.shape, payload,
-                                     config_.state.shape, first_chunk, true);
+                                     config_.state.shape, first_chunk, with_state);
         if (!ok) { error_ = lease->error(); }
         return ok;
     }

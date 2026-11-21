@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -379,9 +380,33 @@ public:
         if (!async_write_) {
             const auto wal_path = wal_.append(prompt_tokens, checkpoint);
             const auto started  = std::chrono::steady_clock::now();
-            const bool written  = publish_job(prompt_tokens, checkpoint, first_chunk);
+            // One message carrying 2.5 GB is not answered by the server: measured on a 163k prefix,
+            // the bytes went out at 213 MiB/s and the reply never arrived. A part therefore carries
+            // a bounded slice of the run. The server's grouped path maps each part's own chunk
+            // indices onto the key, so a part may cover any contiguous subset; only the last part
+            // carries the state image, because that belongs to the trailing chunk.
+            const std::size_t part_bytes =
+                std::max<std::size_t>(1, chunk_bytes_ == 0 ? 0 : publish_part_bytes() / chunk_bytes_);
+            bool written    = true;
+            std::size_t part = 0;
+            std::size_t parts_sent = 0;
+            for (std::size_t begin = first_chunk; begin < total_chunks;
+                 begin += part_bytes, ++part) {
+                const std::size_t end  = std::min(total_chunks, begin + part_bytes);
+                const bool last        = end == total_chunks;
+                if (!publish_job(prompt_tokens, checkpoint, begin, end, last, part)) {
+                    written = false;
+                    break;
+                }
+                ++parts_sent;
+            }
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+                std::fprintf(stderr, "[lmcache] store split into %zu part(s) of %zu chunk(s)\n",
+                             parts_sent, part_bytes);
+                std::fflush(stderr);
+            }
             if (seconds >= 0.2) {
                 // The synchronous publish runs on the engine's own thread, so this number is time the
                 // request (or the boundary that produced the checkpoint) actually waits.
@@ -404,9 +429,10 @@ public:
                 const auto total_mib = kv_mib + state_mib;
                 std::fprintf(stderr,
                              "[lmcache] store %.1f MiB in %.3f s (%.0f MiB/s) | kv %.1f + state %.1f "
-                             "MiB | chunk %zu of %zu | %zu token(s) | ok=%d\n",
+                             "MiB | chunk %zu of %zu | %zu token(s) | %zu part(s) | ok=%d\n",
                              total_mib, seconds, total_mib / std::max(seconds, 1e-6), kv_mib, state_mib,
-                             first_chunk, total_chunks, prompt_tokens.size(), written ? 1 : 0);
+                             first_chunk, total_chunks, prompt_tokens.size(), parts_sent,
+                             written ? 1 : 0);
                 std::fflush(stderr);
             }
             if (written) { wal_.complete(wal_path); }
@@ -517,8 +543,22 @@ public:
     // `first_chunk` is the first chunk of this run the cache does not already hold; the payload then
     // carries [first_chunk, end) and names those absolute indices. Zero means "publish the whole run",
     // which is what every caller did before this parameter existed.
+    // Bytes per store message. One 163k checkpoint is 2.5 GB, and the server does not answer a
+    // message that large; 512 MiB keeps every part in the range that has been answered reliably.
+    // NINFER_PUBLISH_PART_MB overrides it.
+    [[nodiscard]] static std::size_t publish_part_bytes() {
+        constexpr std::size_t kDefault = 512ULL * 1024 * 1024;
+        const char* value = std::getenv("NINFER_PUBLISH_PART_MB");
+        if (value == nullptr || *value == '\0') { return kDefault; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed <= 0) { return kDefault; }
+        return static_cast<std::size_t>(parsed) * 1024ULL * 1024ULL;
+    }
+
     bool publish_job(std::span<const TokenId> prompt_tokens,
-                     const ninfer::CachedCheckpoint& checkpoint, std::size_t first_chunk = 0) {
+                     const ninfer::CachedCheckpoint& checkpoint, std::size_t first_chunk = 0,
+                     std::size_t chunk_end = std::numeric_limits<std::size_t>::max(),
+                     bool with_state = true, std::size_t part = 0) {
         // Every early return below drops a checkpoint silently, and a dropped store is invisible from
         // the engine side: the request already answered and the next lookup simply misses. The probe
         // names which guard fired, because "the cache never has it" has been three different bugs.
@@ -583,48 +623,65 @@ public:
 
         ninfer::core::lmcache::BridgeKey key;
         key.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
-        key.request_id =
-            "put-" + std::to_string(instance_tag_) + "-" + std::to_string(++sequence_);
+        // One request id per part. The server keys its session - and its prefetch job - by request_id,
+        // so sharing one across parts is what made a concurrent split fail (measured: the second and
+        // later parts never saw a prepare reply). The token stream is identical, so all parts name
+        // the same cache entry.
+        key.request_id = "put-" + std::to_string(instance_tag_) + "-" +
+                         std::to_string(++sequence_) +
+                         (part == 0 ? std::string() : "-p" + std::to_string(part));
 
         std::string state;
-        for (const std::string& shard : checkpoint.state_shards) { state += shard; }
-        if (state.size() != image_bytes_) {
-            if (probe) {
-                std::fprintf(stderr,
-                             "[publish] job refused: state is %zu B, the registered image is %zu B\n",
-                             state.size(), image_bytes_);
-                std::fflush(stderr);
+        std::vector<std::byte> payload;
+        if (with_state) {
+            for (const std::string& shard : checkpoint.state_shards) { state += shard; }
+            if (state.size() != image_bytes_) {
+                if (probe) {
+                    std::fprintf(
+                        stderr, "[publish] job refused: state is %zu B, the registered image is %zu B\n",
+                        state.size(), image_bytes_);
+                    std::fflush(stderr);
+                }
+                return false;
             }
-            return false;
+            // [u32 valid_tokens][state image][tail chunk]. The tail region is zero when the real
+            // length does not reach past the last addressable chunk, so a reader can slice it blind.
+            const std::size_t carried = valid_tokens > covered ? tail_capacity : 0;
+            const std::span<const std::byte> tail =
+                carried == 0 ? std::span<const std::byte>{}
+                             : std::span<const std::byte>(checkpoint.kv_bytes.data() + tail_begin,
+                                                          carried);
+            payload = ninfer::core::lmcache::encode_state_object(
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(state.data()),
+                                           state.size()),
+                valid_tokens, tail, chunk_bytes_total);
         }
-
-        // [u32 valid_tokens][state image][tail chunk]. The tail region is zero when the real length
-        // does not reach past the last addressable chunk, so a reader can slice it blind.
-        const std::size_t carried = valid_tokens > covered ? tail_capacity : 0;
-        const std::span<const std::byte> tail =
-            carried == 0 ? std::span<const std::byte>{}
-                         : std::span<const std::byte>(checkpoint.kv_bytes.data() + tail_begin,
-                                                      carried);
-        const auto payload = ninfer::core::lmcache::encode_state_object(
-            std::span<const std::byte>(reinterpret_cast<const std::byte*>(state.data()),
-                                       state.size()),
-            valid_tokens, tail, chunk_bytes_total);
 
         std::lock_guard<std::mutex> guard(bridge_mutex_);
         // Slice on a chunk boundary: `complete` is a whole number of chunks, and `first_chunk` counts
         // them, so the span stays aligned and the indices handed to the server are its own.
-        const std::size_t skip_bytes = std::min(complete, first_chunk * chunk_bytes_total);
-        // Every chunk this run could carry is already in the cache: the request that produced this
+        const std::size_t begin_byte = std::min(complete, first_chunk * chunk_bytes_total);
+        const std::size_t end_chunk  = std::min(chunk_end, complete / chunk_bytes_total);
+        const std::size_t end_byte   = end_chunk * chunk_bytes_total;
+        // Every chunk this part could carry is already in the cache: the request that produced this
         // checkpoint had just restored the same prefix, so the registry named its own chunk count.
         // Nothing to send is success - it used to fall through to the bridge with an empty span,
         // which the bridge rejects as "not a whole number of chunks", and a perfectly good store
         // was counted (and logged) as a failure.
-        if (skip_bytes >= complete) { return true; }
-        const bool written = bridge_->publish(
-            key, std::span<const std::byte>(checkpoint.kv_bytes.data() + skip_bytes,
-                                            complete - skip_bytes),
-            std::span<const std::byte>(payload.data(), payload.size()),
-            static_cast<std::int64_t>(first_chunk));
+        if (end_byte <= begin_byte) { return true; }
+        if (probe) {
+            std::fprintf(stderr,
+                         "[publish] part %zu: chunk [%zu,%zu) of %zu, bytes [%zu,%zu), state=%d\n",
+                         part, first_chunk, end_chunk, complete / chunk_bytes_total, begin_byte,
+                         end_byte, with_state ? 1 : 0);
+            std::fflush(stderr);
+        }
+        const std::span<const std::byte> kv_slice(checkpoint.kv_bytes.data() + begin_byte,
+                                                  end_byte - begin_byte);
+        std::span<const std::byte> state_slice;
+        if (with_state) { state_slice = std::span<const std::byte>(payload.data(), payload.size()); }
+        const bool written = bridge_->publish(key, kv_slice, state_slice,
+                                              static_cast<std::int64_t>(first_chunk), with_state);
         if (!written) {
             // A publish that fails is invisible from the engine side: the request already answered,
             // and the next lookup simply misses. That is why "the cache never answers" survived this

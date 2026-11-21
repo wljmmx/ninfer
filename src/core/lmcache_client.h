@@ -168,7 +168,11 @@ public:
             }
         }
 
-        std::vector<TensorGroupWire> groups(with_state ? 2 : 1);
+        // Always two groups, even when this part carries no state. A single-group envelope takes the
+        // server's flat path, which requires one chunk per object key for the WHOLE key; the grouped
+        // path maps the envelope's own indices onto the key list and therefore accepts a subset.
+        // That is what makes a split store possible at all.
+        std::vector<TensorGroupWire> groups(2);
         groups[0].chunk_indices.reserve(kv_chunks.size());
         groups[0].tensors.reserve(kv_chunks.size());
         for (std::size_t i = 0; i < kv_chunks.size(); ++i) {
