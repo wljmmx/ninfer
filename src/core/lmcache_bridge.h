@@ -19,6 +19,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <future>
 #include <span>
 #include <string>
 #include <vector>
@@ -256,13 +258,26 @@ public:
     // milliseconds, a transfer is the payload and is proportional to bytes. Reporting the sum (as
     // fetch() used to) hides which one a change moved.
     bool restore(const BridgeKey& key, std::vector<std::byte>* kv, std::vector<std::byte>* state) {
+        const CacheKey cache_key = make_key(key);
+        // Probe: the server binds a worker to the ZMQ identity, so connections should run on
+        // different workers. Whether that makes two retrieves of the SAME key overlap -- and whether
+        // they trip over each other's session state -- is a measurement, not a reading of the code.
+        if (const char* fanout_text = std::getenv("NINFER_RESTORE_FANOUT")) {
+            const int fanout = std::atoi(fanout_text);
+            if (fanout > 1) { return restore_fanout(cache_key, fanout, kv, state); }
+        }
+        // Split the payload across connections. The server assembles a restore in ~0.15 s and then
+        // pushes 181 MB down one socket; the link carries far more than that when asked in parallel.
+        if (const char* split_text = std::getenv("NINFER_RESTORE_SPLIT")) {
+            const int parts = std::atoi(split_text);
+            if (parts > 1) { return restore_split(key, cache_key, parts, kv, state); }
+        }
         auto lease = pool_.acquire();
         if (!lease) {
             error_ = "no connection available";
             return false;
         }
         RestorePayload got;
-        const CacheKey cache_key = make_key(key);
         const auto matched_at      = std::chrono::steady_clock::now();
         const bool matched         = lease->has(cache_key);
         const auto transferred_at  = std::chrono::steady_clock::now();
@@ -292,6 +307,169 @@ public:
     }
 
 private:
+    // Probe only: run N retrieves of the same key on N connections at once and report what each
+    // branch actually cost. If the branches overlap, the server really is running them on different
+    // worker threads (affinity is the ZMQ identity, not the cache key) and a chunk range split is
+    // worth building. If they serialize, the total will be the sum and the split buys nothing.
+    bool restore_fanout(const CacheKey& cache_key, int fanout, std::vector<std::byte>* kv,
+                        std::vector<std::byte>* state) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto width   = static_cast<std::size_t>(fanout);
+        std::vector<RestorePayload> payloads(width);
+        std::vector<double> branch_seconds(width, 0.0);
+        std::vector<std::future<bool>> tasks;
+        tasks.reserve(width);
+        for (std::size_t i = 0; i < width; ++i) {
+            tasks.push_back(std::async(std::launch::async, [this, &cache_key, &payloads,
+                                                            &branch_seconds, i]() {
+                auto lease = pool_.acquire();
+                if (!lease) { return false; }
+                if (!lease->has(cache_key)) { return false; }
+                const auto began = std::chrono::steady_clock::now();
+                const bool ok    = lease->fetch(cache_key, &payloads[i]);
+                branch_seconds[i] =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+                return ok;
+            }));
+        }
+        int succeeded = 0;
+        for (auto& task : tasks) {
+            if (task.get()) { ++succeeded; }
+        }
+        const double total =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr, "[lmcache] restore fanout=%d ok=%d/%d total %.3f s | branches",
+                     fanout, succeeded, fanout, total);
+        for (const double seconds : branch_seconds) { std::fprintf(stderr, " %.3f", seconds); }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+        if (succeeded != fanout) {
+            error_ = "restore fanout branch failed";
+            return false;
+        }
+        const RestorePayload& got = payloads[0];
+        if (kv != nullptr) {
+            kv->clear();
+            for (const std::string& chunk : got.kv_chunks) {
+                const auto* bytes = reinterpret_cast<const std::byte*>(chunk.data());
+                kv->insert(kv->end(), bytes, bytes + chunk.size());
+            }
+        }
+        if (state != nullptr) {
+            state->assign(reinterpret_cast<const std::byte*>(got.state.data()),
+                          reinterpret_cast<const std::byte*>(got.state.data()) + got.state.size());
+        }
+        return true;
+    }
+
+    // Split one restore into `parts` retrieves that run at the same time on different connections.
+    //
+    // Each part asks the server for its own slice - KV chunk range, state byte range - and carries
+    // its own request_id, because the server's prefetch job is consumed once per request_id: with a
+    // shared one only the first part finds the prefetched objects and the rest time out (measured:
+    // 4/4 branches failed, 5.008 s each). The token stream is untouched, so all parts name the same
+    // cache entry; only the session differs.
+    bool restore_split(const BridgeKey& key, const CacheKey& base_key, int parts,
+                       std::vector<std::byte>* kv, std::vector<std::byte>* state) {
+        const auto width      = static_cast<std::size_t>(parts);
+        const auto chunk_tok  = static_cast<std::int64_t>(config_.chunk_tokens());
+        if (chunk_tok <= 0) {
+            error_ = "chunk tokens not known";
+            return false;
+        }
+        const std::int64_t chunks = base_key.end / chunk_tok;
+        const auto state_bytes    = static_cast<std::int64_t>(config_.state.object_bytes());
+        if (chunks <= 0 || state_bytes <= 0) {
+            error_ = "nothing to split";
+            return false;
+        }
+
+        struct PartResult {
+            bool ok = false;
+            std::string error;
+            RestorePayload payload;
+            std::int64_t chunk_begin = 0;
+            std::int64_t chunk_end   = 0;
+        };
+        std::vector<PartResult> results(width);
+        std::vector<std::future<void>> tasks;
+        tasks.reserve(width);
+        const auto started = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < width; ++i) {
+            // Contiguous, exhaustive cover of both ranges: chunk i owns [chunks*i/parts, chunks*(i+1)/parts)
+            // and byte i owns the same fraction of the state object. Together they reassemble exactly.
+            const std::int64_t cb = chunks * static_cast<std::int64_t>(i) / static_cast<std::int64_t>(width);
+            const std::int64_t ce =
+                chunks * static_cast<std::int64_t>(i + 1) / static_cast<std::int64_t>(width);
+            const std::int64_t sb =
+                state_bytes * static_cast<std::int64_t>(i) / static_cast<std::int64_t>(width);
+            const std::int64_t se =
+                state_bytes * static_cast<std::int64_t>(i + 1) / static_cast<std::int64_t>(width);
+            results[i].chunk_begin = cb;
+            results[i].chunk_end   = ce;
+            tasks.push_back(std::async(std::launch::async, [this, &key, &results, i, cb, ce, sb,
+                                                            se]() {
+                BridgeKey slice_key = key;
+                slice_key.request_id += "-p" + std::to_string(i);
+                const CacheKey slice = make_key(slice_key);
+                PartResult& out      = results[i];
+                auto lease           = pool_.acquire();
+                if (!lease) {
+                    out.error = "no connection available";
+                    return;
+                }
+                if (!lease->has(slice)) {
+                    out.error = "not cached";
+                    return;
+                }
+                out.ok = lease->fetch(slice, &out.payload, cb, ce, sb, se);
+                if (!out.ok) { out.error = lease->error(); }
+            }));
+        }
+        for (auto& task : tasks) { task.get(); }
+        const double total =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+        std::size_t kv_before = kv != nullptr ? kv->size() : 0;
+        std::size_t state_before = state != nullptr ? state->size() : 0;
+        if (kv != nullptr) { kv->clear(); }
+        if (state != nullptr) { state->clear(); }
+        for (std::size_t i = 0; i < width; ++i) {
+            if (!results[i].ok) {
+                error_ = "restore part " + std::to_string(i) + " failed: " + results[i].error;
+                if (kv != nullptr) { kv->resize(kv_before); }
+                if (state != nullptr) { state->resize(state_before); }
+                return false;
+            }
+            if (kv != nullptr) {
+                for (const std::string& chunk : results[i].payload.kv_chunks) {
+                    const auto* bytes = reinterpret_cast<const std::byte*>(chunk.data());
+                    kv->insert(kv->end(), bytes, bytes + chunk.size());
+                }
+            }
+            if (state != nullptr) {
+                const std::string& piece = results[i].payload.state;
+                state->insert(state->end(), reinterpret_cast<const std::byte*>(piece.data()),
+                              reinterpret_cast<const std::byte*>(piece.data()) + piece.size());
+            }
+        }
+        const std::size_t want_kv =
+            static_cast<std::size_t>(chunks) * chunk_bytes();
+        const std::size_t want_state = static_cast<std::size_t>(state_bytes);
+        const bool sized = (kv == nullptr || kv->size() == want_kv) &&
+                           (state == nullptr || state->size() == want_state);
+        std::fprintf(stderr,
+                     "[lmcache] restore split=%d total %.3f s | kv %zu/%zu B, state %zu/%zu B%s\n",
+                     parts, total, kv != nullptr ? kv->size() : 0, want_kv,
+                     state != nullptr ? state->size() : 0, want_state, sized ? "" : "  SIZE MISMATCH");
+        std::fflush(stderr);
+        if (!sized) {
+            error_ = "restore split reassembled the wrong size";
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] RegisterContext registration() const {
         RegisterContext context;
         context.instance_id        = instance_id_;

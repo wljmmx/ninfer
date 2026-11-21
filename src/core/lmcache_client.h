@@ -216,13 +216,28 @@ public:
         return call(kWaitPrefetch, {request.take(), timeout.take()}, &body);
     }
 
-    // Only call this after has() returned true: it moves the whole payload across.
-    bool fetch(const CacheKey& key, RestorePayload* out) {
+    // Only call this after has() returned true: it moves the payload across.
+    //
+    // The four ranges narrow what the server reads and encodes; -1 means "no restriction", which is
+    // what every caller got before the ranges existed. They exist so one restore can be split across
+    // connections: the server assembles in 0.15 s but ships 181 MB down a single one, and the link
+    // does not care how many connections carry it.
+    bool fetch(const CacheKey& key, RestorePayload* out, std::int64_t chunk_begin = -1,
+               std::int64_t chunk_end = -1, std::int64_t state_begin = -1,
+               std::int64_t state_end = -1) {
         std::string body;
         {
             msgpack::Writer instance;
             instance.integer(registered_->instance_id);
-            if (!call(kPrepareRetrieve, {encode_cache_key(key), instance.take()}, &body)) {
+            msgpack::Writer ranges[4];
+            ranges[0].integer(chunk_begin);
+            ranges[1].integer(chunk_end);
+            ranges[2].integer(state_begin);
+            ranges[3].integer(state_end);
+            if (!call(kPrepareRetrieve,
+                      {encode_cache_key(key), instance.take(), ranges[0].take(), ranges[1].take(),
+                       ranges[2].take(), ranges[3].take()},
+                      &body)) {
                 return false;
             }
         }
