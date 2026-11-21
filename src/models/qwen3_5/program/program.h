@@ -394,6 +394,15 @@ public:
         return constraint_failed_.at(row);
     }
 
+    // The Engine's output policy is the second, host-side grammar. When it rejects a token the mask
+    // let through (measured 2026-11-21: 7 of 8 speculative drafts), the row must be marked failed
+    // here, before commit(): the commit contract only accepts a failed decision for a row the
+    // program already considers constraint-dead ("pending transaction decision is invalid"
+    // otherwise), and letting the throw escape answered 503 to every later request.
+    void mark_constraint_failed(std::size_t row, bool failed) {
+        constraint_failed_.at(row) = failed;
+    }
+
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:

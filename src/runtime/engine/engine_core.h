@@ -14,6 +14,7 @@
 #include "runtime/engine/kv_capacity.h"
 #include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/program/program.h"
+#include "text/grammar.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/param_bus.h"
@@ -1257,8 +1258,13 @@ private:
                 throw std::logic_error("terminal native sequence could not finish");
             }
             if (finished.checkpoint) {
+                const auto publish_started = Clock::now();
                 resources_.publish(*instance_.program, request->continuation_owner,
                                    *finished.checkpoint, monotonic_ms());
+                report_boundary_work(
+                    "publish", request->id,
+                    std::chrono::duration<double>(Clock::now() - publish_started).count(),
+                    request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             }
             resources_.finish(*instance_.program, request->continuation_owner, *request->base_plan,
                               request->publication_order);
@@ -1404,8 +1410,29 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
-                const OutputDecision decision = request->output.preview_model(
-                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                OutputDecision decision;
+                try {
+                    decision = request->output.preview_model(
+                        row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                } catch (const text::GrammarViolation& violation) {
+                    // This request's token set and the matcher disagree - a speculative draft the
+                    // mask never saw, measured 2026-11-21 as 7 of 8 drafts. It is the request's
+                    // outcome, not the engine's: fail this row and keep every other lane serving.
+                    // Escaping to the worker's catch used to set failed_ and answer 503 to every
+                    // later request, which is what made a single constrained turn look like an
+                    // engine outage.
+                    //
+                    // The row is marked on the batch first: commit() only accepts a failed decision
+                    // for a row the program already considers constraint-dead, and the program's own
+                    // mark comes from the mask, which is exactly the side that accepted these tokens.
+                    std::fprintf(stderr, "[grammar] request %llu failed: %s\n",
+                                 static_cast<unsigned long long>(request->id), violation.what());
+                    std::fflush(stderr);
+                    pending.mark_constraint_failed(row, true);
+                    failed[row]    = true;   // expected disposition: FailedReleased (see below)
+                    decisions[row] = CommitDecision{.terminal = true, .failed = true};
+                    continue;
+                }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1622,6 +1649,18 @@ private:
         for (std::size_t index = 0; index < terminal_count; ++index) {
             complete_success(terminal_requests[index], terminal_reasons[index]);
         }
+    }
+
+    // Boundary attribution. The done line shows a "boundary" phase of 1.5 s on an agent-shaped turn
+    // (163k prompt, +30 tokens) against 189 ms when the same prompt is asked twice, and the phase
+    // total alone cannot say which of the three boundary jobs it is. These lines answer that -
+    // capture staging, finish-time publish, fork - and stay silent unless they are worth printing.
+    static void report_boundary_work(const char* what, std::uint64_t id, double seconds,
+                                     std::uint32_t pages) {
+        if (seconds < 0.02) { return; }
+        std::fprintf(stderr, "[ckpt] %s | req %llu | %u page(s) | %.0f ms\n", what,
+                     static_cast<unsigned long long>(id), pages, seconds * 1000.0);
+        std::fflush(stderr);
     }
 
     void reserve_active_capture(const std::shared_ptr<Request>& request, EngineRequestState next) {
@@ -3067,8 +3106,15 @@ private:
                 throw std::logic_error("progress owner cannot obtain its legal unit");
             }
         }
-        if (prefill && runnable_units_[*prefill] && !prepare_semantic_capture(slots_[*prefill])) {
-            runnable_units_[*prefill] = false;
+        if (prefill && runnable_units_[*prefill]) {
+            const auto capture_started = Clock::now();
+            const bool capture_ready   = prepare_semantic_capture(slots_[*prefill]);
+            report_boundary_work(
+                "capture stage", slots_[*prefill]->id,
+                std::chrono::duration<double>(Clock::now() - capture_started).count(),
+                slots_[*prefill]->base_plan ? slots_[*prefill]->base_plan->summary().prompt_tokens
+                                            : 0U);
+            if (!capture_ready) { runnable_units_[*prefill] = false; }
         }
         // A pause may have selected an already licensed younger row. Its permit belongs
         // to Native cleanup, and it must not enter this cycle's compact execution batch.

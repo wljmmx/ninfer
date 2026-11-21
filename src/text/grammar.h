@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -45,6 +46,18 @@ public:
     virtual bool accept(std::string_view bytes)        = 0;
     virtual void confirm() noexcept                    = 0;
     virtual void discard() noexcept                    = 0;
+};
+
+// A token the sampler produced is not in the grammar's token set.
+//
+// It is a property of the REQUEST, never of the engine: the target token is sampled under the mask,
+// but a speculative draft is the model's own continuation, and the device-side mask and this matcher
+// have been seen to disagree about it (measured 2026-11-21: 7 of 8 drafts rejected here while the
+// mask reported no dead position). Callers turn this into a request outcome - treating it as a
+// worker failure answered 503 to every later request.
+class GrammarViolation : public std::logic_error {
+public:
+    using std::logic_error::logic_error;
 };
 
 // One immutable vocabulary/compiler per model; one transactional matcher per request.
