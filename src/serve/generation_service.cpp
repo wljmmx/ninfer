@@ -307,6 +307,16 @@ public:
     // Switch off (the default) is the old call, on the old thread, byte for byte.
     void store(std::span<const TokenId> prompt_tokens,
                const ninfer::CachedCheckpoint& checkpoint) override {
+        const bool trace = std::getenv("NINFER_PUBLISH_PROBE") != nullptr;
+        if (trace) {
+            std::fprintf(stderr,
+                         "[lmcache] store entered: ready=%d bridge=%d tokens=%zu disabled=%d "
+                         "page_bytes=%zu kv=%zu\n",
+                         ready_.load() ? 1 : 0, bridge_ != nullptr ? 1 : 0, prompt_tokens.size(),
+                         write_disabled_.load(std::memory_order_relaxed) ? 1 : 0,
+                         checkpoint.page_bytes, checkpoint.kv_bytes.size());
+            std::fflush(stderr);
+        }
         if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
         if (write_disabled_.load(std::memory_order_relaxed)) { return; }
         if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
@@ -349,8 +359,21 @@ public:
         }
         const auto total_chunks =
             chunk_bytes_ == 0 ? 0 : checkpoint.kv_bytes.size() / chunk_bytes_;
+        if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+            std::fprintf(stderr,
+                         "[lmcache] store path: first_chunk %zu, total_chunks %zu, async %d, "
+                         "kv %zu B, state_shards %zu\n",
+                         first_chunk, total_chunks, async_write_ ? 1 : 0, checkpoint.kv_bytes.size(),
+                         checkpoint.state_shards.size());
+            std::fflush(stderr);
+        }
         if (first_chunk >= total_chunks) {
             // Nothing new to say: the cache already holds every whole chunk this checkpoint has.
+            if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+                std::fprintf(stderr, "[lmcache] store skipped: nothing past chunk %zu\n",
+                             first_chunk);
+                std::fflush(stderr);
+            }
             return;
         }
         if (!async_write_) {
@@ -496,8 +519,23 @@ public:
     // which is what every caller did before this parameter existed.
     bool publish_job(std::span<const TokenId> prompt_tokens,
                      const ninfer::CachedCheckpoint& checkpoint, std::size_t first_chunk = 0) {
-        if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return false; }
-        if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return false; }
+        // Every early return below drops a checkpoint silently, and a dropped store is invisible from
+        // the engine side: the request already answered and the next lookup simply misses. The probe
+        // names which guard fired, because "the cache never has it" has been three different bugs.
+        const bool probe = std::getenv("NINFER_PUBLISH_PROBE") != nullptr;
+        const auto refuse = [probe](const char* why) {
+            if (probe) {
+                std::fprintf(stderr, "[publish] job refused: %s\n", why);
+                std::fflush(stderr);
+            }
+            return false;
+        };
+        if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) {
+            return refuse("not ready, no bridge, or no tokens");
+        }
+        if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) {
+            return refuse("checkpoint has no pages or no bytes");
+        }
 
         // Only whole chunks can be addressed, so the key and the KV group stay chunk-aligned. The
         // partial trailing chunk is not thrown away any more: it rides in the state object (L7-b).
@@ -511,14 +549,14 @@ public:
         // The publish was lost silently; only a cross-process retrieve would have shown it.
         const std::size_t chunk_bytes_total = chunk_bytes_;
         if (chunk_bytes_total == 0 || chunk_tokens_ == 0 || page_bytes_ == 0 || page_tokens_ == 0) {
-            return false;
+            return refuse("cache geometry is not populated");
         }
         // Q64 2d-2b-4: the layout arithmetic lives in core/lmcache_layout.h so the store side and the
         // restore side cannot drift apart. This call computes exactly what the inline block did.
         const auto plan = ninfer::core::lmcache::plan_payload(
             checkpoint.kv_bytes.size(), checkpoint.valid_tokens, checkpoint.frontier,
             prompt_tokens.size(), chunk_bytes_total, chunk_tokens_, page_bytes_, page_tokens_);
-        if (plan.chunks == 0 || plan.valid_tokens == 0) { return false; }
+        if (plan.chunks == 0 || plan.valid_tokens == 0) { return refuse("plan has no chunks or no valid tokens"); }
         const std::size_t payload_chunks = plan.payload_chunks;
         const std::size_t addressable    = prompt_tokens.size() / chunk_tokens_;
         const std::size_t chunks         = plan.chunks;
@@ -550,7 +588,15 @@ public:
 
         std::string state;
         for (const std::string& shard : checkpoint.state_shards) { state += shard; }
-        if (state.size() != image_bytes_) { return false; }
+        if (state.size() != image_bytes_) {
+            if (probe) {
+                std::fprintf(stderr,
+                             "[publish] job refused: state is %zu B, the registered image is %zu B\n",
+                             state.size(), image_bytes_);
+                std::fflush(stderr);
+            }
+            return false;
+        }
 
         // [u32 valid_tokens][state image][tail chunk]. The tail region is zero when the real length
         // does not reach past the last addressable chunk, so a reader can slice it blind.

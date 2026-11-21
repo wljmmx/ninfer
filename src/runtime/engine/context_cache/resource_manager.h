@@ -497,14 +497,26 @@ public:
         auto payload            = std::make_shared<CachedCheckpoint>(std::move(out));
         std::vector<TokenId> kept(tokens.begin(), tokens.end());
         auto backend = checkpoint_cache_;
+        // The job captures its own COPY of the token ids on purpose. Capturing by move emptied the
+        // local `kept`, and the fallback below then ran with an empty token list: every payload over
+        // the worker's 256 MiB window (measured at 396 MB for a 16k prefix) was refused by enqueue
+        // and silently dropped by the synchronous path, while small prefixes stored fine. A token
+        // list is a few tens of KiB, so copying it costs nothing next to that bug.
         if (publish_worker_ != nullptr &&
             publish_worker_->enqueue(
-                [backend, kept = std::move(kept), payload]() {
-                    backend->store(kept, *payload);
+                [captured_backend = backend, captured_tokens = kept,
+                 captured_payload = payload]() {
+                    captured_backend->store(captured_tokens, *captured_payload);
                     return true;
                 },
                 bytes, /*due=*/1, /*now=*/0)) {
             return;
+        }
+        if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+            std::fprintf(stderr,
+                         "[publish] sink: worker refused %zu B, storing synchronously on this thread\n",
+                         bytes);
+            std::fflush(stderr);
         }
         backend->store(kept, *payload);
     }
