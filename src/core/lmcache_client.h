@@ -310,6 +310,7 @@ private:
         }
         for (const std::string& payload : payloads) { frames.push_back(payload); }
 
+        const auto send_started = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < frames.size(); ++i) {
             const int flags = (i + 1 < frames.size()) ? ZMQ_SNDMORE : 0;
             if (zmq_send(socket_, frames[i].data(), frames[i].size(), flags) < 0) {
@@ -318,6 +319,7 @@ private:
                 return false;
             }
         }
+        const auto sent_at = std::chrono::steady_clock::now();
 
         std::vector<std::string> reply;
         while (true) {
@@ -359,6 +361,20 @@ private:
             }
         }
         if (body != nullptr) { *body = reply.size() >= 3 ? reply[2] : std::string(); }
+        if (std::getenv("NINFER_LMCACHE_IO_PROBE") != nullptr) {
+            // Splitting the turn says which side is the limit: a send that blocks means the server is
+            // not draining, a send that returns instantly with a long wait means it is still working.
+            std::size_t payload_bytes = 0;
+            for (const std::string& payload : payloads) { payload_bytes += payload.size(); }
+            const auto received_at = std::chrono::steady_clock::now();
+            const auto seconds     = [](auto from, auto to) {
+                return std::chrono::duration<double>(to - from).count();
+            };
+            std::fprintf(stderr, "[lmcache io] op=%lld bytes=%zu send=%.3f s wait=%.3f s\n",
+                         static_cast<long long>(operation), payload_bytes,
+                         seconds(send_started, sent_at), seconds(sent_at, received_at));
+            std::fflush(stderr);
+        }
         return true;
     }
 
