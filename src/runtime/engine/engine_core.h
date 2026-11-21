@@ -1253,10 +1253,15 @@ private:
                 throw std::logic_error("terminal-pending request has invalid ownership");
             }
             const FinishReason reason = *request->terminal_reason;
+            const auto finish_started = Clock::now();
             auto finished             = instance_.program->finish(*request->sequence);
             if (finished.status != ConsumeStatus::Consumed) {
                 throw std::logic_error("terminal native sequence could not finish");
             }
+            report_boundary_work(
+                "program finish", request->id,
+                std::chrono::duration<double>(Clock::now() - finish_started).count(),
+                request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             if (finished.checkpoint) {
                 const auto publish_started = Clock::now();
                 resources_.publish(*instance_.program, request->continuation_owner,
@@ -1266,15 +1271,25 @@ private:
                     std::chrono::duration<double>(Clock::now() - publish_started).count(),
                     request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             }
+            const auto release_started = Clock::now();
             resources_.finish(*instance_.program, request->continuation_owner, *request->base_plan,
                               request->publication_order);
             request->continuation_owner = 0;
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             request->terminal_reason.reset();
+            report_boundary_work(
+                "resources finish", request->id,
+                std::chrono::duration<double>(Clock::now() - release_started).count(),
+                request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            const auto complete_started = Clock::now();
             complete_success(request, reason);
+            report_boundary_work(
+                "complete", request->id,
+                std::chrono::duration<double>(Clock::now() - complete_started).count(),
+                request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             boundary = begin_host_phase();
             changed  = true;
         }
