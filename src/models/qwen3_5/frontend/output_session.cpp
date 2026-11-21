@@ -456,6 +456,25 @@ public:
         try {
             grammar->accept(tokens);
         } catch (...) {
+            // Which token id is the rejected one, and is id 0 a real piece or a special token? That
+            // one fact separates "the verify pass never computed the bonus column" (id 0 is an
+            // ordinary piece and the logits were zero) from "the model legitimately chose a special
+            // token the matcher does not accept" (id 0 is <|...|>). Measured 2026-11-21: the
+            // committed run ends in id 0 exactly when it carries a bonus slot.
+            std::fprintf(stderr, "[grammar] rejected set:");
+            for (std::size_t index = 0; index < tokens.size() && index < 8; ++index) {
+                std::fprintf(stderr, " %lld", static_cast<long long>(tokens[index]));
+            }
+            if (tokenizer) {
+                const auto piece0 = tokenizer->decoded_token(0);
+                std::fprintf(stderr, " | id0=");
+                for (std::size_t index = 0; index < piece0.bytes.size() && index < 16; ++index) {
+                    const unsigned char byte = static_cast<unsigned char>(piece0.bytes[index]);
+                    std::fprintf(stderr, byte >= 32 && byte < 127 ? "%c" : "\\x%02x", byte);
+                }
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
             grammar->discard();
             throw;
         }
