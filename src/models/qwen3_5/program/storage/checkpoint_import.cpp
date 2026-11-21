@@ -66,6 +66,20 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
     std::string* error, bool pin_pages) {
+    // Same rule the disk tier states for itself in `tier_open`: a record that arrived as bytes
+    // carries the main KV run and the state image, never the draft/backend KV, so a request running
+    // a speculative backend would be bound to a prefix half of which has no pages. Refusing here
+    // makes that an ordinary cold prefill (the request still answers) instead of a 500 from the
+    // first decode step's coverage check.
+    if (speculative_backend != SpeculativeBackend::None) {
+        if (error != nullptr) {
+            *error = speculative_backend == SpeculativeBackend::Mtp
+                         ? "a checkpoint-cache record carries no MTP draft KV; this engine runs MTP"
+                         : "a checkpoint-cache record carries no draft/backend KV; this engine runs "
+                           "a speculative backend";
+        }
+        return std::nullopt;
+    }
     std::string why;
     auto source = import_checkpoint_source_current_layout(kv, state_shards, &why, pin_pages);
     if (!source) {

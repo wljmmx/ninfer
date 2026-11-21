@@ -187,8 +187,16 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                                             *record.kv->backend, record.backend_frontier));
         transaction.borrow_backend = transaction.borrow_text && record.kv->backend.has_value();
     }
+    // MTP's draft KV is a second address space that also has to cover the reused prefix, and
+    // `reuse_frontier - 1` is what an in-process capture carries: its export includes the backend
+    // half. A record that arrived as bytes (a checkpoint-cache restore) carries the main KV and the
+    // state image only, so `record.kv->backend` is empty and this claim would describe coverage the
+    // request has no pages for. It has to be gated on the source actually having a backend history,
+    // otherwise the first decode step asks `ensure_mapped_to_tokens` for the whole prefix on an
+    // address holding nothing and the round dies with "KV coverage exceeds reserved unit growth".
+    const bool source_has_backend = source && checkpoint(*source).kv->backend.has_value();
     if (!own_snapshot && speculative_backend == SpeculativeBackend::Mtp &&
-        transaction.reuse_frontier) {
+        transaction.reuse_frontier && source_has_backend) {
         transaction.backend_frontier = transaction.reuse_frontier - 1U;
     }
     auto& request = requests[lane];
@@ -557,6 +565,19 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
             }
         } else {
             activation.emplace(addresses.prepare_activation(destination, growth, tx.lane));
+        }
+        if (std::getenv("NINFER_BIND_PROBE") != nullptr) {
+            // Which door the prefix came through, and what the destination address holds afterwards.
+            const char* branch = borrowed ? "activation(borrowed)"
+                                 : (source && prefix && addresses.active(*source))
+                                     ? "active-prefix-view"
+                                 : (source && prefix) ? "prefix-fork" : "cold";
+            std::fprintf(stderr,
+                         "[bind] lane=%d prefix=%u target=%u growth=%u branch=%s dest_pages=%u "
+                         "source=%d\n",
+                         tx.lane, prefix, target, growth, branch, addresses.page_count(destination),
+                         source ? 1 : 0);
+            std::fflush(stderr);
         }
     };
     prepare(*text_kv_addresses, *text_kv_pages, tx.reserved_kv->text,

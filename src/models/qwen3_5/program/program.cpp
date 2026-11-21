@@ -261,6 +261,10 @@ CheckpointPoolHeadroom Program::checkpoint_pool_headroom() const {
     return impl_->checkpoint_pool_headroom();
 }
 
+bool Program::accepts_byte_records() const {
+    return impl_->speculative_backend == SpeculativeBackend::None;
+}
+
 std::optional<CheckpointHandle> Program::import_checkpoint_current_layout(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     std::shared_ptr<const detail::PreparedCaptureBacking> identity, const PrefixShortlistKey* key,

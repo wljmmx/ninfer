@@ -226,6 +226,21 @@ public:
     [[nodiscard]] std::optional<SourceChoice> restore_from_cache(Program& program, const Base& base) {
         const auto tokens = base.prompt_tokens();
         if (tokens.empty()) { return std::nullopt; }
+        // Refuse before the transfer, not after it: a speculative-backend engine has no address space
+        // to bind the record's main KV to (the payload carries no draft KV), so fetching the prefix
+        // only to decline it costs the whole block in bandwidth and answers nothing. Said once, because
+        // on a long conversation this is every request.
+        if (!program.accepts_byte_records()) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                std::fprintf(stderr,
+                             "[lmcache] restore off: a byte record carries no draft/backend KV and "
+                             "this engine runs one; requests prefill cold\n");
+                std::fflush(stderr);
+            }
+            return std::nullopt;
+        }
         auto cached = checkpoint_cache_->fetch(tokens);
         if (!cached || cached->page_bytes == 0 || cached->kv_bytes.empty()) { return std::nullopt; }
 
@@ -262,6 +277,19 @@ public:
         // checkpoint_matches -- the candidate would simply be filtered out and the request would
         // prefill as if nothing had been restored.
         kv.frontier = cached->frontier;
+        // A record that covers the WHOLE prompt would put the request on the zero-suffix path, whose
+        // first token is sampled from the checkpoint's tail hidden. A byte record carries the state
+        // image, not the last activation, so that binding fails later with "zero-suffix reuse has no
+        // target tail hidden" - a 500 on a hit. A record that stops short is an ordinary prefix and
+        // is what this path can serve; anything else is a miss.
+        if (kv.frontier >= base.summary().prompt_tokens) {
+            std::fprintf(stderr,
+                         "[lmcache] restore declined: record covers %u of %u token(s); a byte record "
+                         "has no tail hidden\n",
+                         kv.frontier, base.summary().prompt_tokens);
+            std::fflush(stderr);
+            return std::nullopt;
+        }
 
         std::string error;
         // Without this key the record is readable and never matchable: checkpoint_matches compares

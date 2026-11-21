@@ -541,6 +541,12 @@ public:
     // Live room in the Device page pool. A caller that is about to import a checkpoint asks this
     // first: taking the last free page turns the next request's allocation into a failure.
     [[nodiscard]] CheckpointPoolHeadroom checkpoint_pool_headroom() const;
+    // Whether this program can be served by a record that arrived as bytes. A checkpoint-cache
+    // record carries the main KV run and the state image, never the draft/backend KV, so an engine
+    // running a speculative backend has no pages to bind the second address space to. The caller
+    // asks this BEFORE it spends the transfer: refusing after the bytes have arrived costs the whole
+    // prefix in bandwidth and answers nothing.
+    [[nodiscard]] bool accepts_byte_records() const;
     // Restores a checkpoint from bytes an external cache handed back, pricing the fingerprint from
     // the live layout. Returns nullopt when the bytes do not fit this program; error says why.
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint_current_layout(
