@@ -142,3 +142,34 @@ Verified after both: 12/12 constrained requests answer 200, engine `ready` throu
 Note on an empty `content` in those tests: the JSON-schema requests spent the whole `max_tokens` on
 `reasoning_content` (`finish_reason: length`), so `content` was empty while the request succeeded. Check
 `constraint.complete` / `finish_reason` before reading an empty body as a failure.
+
+## 8. LMCache path, measured 2026-11-21 (blocked on the import, not on the publish)
+
+State: the engine can store and can fetch, but a fetched record cannot be brought into a live
+request, so attaching the cache today turns a hit into a hard 500 - worse than a miss.
+
+What was measured:
+
+| step | result |
+|---|---|
+| store, 1916-token prefix | `[lmcache] store 28.1 MiB in 1.660 s (17 MiB/s) | ok=1`, `publish covers 1909 of 1916` |
+| restore after a restart, same prefix | `[lmcache] restore: match 0.002 s, transfer 2.876 s`, `fetch 27525120 KV byte(s) + 155920388 state byte(s)` |
+| the request that used it | `HTTP 500`, worker: `KV coverage exceeds reserved unit growth: tokens=1921 required_pages=31 mapped_pages=0 reserved_pages=1` |
+| same test with the synchronous store (no `NINFER_LMCACHE_ASYNC_WRITE`) | identical 500 |
+
+So `NINFER_LMCACHE_ASYNC_WRITE` is not what produced the failures attributed to it; the import is.
+`[ckpt] adopt: written epoch=3 read-back epoch=3` shows the restored pages reach a checkpoint handle
+(`ResourceManager::...` -> `import_checkpoint_current_layout`), but the live KV address that then runs
+`ensure_mapped_to_tokens` has `page_count = 0` and a one-page reservation, while the restored frontier
+needs 31. The address has to take the checkpoint's membership before that call (or the request plan has
+to reserve from the imported page count instead of from the restore frontier).
+
+Two side findings worth keeping:
+
+* `--max-context` is not a capacity promise. `--max-context 200000 --kv-capacity 200000` started with
+  693 pages = 44k tokens and `free 0 B`, so a 163k prompt was refused with `context length exceeded`.
+  Read the `capacity |` line at startup, not the flag.
+* 256k full residency on this card only holds while ~7 GiB stays free. When the desktop took that
+  memory, decode fell from 92 to 1.4-46 tok/s with `devwait` in the minutes and the GPU at 15 % /
+  92 W: WDDM was re-reading the weights every step. 128k KV gives 98-109 tok/s with 2.7 GiB spare.
+  This, not LMCache, is what made a 163k request look like it took 12 minutes.
