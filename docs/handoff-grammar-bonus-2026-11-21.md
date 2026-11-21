@@ -331,3 +331,42 @@ changes that, because the limit is bytes over a VM boundary - which is why the o
 2. shrink the payload: the state image is a constant 147 MiB per turn and compresses well (BF16/FP32
    recurrent state), and a prefix whose state did not change needs no re-send at all;
 3. keep the current topology and accept ~40 s at 163k, which still beats the 111-114 s cold prefill.
+
+## 13. The 127.0.0.1 path in mirrored mode is the slow one (measured 2026-11-21)
+
+The comparison that made this visible: a 2.5 GbE link to a NAS carries ~300 MB/s, while this machine's
+WSL loopback was delivering 150 MB/s one way and 64 MB/s the other. That is not a bandwidth ceiling,
+it is a chosen path.
+
+Evidence - the same 28 MB TCP transfer, one Python client, three destinations:
+
+| destination | send | receive |
+|---|---|---|
+| `127.0.0.1` | 112.7 MB/s | 68.2 MB/s |
+| `192.168.50.54` (mirrored NIC) | 146.1 MB/s | 195.9 MB/s |
+| `10.222.222.1` (WSL virtual NIC) | **331.1 MB/s** | 150.9 MB/s |
+
+The route table says why: `127.0.0.1 via 169.254.73.249 dev loopback0`. With
+`networkingMode=Mirrored`, Windows reaching 127.0.0.1 lands on a user-space loopback proxy instead of
+a kernel path, and that proxy is the narrow end.
+
+End to end through the real cache (a 1916-token checkpoint = 175 MiB on the wire: 28.1 MiB KV plus the
+146.8 MiB state image):
+
+| engine endpoint | store | restore (183.5 MB) |
+|---|---|---|
+| `tcp://127.0.0.1:6555` | ~97 MB/s | 64 MB/s (2.876 s) |
+| `tcp://10.222.222.1:6555` | 132 MB/s | **129 MB/s (1.424 s)** |
+| `tcp://192.168.50.54:6555` | - | **130 MB/s (1.410 s)** |
+
+So the address alone buys ~2x on the restore TTFT waits on, and `tools/console/l3_lmcache.sh` now binds
+`--host 0.0.0.0` for that reason (`L3_HOST` overrides).
+
+What this does not fix: at 130 MB/s a 163k restore (2.55 GiB including the image) is still ~20 s, so the
+1-2 s target still needs the cache on the engine's side of the boundary. What it does mean is that the
+remaining gap is no longer a misconfiguration - it is the relay plus the Python server, and the raw
+numbers above show the path itself can do 331 MB/s in the store direction.
+
+Next measurements worth taking, in order: the same three destinations with a C++ client (these are
+Python numbers, so they are a floor), then the same cache with the state image compressed, since it is
+146.8 MiB of every turn regardless of prefix length.
