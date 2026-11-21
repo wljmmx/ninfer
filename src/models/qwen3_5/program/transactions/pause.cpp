@@ -9,7 +9,14 @@ namespace ninfer::models::qwen3_5::detail {
 
 std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& state) {
     const auto frontier = state.text_kv_valid;
-    if (!frontier || !state.kv) { return std::nullopt; }
+    if (!frontier || !state.kv) {
+        if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+            std::fprintf(stderr, "[publish] detach refused: frontier=%u has_kv=%d\n", frontier,
+                         state.kv ? 1 : 0);
+            std::fflush(stderr);
+        }
+        return std::nullopt;
+    }
     auto backing     = std::make_shared<PreparedCaptureBacking>();
     backing->digests = state.prefix_digests;
     backing->digests.truncate(frontier);
@@ -17,7 +24,20 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
     backing->prefix_identity = state.prefix_identity;
     backing->prefix_identity.truncate(frontier);
     auto handle = reserve_checkpoint();
-    if (!handle) { return std::nullopt; }
+    if (!handle) {
+        if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+            // The directory is finite and a prompt-frontier capture already holds a slot for this
+            // request, so "no checkpoint to publish" can simply mean "no free slot".
+            std::uint32_t live = 0;
+            for (const auto& slot : checkpoints) {
+                if (slot.value) { ++live; }
+            }
+            std::fprintf(stderr, "[publish] detach refused: no slot (live %u of %zu), frontier=%u\n",
+                         live, checkpoints.size(), frontier);
+            std::fflush(stderr);
+        }
+        return std::nullopt;
+    }
     if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
         state_store->freeze(state.state.read);
     }

@@ -115,6 +115,16 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     base->allow_prefix_reuse             = options.allow_prefix_reuse && prompt.identity.reusable;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+        // Which of the three inputs decided the finish-time checkpoint. Without this, "the cache has
+        // nothing to store" and "the request never produced a checkpoint" look the same from outside.
+        std::fprintf(stderr,
+                     "[publish] tokens=%u reuse=%d reusable=%d context_cache=%d -> publish=%d\n",
+                     base->summary.prompt_tokens, options.allow_prefix_reuse ? 1 : 0,
+                     prompt.identity.reusable ? 1 : 0, context_cache.enabled ? 1 : 0,
+                     base->summary.publish_continuation ? 1 : 0);
+        std::fflush(stderr);
+    }
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {
             throw std::logic_error("Vision prompt has no startup workspace plan");
