@@ -508,6 +508,15 @@ public:
         const bool written = bridge_->publish(
             key, std::span<const std::byte>(checkpoint.kv_bytes.data(), complete),
             std::span<const std::byte>(payload.data(), payload.size()));
+        if (!written) {
+            // A publish that fails is invisible from the engine side: the request already answered,
+            // and the next lookup simply misses. That is why "the cache never answers" survived this
+            // long - print the reason the bridge kept.
+            std::fprintf(stderr, "[lmcache] publish failed | %zu chunk(s) | %zu byte(s) | %s\n",
+                         static_cast<std::size_t>(chunks), static_cast<std::size_t>(complete),
+                         bridge_->error().c_str());
+            std::fflush(stderr);
+        }
         if (written) {
             // Q54: remember which prefix lengths this entry answers for. The frontier and the real
             // committed length are different numbers (388 vs 397 in the measured case), and a longer
