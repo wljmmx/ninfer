@@ -336,7 +336,24 @@ public:
         });
         if (!async_write_) {
             const auto wal_path = wal_.append(prompt_tokens, checkpoint);
-            if (publish_job(prompt_tokens, checkpoint)) { wal_.complete(wal_path); }
+            const auto started  = std::chrono::steady_clock::now();
+            const bool written  = publish_job(prompt_tokens, checkpoint);
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (seconds >= 0.2) {
+                // The synchronous publish runs on the engine's own thread, so this number is time the
+                // request (or the boundary that produced the checkpoint) actually waits. The byte
+                // count is what to compare it against: a 163k prefix is ~2.4 GiB.
+                std::fprintf(stderr,
+                             "[lmcache] store %.1f MiB in %.3f s (%.0f MiB/s) | %zu token(s) | ok=%d\n",
+                             static_cast<double>(checkpoint.kv_bytes.size()) / (1024.0 * 1024.0),
+                             seconds,
+                             (static_cast<double>(checkpoint.kv_bytes.size()) / (1024.0 * 1024.0)) /
+                                 std::max(seconds, 1e-6),
+                             prompt_tokens.size(), written ? 1 : 0);
+                std::fflush(stderr);
+            }
+            if (written) { wal_.complete(wal_path); }
             return;
         }
         {
