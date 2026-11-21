@@ -173,3 +173,49 @@ Two side findings worth keeping:
   memory, decode fell from 92 to 1.4-46 tok/s with `devwait` in the minutes and the GPU at 15 % /
   92 W: WDDM was re-reading the weights every step. 128k KV gives 98-109 tok/s with 2.7 GiB spare.
   This, not LMCache, is what made a 163k request look like it took 12 minutes.
+
+## 9. The LMCache 500, root-caused and fixed (2026-11-21)
+
+Section 8 recorded the symptom. The cause was in binding, not in the cache.
+
+`bind` (`transactions/binding.cpp`) set `backend_frontier = reuse_frontier - 1`
+whenever the request ran MTP and reused a prefix. An in-process capture carries a
+draft KV in its export, so that is true there. A record that arrives as bytes does
+not: `CheckpointExport` (`program.h`) has `frontier / page_count / page_bytes /
+epochs / kv_bytes` and nothing for the backend. So `record.kv->backend` was empty,
+the backend address took the cold branch with zero pages, and the first decode
+step asked `ensure_mapped_to_tokens` for 1921 tokens against `reserved_pages=1`:
+
+    KV coverage exceeds reserved unit growth: tokens=1921 required_pages=31
+    mapped_pages=0 reserved_pages=1
+
+`NINFER_BIND_PROBE=1` shows both binds of that round, which is what named it:
+
+    [bind] lane=0 prefix=1909 target=1916 growth=0 branch=prefix-fork dest_pages=0 source=1
+    [bind] lane=0 prefix=1908 target=1921 growth=1 branch=cold dest_pages=0 source=0
+
+Fixes (`6f51dee0`):
+
+* the backend claim is gated on the source actually having a backend history;
+* `Program::accepts_byte_records()` is asked before the transfer, so a
+  speculative-backend engine declines the record for free instead of paying
+  2.85 s (16k) / minutes (163k) before refusing;
+* `import_checkpoint_current_layout` refuses the same case with a reason, which
+  is the rule `tier_open` already states for the disk tier;
+* a record covering the whole prompt is declined (its zero-suffix path needs a
+  tail hidden a byte record does not carry).
+
+Measured after the fix:
+
+| case | before | after |
+|---|---|---|
+| `--spec mtp`, hit | 4.27 s then 500 | restore declined before transfer, cold prefill 1.36 s, 200 |
+| `--spec none`, hit | 500 | `cache_n 1909`, `branch=prefix-fork`, 200 |
+| `--spec none`, after restart | - | `restore: match 0.002 s, transfer 2.8 s`, `cache_n 1909`, 200 |
+
+Still true, and the next thing to fix if the cache is to pay for itself: this
+LMCache server ingests and serves at ~16 MiB/s on this box (28.1 MiB in 1.66-1.79 s
+on store; 2.7-2.9 s to transfer the same block back), while the model prefills at
+~2.4 GB/s. At 1916 tokens the restore is therefore slower than the prefill it
+replaces, and at 163k it would cost minutes. The engine side is correct now; the
+throughput is the cache's.
