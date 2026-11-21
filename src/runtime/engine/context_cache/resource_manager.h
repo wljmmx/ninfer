@@ -449,6 +449,22 @@ public:
             if (probe) { std::fprintf(stderr, "[publish] sink: export_state produced nothing\n"); }
             return;
         }
+        // Diagnostics only: write the exact image that would go on the wire, so a compression ratio
+        // can be measured on real bytes instead of a guess about their shape.
+        if (const char* dump_dir = std::getenv("NINFER_STATE_DUMP")) {
+            const std::string path = std::string(dump_dir) + "\\state-" +
+                                     std::to_string(summary.frontier) + ".bin";
+            if (FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(state->bytes.data(), 1, state->bytes.size(), file);
+                std::fclose(file);
+                std::fprintf(stderr, "[publish] dumped state %zu B -> %s\n", state->bytes.size(),
+                             path.c_str());
+                std::fflush(stderr);
+            } else {
+                std::fprintf(stderr, "[publish] state dump failed: %s\n", path.c_str());
+                std::fflush(stderr);
+            }
+        }
         if (probe) {
             std::fprintf(stderr, "[publish] sink: %u frontier, %zu page(s), %zu KV byte(s)\n",
                          summary.frontier, static_cast<std::size_t>(kv->page_count),

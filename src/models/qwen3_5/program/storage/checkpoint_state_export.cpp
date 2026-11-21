@@ -15,6 +15,8 @@
 
 #include "models/qwen3_5/program/program_impl.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -58,6 +60,19 @@ std::optional<CheckpointStateExport> ProgramImpl::export_state(CheckpointHandle 
     out.key_head_dim   = layout.spec.linear.key_head_dim;
     out.hidden         = layout.spec.hidden;
     out.has_dflash_local = layout.spec.dflash_local.has_value();
+
+    // Diagnostics: the image is a fixed size whatever the prefix is, so the only way to say what a
+    // smaller one would have to drop is to name its parts.
+    if (std::getenv("NINFER_STATE_DUMP") != nullptr) {
+        std::fprintf(stderr,
+                     "[state] image %zu B | conv %zu | recurrent %zu | hidden %zu | "
+                     "dflash_k %zu | dflash_v %zu\n",
+                     layout.image_bytes, layout.linear_conv.bytes,
+                     layout.linear_recurrent.bytes, layout.continuation_hidden.bytes,
+                     layout.dflash_local_k ? layout.dflash_local_k->bytes : 0,
+                     layout.dflash_local_v ? layout.dflash_local_v->bytes : 0);
+        std::fflush(stderr);
+    }
 
     out.bytes.assign(view.data, view.data + layout.image_bytes);
     return out;
