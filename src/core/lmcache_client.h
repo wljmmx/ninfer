@@ -347,23 +347,37 @@ private:
         }
         const auto sent_at = std::chrono::steady_clock::now();
 
+        // A reply whose uid does not match belongs to an earlier call that timed out. This client
+        // gives up on a call at RCVTIMEO but the server still answers it later, and that stale frame
+        // is then the first thing the next call reads - which used to fail the next call outright
+        // ("reply uid does not echo the request") and silently lose a store that had been written.
+        // The socket is ordered, so dropping stale frames until ours arrives is both correct and
+        // bounded: after a handful the connection is not trustworthy and the call gives up.
         std::vector<std::string> reply;
-        while (true) {
-            zmq_msg_t message;
-            zmq_msg_init(&message);
-            if (zmq_msg_recv(&message, socket_, 0) < 0) {
-                // The usual cause is a payload the server rejected: a raising handler answers with
-                // no frames at all, so this timeout is the only symptom and it looks like EAGAIN.
-                error_ = "receive failed: ";
-                error_ += zmq_strerror(zmq_errno());
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            reply.clear();
+            while (true) {
+                zmq_msg_t message;
+                zmq_msg_init(&message);
+                if (zmq_msg_recv(&message, socket_, 0) < 0) {
+                    // The usual cause is a payload the server rejected: a raising handler answers with
+                    // no frames at all, so this timeout is the only symptom and it looks like EAGAIN.
+                    error_ = "receive failed: ";
+                    error_ += zmq_strerror(zmq_errno());
+                    zmq_msg_close(&message);
+                    return false;
+                }
+                reply.emplace_back(static_cast<const char*>(zmq_msg_data(&message)),
+                                   zmq_msg_size(&message));
+                const bool more = zmq_msg_more(&message) != 0;
                 zmq_msg_close(&message);
-                return false;
+                if (!more) { break; }
             }
-            reply.emplace_back(static_cast<const char*>(zmq_msg_data(&message)),
-                               zmq_msg_size(&message));
-            const bool more = zmq_msg_more(&message) != 0;
-            zmq_msg_close(&message);
-            if (!more) { break; }
+            if (reply.size() < 2) { continue; }
+            std::size_t offset = 0;
+            msgpack::Value got;
+            if (!msgpack::decode(reply[0], offset, got) || got.integer != uid) { continue; }
+            break;
         }
 
         if (reply.size() < 2) {
