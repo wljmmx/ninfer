@@ -391,17 +391,49 @@ public:
     // nothing happens below two chunks -- a prefix the cache cannot even address is not worth a
     // 77 MB export.
     void publish_to_cache(Program& program, const Base& base, Handle handle) {
-        if (checkpoint_cache_ == nullptr) { return; }
-        if (!program.valid_checkpoint(handle)) { return; }
+        const bool probe = std::getenv("NINFER_PUBLISH_PROBE") != nullptr;
+        if (checkpoint_cache_ == nullptr) {
+            if (probe) { std::fprintf(stderr, "[publish] sink: no cache backend\n"); }
+            return;
+        }
+        if (!program.valid_checkpoint(handle)) {
+            if (probe) { std::fprintf(stderr, "[publish] sink: handle is stale\n"); }
+            return;
+        }
         const auto summary = program.checkpoint_metadata(handle);
-        if (summary.frontier < kMinimumCacheableFrontier) { return; }
+        if (summary.frontier < kMinimumCacheableFrontier) {
+            if (probe) {
+                std::fprintf(stderr, "[publish] sink: frontier %u below the %u minimum\n",
+                             summary.frontier,
+                             static_cast<unsigned>(kMinimumCacheableFrontier));
+            }
+            return;
+        }
         const auto tokens = base.prompt_tokens();
-        if (tokens.empty()) { return; }
+        if (tokens.empty()) {
+            if (probe) { std::fprintf(stderr, "[publish] sink: no tokens\n"); }
+            return;
+        }
 
         auto kv = program.export_checkpoint(handle);
-        if (!kv || kv->page_count == 0 || kv->page_bytes == 0) { return; }
+        if (!kv || kv->page_count == 0 || kv->page_bytes == 0) {
+            if (probe) {
+                std::fprintf(stderr, "[publish] sink: export_checkpoint produced nothing (%d)\n",
+                             kv ? 1 : 0);
+            }
+            return;
+        }
         auto state = program.export_state(handle);
-        if (!state || state->bytes.empty()) { return; }
+        if (!state || state->bytes.empty()) {
+            if (probe) { std::fprintf(stderr, "[publish] sink: export_state produced nothing\n"); }
+            return;
+        }
+        if (probe) {
+            std::fprintf(stderr, "[publish] sink: %u frontier, %zu page(s), %zu KV byte(s)\n",
+                         summary.frontier, static_cast<std::size_t>(kv->page_count),
+                         kv->kv_bytes.size());
+            std::fflush(stderr);
+        }
 
         CachedCheckpoint out;
         out.frontier   = kv->frontier;
@@ -559,6 +591,16 @@ public:
     }
 
     void publish(Program& program, OwnerToken token, Handle handle, std::uint64_t now_ms) {
+        if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+            std::fprintf(stderr,
+                         "[publish] finish: valid=%d enabled=%d token=%llu frontier=%u\n",
+                         program.valid_checkpoint(handle) ? 1 : 0, enabled_ ? 1 : 0,
+                         static_cast<unsigned long long>(token),
+                         program.valid_checkpoint(handle)
+                             ? program.checkpoint_metadata(handle).frontier
+                             : 0U);
+            std::fflush(stderr);
+        }
         if (!program.valid_checkpoint(handle)) { return; }
         const auto summary = program.checkpoint_metadata(handle);
         if (!enabled_ || !token) {

@@ -1266,6 +1266,14 @@ private:
                 const auto publish_started = Clock::now();
                 resources_.publish(*instance_.program, request->continuation_owner,
                                    *finished.checkpoint, monotonic_ms());
+                // The finish-time checkpoint is the one a later request can actually match: it covers
+                // the whole prompt plus everything generated. Without this hand-off the record is
+                // retained for pause/replay only and the external cache never sees a byte, because
+                // publish_to_cache() used to be reachable from the active-capture path alone.
+                if (request->base_plan) {
+                    resources_.publish_to_cache(*instance_.program, *request->base_plan,
+                                                *finished.checkpoint);
+                }
                 report_boundary_work(
                     "publish", request->id,
                     std::chrono::duration<double>(Clock::now() - publish_started).count(),

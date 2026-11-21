@@ -568,6 +568,12 @@ public:
         // Slice on a chunk boundary: `complete` is a whole number of chunks, and `first_chunk` counts
         // them, so the span stays aligned and the indices handed to the server are its own.
         const std::size_t skip_bytes = std::min(complete, first_chunk * chunk_bytes_total);
+        // Every chunk this run could carry is already in the cache: the request that produced this
+        // checkpoint had just restored the same prefix, so the registry named its own chunk count.
+        // Nothing to send is success - it used to fall through to the bridge with an empty span,
+        // which the bridge rejects as "not a whole number of chunks", and a perfectly good store
+        // was counted (and logged) as a failure.
+        if (skip_bytes >= complete) { return true; }
         const bool written = bridge_->publish(
             key, std::span<const std::byte>(checkpoint.kv_bytes.data() + skip_bytes,
                                             complete - skip_bytes),
