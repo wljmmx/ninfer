@@ -153,6 +153,12 @@ struct TargetVerifyFrameView {
     std::span<const std::int32_t> ple_slots;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
+    // The Host mirror of the same sampling operands, one entry per row of this rectangle, plus the
+    // number of grammar positions each row's bitmap holds (`draft_window + 1`). The verify pass
+    // argmaxes its columns under those bitmaps, so the bonus column a constrained request commits
+    // is a legal token instead of whatever the raw argmax happened to pick.
+    std::span<const ops::SamplingConfig> row_sampling;
+    std::int32_t mask_positions            = 0;
     DFlashFeatureSink* feature_sink        = nullptr;
 };
 

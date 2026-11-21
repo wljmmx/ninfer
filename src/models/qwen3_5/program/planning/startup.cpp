@@ -552,6 +552,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     device_execution));
             }
         }
+        if (phase == qwen3_5::TextPhase::Verify) {
+            // The verify rectangle argmaxes its columns under the per-(row, position) grammar
+            // bitmap. It copies the projection's output once (`target_logits` has to stay the
+            // acceptance kernel's own operand, untouched by any mask) and keeps one bitmap block
+            // per column, sized for the vocabulary the logits cover.
+            const std::int32_t vocabulary = dimension(config.vocab_size);
+            matrix(layout, DType::BF16, vocabulary, last);
+            const std::size_t words = (static_cast<std::size_t>(vocabulary) + 31) / 32;
+            scratch(layout, static_cast<std::size_t>(last) * words * sizeof(std::uint32_t));
+        }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);

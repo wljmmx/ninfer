@@ -170,18 +170,30 @@ public:
                                const Tensor& linear_state_destination_slots,
                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                Tensor& logits);
+    // `row_sampling` is the Host mirror of the round's per-row sampling operands, and
+    // `mask_positions` the number of grammar positions each row's bitmap holds (`draft_window + 1`).
+    // The verify rectangle's columns are laid out row-major by sequence (column `row * width +
+    // position`), which is the bitmap's own layout, so the whole rectangle is argmaxed under it:
+    // the token the acceptance kernel reads as the bonus is a column of that rectangle like any
+    // other, and a plain argmax would answer it with a token the request's grammar forbids
+    // (measured 2026-11-21: a JSON-schema request committed token 0, `!`). An unconstrained row
+    // carries a null bitmap and keeps the plain argmax bit for bit.
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              std::span<const std::int32_t> ple_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
+                             Tensor& logits, Tensor& target_tokens,
+                             std::span<const ops::SamplingConfig> row_sampling,
+                             std::int32_t mask_positions);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              std::span<const std::int32_t> ple_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink,
+                             std::span<const ops::SamplingConfig> row_sampling,
+                             std::int32_t mask_positions);
     // Qwen4Exp PLE after a verify rectangle: the window was opened over every candidate column and
     // the layer applied to all of them (the verifier needs each column's logits), but the nine-column
     // history may only advance by the prefix the verifier accepted. `accepted_columns` is the same
@@ -283,7 +295,9 @@ private:
                                   const Tensor& linear_state_source_slots,
                                   std::span<const std::int32_t> ple_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor& logits, Tensor& target_tokens, Tap& tap,
+                                  std::span<const ops::SamplingConfig> row_sampling,
+                                  std::int32_t mask_positions);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
