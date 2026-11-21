@@ -335,17 +335,33 @@ void ProgramImpl::prepare_graphs() {
         draft_needs_ordinary_fallback(parameters, capacity)) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
-        const std::uint32_t ordinary_batch_limit = max_concurrency;
+        // A row of an ordinary batch borrows one column slot of the Linear Attention state image as
+        // the convolution snapshot's scratch (see `gdn_projection_snapshot`), so the batch cannot
+        // exceed the pool's slot count. Building a profile for a batch beyond it fails during graph
+        // preparation with "gdn_input_proj_conv_snapshot: invalid convolution snapshot state" -
+        // measured 2026-11-21 as a `--spec none` startup failure for batch 3 with a two-slot pool.
+        // The runtime cannot form such a batch either (every lane holds a state slot), so capping
+        // the family here drops only profiles that could never be selected.
+        const auto conv_slots = static_cast<std::uint32_t>(state_images->linear().spec().slot_count);
+        const std::uint32_t ordinary_batch_limit = std::min(max_concurrency, conv_slots);
         execution::OrdinaryBatchContext ordinary_state{
             execution_core(),      decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
             *ordinary_host_egress, state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
+        if (std::getenv("NINFER_GRAPH_TRACE") != nullptr) {
+            std::fprintf(stderr, "[graphs] ordinary warm frontier=%u batch=1\n", code_warm.min);
+            std::fflush(stderr);
+        }
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         execution::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
                                          nullptr);
         device.synchronize();
+        if (std::getenv("NINFER_GRAPH_TRACE") != nullptr) {
+            std::fprintf(stderr, "[graphs] ordinary warm done\n");
+            std::fflush(stderr);
+        }
 
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
