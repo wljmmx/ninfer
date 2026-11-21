@@ -370,3 +370,40 @@ numbers above show the path itself can do 331 MB/s in the store direction.
 Next measurements worth taking, in order: the same three destinations with a C++ client (these are
 Python numbers, so they are a floor), then the same cache with the state image compressed, since it is
 146.8 MiB of every turn regardless of prefix length.
+
+## 14. The single-connection ceiling is the relay, not the socket window (measured 2026-11-21)
+
+Four measurements on `10.222.222.1` (the WSL virtual NIC), same Python client and server, 16 MB each
+way per connection:
+
+| connections | aggregate |
+|---|---|
+| 1 | 81.9 MB/s |
+| 4 | 287.1 MB/s |
+| 8 | **358.5 MB/s** |
+
+and, on one connection, socket buffer size makes no difference at all:
+
+| SO_SNDBUF/SO_RCVBUF | rate |
+|---|---|
+| 1 MB | 98.1 MB/s |
+| 4 MB | 89.5 MB/s |
+| 16 MB | 80.8 MB/s |
+| 64 MB | 88.5 MB/s |
+
+So this is not a TCP window problem (`tcp_rmem` 4 KB-32 MB, `wmem` 4 MB, window scaling on, BBR) and
+not memory bandwidth. It is one connection being served serially at ~90 MB/s somewhere in the relay,
+with parallelism absorbing it: 4 connections reach 287 MB/s, 8 reach 358 MB/s.
+
+Where that leaves each direction of a checkpoint:
+
+* **store can be split** - `kCommitStore` carries `groups[].chunk_indices`, so disjoint chunk ranges can
+  go over separate pooled connections, and each connection is its own ZMQ identity and therefore its own
+  server worker thread. Measured headroom: 4-8x.
+* **restore cannot** - `kPrepareRetrieve` takes only `(cache_key, instance)` and answers with the whole
+  run in one reply. A restore stays at whatever one connection does (~90-130 MB/s), which is the
+  direction TTFT waits on.
+
+That is the real boundary of this topology, and it is why the two structural options remain: change the
+WSL networking mode so the path stops being a user-space relay (needs `wsl --shutdown`, so it must be a
+deliberate step), or put the cache on the engine's side of the boundary.
