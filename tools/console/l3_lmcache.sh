@@ -30,6 +30,12 @@ WORKERS="${L3_WORKERS:-4}"
 L1_GB="${L3_L1_GB:-4}"
 LOG="${L3_LOG:-$ROOT/l3-lmcache.log}"
 PATTERN="lmcache server --transport zmq --port $PORT"
+# Bind every interface, not loopback. Measured 2026-11-21 with WSL's `networkingMode=Mirrored`: a
+# Windows client that connects to 127.0.0.1 reaches a user-space loopback proxy (`127.0.0.1 via
+# 169.254.x dev loopback0`), and a 183 MB checkpoint moves at 64 MB/s over it against 129-130 MB/s
+# when the same client connects to the distro's own address. The store direction gains less (97 ->
+# 132 MB/s) but moves the same way. Set L3_HOST to override (e.g. 127.0.0.1 for a same-distro client).
+HOST="${L3_HOST:-0.0.0.0}"
 
 up() { pgrep -f "$PATTERN" >/dev/null 2>&1; }
 
@@ -56,7 +62,7 @@ if [ ! -x "$VENV/bin/lmcache" ]; then
 fi
 
 nohup "$VENV/bin/lmcache" server \
-  --transport zmq --port "$PORT" --http-port "$HTTP_PORT" \
+  --transport zmq --host "$HOST" --port "$PORT" --http-port "$HTTP_PORT" \
   --supported-transfer-mode engine_driven \
   --chunk-size "$CHUNK" --max-workers "$WORKERS" \
   --l1-size-gb "$L1_GB" --eviction-policy LRU >"$LOG" 2>&1 &
