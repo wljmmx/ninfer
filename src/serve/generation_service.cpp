@@ -424,10 +424,24 @@ public:
                 job = std::move(writes_.front());
                 writes_.pop_front();
             }
-            if (publish_job(job.tokens, job.checkpoint)) {
-                wal_.complete(job.wal_path);
-                ++written_;
+            const auto started = std::chrono::steady_clock::now();
+            const bool written = publish_job(job.tokens, job.checkpoint);
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (const auto mib = static_cast<double>(job.checkpoint.kv_bytes.size()) /
+                                 (1024.0 * 1024.0);
+                seconds >= 0.2 || !written) {
+                // The async path has to report the same facts as the synchronous one, otherwise a
+                // background store that is slow - or that the server refused - is invisible.
+                std::fprintf(stderr,
+                             "[lmcache] store(async) %.1f MiB in %.3f s (%.0f MiB/s) | %zu token(s) "
+                             "| ok=%d%s%s\n",
+                             mib, seconds, mib / std::max(seconds, 1e-6), job.tokens.size(),
+                             written ? 1 : 0, written ? "" : " | ",
+                             written ? "" : bridge_->error().c_str());
+                std::fflush(stderr);
             }
+            if (written) { wal_.complete(job.wal_path); }
         }
     }
 
