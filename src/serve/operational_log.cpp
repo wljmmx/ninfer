@@ -290,6 +290,26 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         if (engine_wall > 0.001) {
             out << " | engine-wall " << product::format_pretty_duration(engine_wall);
         }
+        // Where that wall went, from the phases the engine already publishes. Printed only when the
+        // wall is big enough to be worth explaining, so the normal line stays short: a cache-hit
+        // turn that reads seconds has to say whether it is the boundary, the submit, the commit or
+        // a device wait, instead of inviting another guess.
+        if (engine_wall > 0.5) {
+            out << " | phases";
+            const auto add = [&out](const char* name, double seconds) {
+                if (seconds >= 0.005) {
+                    out << ' ' << name << ' ' << product::format_pretty_duration(seconds);
+                }
+            };
+            add("boundary", metrics.engine_timing.engine_boundary_exposed_seconds);
+            add("submit", metrics.engine_timing.program_submit_exposed_seconds);
+            add("post", metrics.engine_timing.program_post_exposed_seconds);
+            add("commit", metrics.engine_timing.engine_commit_output_exposed_seconds);
+            add("maint", metrics.engine_timing.engine_maintenance_exposed_seconds);
+            add("devwait", metrics.engine_timing.device_wait_exposed_seconds);
+            add("decodehost", metrics.engine_timing.decode_host_exposed_seconds);
+            add("decodewait", metrics.engine_timing.decode_device_wait_exposed_seconds);
+        }
     }
     if (metrics.prefill_seconds > 0.0) {
         out << " | prefill "
