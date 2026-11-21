@@ -52,6 +52,11 @@ Hypotheses already disproved (do not repeat them):
 
 ## 3. The patch to apply
 
+**SUPERSEDED — see section 7. The plan below is kept only as the record of what was tried; it names the
+wrong header (`apply_sampling_mask` lives in `include/ninfer/ops/speculative_round.h`) and, more
+importantly, it masks the bonus column only, which the sampled accept path never needed: that path had
+its own defect.**
+
 Existing API to reuse: `ops::apply_sampling_mask(logits, masked, mask, ...)`
 (`include/infer/ops/sampling.h`) and the `(row, position)` mask addressing already used by
 `TextContext::mtp_propose_topk_strided` (`mask_column` + `mask_window_words`).
@@ -100,3 +105,40 @@ byte-identical to today.
 * Not pushed: `cd35824f`, `c7cd47c7`, `f70b5e5e`, `4f120123`, `7853decc`.
 * Uncommitted: the `rejected set / id0` probe in `output_session.cpp` (keep it — it is what proved the
   token is `!`).
+
+## 7. Resolved 2026-11-21 (the two defects, and what actually closed them)
+
+Two separate defects produced the 400s, and only fixing both makes 12/12 pass.
+
+**7.1 The verify rectangle was argmaxed without the grammar bitmap** (`e1f4fcc9`). The rectangle's
+columns are already the bitmap's own `(row, position)` order, so the projection's output is masked with
+the request's bitmap before the argmax. An unconstrained row keeps an all-ones block, so the pass has no
+per-request branch (one captured-graph path) and is bit-identical for unconstrained requests — the PPL
+gate confirms it. The masked copy and the bitmap are priced in `target_body` (`planning/startup.cpp`),
+which mirrors this pass's allocations; an allocation here that `target_body` does not reserve throws at
+run time.
+
+Graph-unsafe detail worth remembering: any *host* value read while building the pass (for example
+`row_sampling[row].mask.words`) is baked into a captured graph. That is why the row masks are addressed
+by a fixed device base plus a per-column stride and their contents are refreshed on the device every
+round — the pointer must be stable, only the bits may change.
+
+**7.2 The sampled accept kept drafts the target cannot emit** (`366383b3`). This was the actual cause of
+"all seven drafts accepted" on a constrained request. In `speculative_sparse_warp_accept`,
+`reject = !(pd >= qd || u * qd < pd)` treats `pd == 0` as acceptable whenever `qd == 0` too: an illegal
+draft has no mass in the masked target distribution (`pd == 0`) and the proposal head is deliberately
+unmasked (`qd == 0`), so zero versus zero kept it. The rule is now `pd > 0` to accept, i.e. exact
+rejection sampling (`min(1, pd/qd)` is zero when `pd` is zero).
+
+The temperature arm test that separated them (`probe_grammar_arms.py`): greedy 4/4 passed while
+temperature 0.7 failed 4/4 — the greedy accept compares against the target argmax, so it never needed
+the accept fix, and the sampled path never needed the bonus-column argmax fix.
+
+Verified after both: 12/12 constrained requests answer 200, engine `ready` throughout, no
+`[grammar] rejected set`; `regress.py --tier fast` → PPL **7.359779** bit-exact, dump
+**e95cacb864d8b1ab**, regressions 0; throughput on the constrained request 92.5 tok/s
+(142 of 394 drafts accepted).
+
+Note on an empty `content` in those tests: the JSON-schema requests spent the whole `max_tokens` on
+`reasoning_content` (`finish_reason: length`), so `content` was empty while the request succeeded. Check
+`constraint.complete` / `finish_reason` before reading an empty body as a failure.
