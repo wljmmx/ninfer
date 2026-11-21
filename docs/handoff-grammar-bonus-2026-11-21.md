@@ -250,3 +250,46 @@ Consequence for the next step: an SSD tier is a configuration change (`--l2-adap
 `{"type": "fs_native", "base_path": ...}`), but it has to be a path that is actually on NVMe - a
 dedicated WSL disk on `R:` rather than `$HOME` (HDD) or `/mnt/r` (9p). Adding it without fixing the
 transport will make stores slower, not faster, because L1 is already the fast tier.
+
+## 11. Why the in-memory cache path is slow (measured 2026-11-21)
+
+The memory tier is not the limit. Inside the server, during a store the traced `StorageManager`
+calls took `reserve_write` 0.14 ms and `finish_write` 2.9-8.2 ms; during a restore every call was
+0.04-16 ms. The whole cost sits outside them.
+
+Split of one turn from the client (`NINFER_LMCACHE_IO_PROBE=1`, `[lmcache io]` lines):
+
+    restore: op=18 bytes=7375 send=0.000 s wait=2.745 s     <- one 28 MB reply
+    store:   reserve_write is entered 2.57 s after the previous call returns
+
+So the client hands the request over instantly and then waits while the server assembles and sends
+one large message; the same happens in the store direction before storage is entered.
+
+Raw transport, for reference (plain TCP, Windows client to a socket inside WSL): 143 MiB/s send,
+78 MiB/s receive. So the bridge is 4-8x faster than what the cache achieves, and it is itself a
+ceiling: the engine runs on Windows, the server inside WSL, and that relay is the path.
+
+Throughput against payload size (engine-side `[lmcache] store`):
+
+| payload | rate |
+|---|---|
+| 28.1 MiB (1916 tok) | 12-20 MiB/s |
+| 69.4 MiB (4723 tok) | 32 MiB/s |
+
+Fitting those two points gives roughly **1.1 s fixed + 65 MiB/s marginal**: the fixed part dominates
+short prefixes, the marginal part roughly matches the bridge. Worker count does not move it
+(4 -> 12, 8 -> 20, 16 -> 11 MiB/s), so it is not a server concurrency knob.
+
+And the shape that would benefit most is never stored at all: a 163,689-token request runs its
+prompt-frontier capture (the done line shows `boundary 3.4 s`) but **no `[lmcache] store` line and no
+growth in the server's RSS appear** - `store()` is never called, because the engine publishes only a
+checkpoint that `finish()` hands back and this request does not hand one back. At 4.7k tokens one of
+four concurrent requests did publish, so the gate is the capture policy, not the size of the payload.
+
+Ordered next steps, by what they unlock:
+
+1. make a 163k turn produce a finished checkpoint, so the cache sees the shape it is for;
+2. send a turn's chunks across the pool's connections in parallel (attack the ~1.1 s fixed part; the
+   restore direction cannot be split - `prepare_retrieve` returns the whole run in one reply);
+3. accept ~78 MiB/s as the ceiling of this topology: 2.4 GiB restores in ~31 s at best, against a
+   111-114 s cold prefill. Beating that needs the client inside WSL or a shared-memory transfer mode.
