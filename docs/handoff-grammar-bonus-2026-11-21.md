@@ -293,3 +293,41 @@ Ordered next steps, by what they unlock:
    restore direction cannot be split - `prepare_retrieve` returns the whole run in one reply);
 3. accept ~78 MiB/s as the ceiling of this topology: 2.4 GiB restores in ~31 s at best, against a
    111-114 s cold prefill. Beating that needs the client inside WSL or a shared-memory transfer mode.
+
+## 12. Correction: section 11's cost model was wrong, and the real term is the link
+
+Section 11 fitted "1.1 s fixed + 65 MiB/s marginal" from two store timings. That model is wrong, and
+the reason is a measurement bug worth remembering: the store/restore payload is **KV chunks plus the
+whole state image**, and the image is `153,954,304 B = 147 MiB` regardless of prefix length. The rate
+line counted only `checkpoint.kv_bytes`, so a 28.1 MiB store (1916 tokens) actually put ~175 MiB on
+the wire while the log said 28.1 MiB.
+
+Sampling the server's socket counter (`ss -tin` on :6555, every 50 ms) during that store shows the
+bytes arriving steadily:
+
+    1795265221.73 ... delta=3245580
+    1795265221.85 ... delta=5569900
+    ...
+    1795265222.99 ... delta=9038860
+    final total=183476609        (~175 MiB, ~150 MB/s sustained)
+
+So the transfer is a plain byte stream at the link's rate. Direction matters:
+
+| direction | rate | evidence |
+|---|---|---|
+| engine -> server (store) | **~150 MB/s** | socket counter above: ~9 MB per 60 ms |
+| server -> engine (restore) | **~64 MB/s** | `fetch 27.5 MB KV + 155.9 MB state` in 2.876 s |
+
+The storage calls inside the server remain milliseconds (`reserve_write` 0.14 ms, `finish_write`
+3-8 ms, restore-path calls 0.04-16 ms), so the server's own work is not the limit - the link is, and
+the restore direction is the slow half, which is also the half TTFT waits on.
+
+Consequence for the 1-2 s target: a 163k restore moves 2.4 GiB of KV **plus** 147 MiB of state
+(2.55 GiB). At 64 MB/s that is ~40 s; at 1.3 GB/s it is 2 s. No amount of client-side parallelism
+changes that, because the limit is bytes over a VM boundary - which is why the options are, in order:
+
+1. put the cache on the same side of the boundary as the engine (a Windows-native L3 service, or a
+   Windows build of the server), so the transfer becomes a memcpy at multi-GB/s;
+2. shrink the payload: the state image is a constant 147 MiB per turn and compresses well (BF16/FP32
+   recurrent state), and a prefix whose state did not change needs no re-send at all;
+3. keep the current topology and accept ~40 s at 163k, which still beats the 111-114 s cold prefill.
