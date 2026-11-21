@@ -18,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -390,7 +391,8 @@ public:
     // capturing. Two guards keep it off the common case: nothing happens without a backend, and
     // nothing happens below two chunks -- a prefix the cache cannot even address is not worth a
     // 77 MB export.
-    void publish_to_cache(Program& program, const Base& base, Handle handle) {
+    void publish_to_cache(Program& program, const Base& base, Handle handle,
+                          OwnerToken owner = 0) {
         const bool probe = std::getenv("NINFER_PUBLISH_PROBE") != nullptr;
         if (checkpoint_cache_ == nullptr) {
             if (probe) { std::fprintf(stderr, "[publish] sink: no cache backend\n"); }
@@ -414,6 +416,25 @@ public:
             if (probe) { std::fprintf(stderr, "[publish] sink: no tokens\n"); }
             return;
         }
+        // A request publishes twice by design: the prompt-frontier capture and the finish-time
+        // record. Those are often the same prefix (measured: frontier 1729 from both), and exporting
+        // it a second time costs about 85 ms of the response path plus another whole payload on the
+        // wire for a key the cache already holds. Publishers are monotone per owner - a later
+        // frontier supersedes an earlier one - so an equal-or-shorter frontier is always already
+        // covered. Printed, because a silent skip here would look exactly like the bug this call
+        // was added to fix.
+        if (owner != 0) {
+            const auto seen = published_frontiers_.find(owner);
+            if (seen != published_frontiers_.end() && seen->second >= summary.frontier) {
+                if (probe) {
+                    std::fprintf(stderr,
+                                 "[publish] sink: frontier %u already published for owner %llu\n",
+                                 summary.frontier, static_cast<unsigned long long>(owner));
+                    std::fflush(stderr);
+                }
+                return;
+            }
+        }
 
         auto kv = program.export_checkpoint(handle);
         if (!kv || kv->page_count == 0 || kv->page_bytes == 0) {
@@ -433,6 +454,12 @@ public:
                          summary.frontier, static_cast<std::size_t>(kv->page_count),
                          kv->kv_bytes.size());
             std::fflush(stderr);
+        }
+        // Claim the frontier only once the export has actually produced something: a failed export
+        // must leave the owner free to publish the same prefix again.
+        if (owner != 0) {
+            auto& published = published_frontiers_[owner];
+            published       = std::max(published, summary.frontier);
         }
 
         CachedCheckpoint out;
@@ -662,6 +689,7 @@ public:
 
     void finish(Program& program, OwnerToken token, const Base& base,
                 std::uint64_t publication_order) {
+        published_frontiers_.erase(token);
         auto* owner = find_owner(token);
         if (!owner) { return; }
         owner->active            = false;
@@ -684,6 +712,7 @@ public:
     }
 
     void abandon(Program& program, OwnerToken token) {
+        published_frontiers_.erase(token);
         auto* owner = find_owner(token);
         if (!owner) { return; }
         const auto old = points(token);
@@ -2036,6 +2065,11 @@ private:
     bool enabled_;
     ContextMachineCostModel costs_;
     std::shared_ptr<CheckpointCacheBackend> checkpoint_cache_;
+    // Highest prefix length already handed to the backend, per continuation owner. A request
+    // publishes both its prompt-frontier capture and its finish-time record, and those are usually
+    // the same prefix; the map keeps the second export from repeating the first. Entries are dropped
+    // in finish(), so this never outlives the request that owns it.
+    std::unordered_map<OwnerToken, std::uint32_t> published_frontiers_;
     // V10-02: fixed at construction from NINFER_PREFIX_RETENTION, never re-read (see the reader).
     bool prefix_retention_ = false;
     std::unique_ptr<core::Prefetcher> publish_worker_;

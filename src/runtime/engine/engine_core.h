@@ -1272,7 +1272,8 @@ private:
                 // publish_to_cache() used to be reachable from the active-capture path alone.
                 if (request->base_plan) {
                     resources_.publish_to_cache(*instance_.program, *request->base_plan,
-                                                *finished.checkpoint);
+                                                *finished.checkpoint,
+                                                request->continuation_owner);
                 }
                 report_boundary_work(
                     "publish", request->id,
@@ -2458,7 +2459,8 @@ private:
                     // Only after the record exists and is owned: publishing an unowned checkpoint
                     // would hand the cache bytes that a later prune() is about to release.
                     if (request->base_plan) {
-                        resources_.publish_to_cache(*instance_.program, *request->base_plan, point);
+                        resources_.publish_to_cache(*instance_.program, *request->base_plan, point,
+                                                   request->continuation_owner);
                     }
                 }
             }
