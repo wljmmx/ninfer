@@ -1574,9 +1574,16 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         // this rectangle's columns are that same (row, position) order, so the rectangle is
         // argmaxed under the bitmap instead of over the raw logits.
         //
-        // The path has no per-request branch: a row whose request carries no grammar keeps an
-        // all-ones block, which is an exact copy of its logits and therefore the plain argmax bit
-        // for bit. A captured graph consequently holds one path, not one per request kind.
+        // The path has no per-request branch on the *values*: a row whose request carries no
+        // grammar keeps an all-ones block, which is an exact copy of its logits and therefore the
+        // plain argmax bit for bit, so the mask is always applied and the PPL gate stays
+        // bit-exact. The one host value it does read is whether a row HAS a bitmap at all, and the
+        // addresses it reads from are fixed offsets of the persistent mask tensor, so what a
+        // captured graph bakes is limited to the presence of a row's bitmap and the source
+        // address: a row that was unconstrained when its shape was captured and is constrained
+        // later in the same shape would not be masked. With this engine's configuration the arena
+        // holds one full-length lane, so a round carries one row; a future resident-multi-row mode
+        // has to fill every row's region with ones per round instead of skipping it here.
         const auto token_domain = static_cast<std::int32_t>(
             dimension(parameters_.model.resources().public_token_count));
         const auto vocabulary     = static_cast<std::int32_t>(flat_logits.ne[0]);
