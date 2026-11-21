@@ -46,6 +46,18 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
         const auto count = round.row_counts.empty() ? 1 : round.row_counts[row];
         ContractAccess::constraint_failed(pending, row,
                                           (grammar_dead_positions[row] & ((1u << count) - 1)) != 0);
+        // Does the DEVICE mask know which drafts the host matcher will reject?
+        //
+        // The engine now fails such a request instead of dying (commit 4f120123), but 9 of 12
+        // constrained requests still ended in 400 because the mask reported nothing while the
+        // matcher rejected 7 of 8 drafts. NINFER_GRAMMAR_DEBUG=1 prints the per-row dead bitmap next
+        // to the licensed count, which is the one fact that says whether the fix belongs here (clamp
+        // the licensed prefix to the first dead bit) or in the mask feed itself.
+        if (std::getenv("NINFER_GRAMMAR_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[grammar] mask | lane %u | licensed %d | dead 0x%08x\n", lanes[row],
+                         static_cast<int>(count), grammar_dead_positions[row]);
+            std::fflush(stderr);
+        }
     }
     return pending;
 }

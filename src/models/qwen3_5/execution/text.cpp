@@ -1566,6 +1566,46 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         project(sample, *lm_head_, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
+        // Does the verify pass actually produce a token for the column the acceptance kernel reads as
+        // the bonus token (index `accepted`, i.e. the one past the last accepted draft)?
+        //
+        // Measured 2026-11-21: the committed run ends in token id 0 whenever it carries a bonus slot
+        // ("matcher got | 8 token(s): ... 1596 0"), and the host grammar therefore rejects the run.
+        // This probe prints the whole row so the answer is data, not another guess: a real token in
+        // the last column points at an index/stride mismatch on the read side, a 0 points at the
+        // write side (column not computed, or its logits left zero).
+        if (std::getenv("NINFER_TARGET_TOKENS_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 400) {
+                ++printed;
+                const auto count = static_cast<std::size_t>(columns);
+                const auto rows  = static_cast<std::size_t>(target_tokens.ne[1]);
+                std::vector<std::int32_t> host(count * rows, -1);
+                std::vector<std::int32_t> valid(rows, -1);
+                const bool ok =
+                    cudaMemcpy(host.data(), flat_tokens.data, host.size() * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    cudaMemcpy(valid.data(), valid_columns.data, rows * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (ok) {
+                    for (std::size_t row = 0; row < rows && row < 4; ++row) {
+                        // valid[row] is the number of computed columns for this row (extent + 1).
+                        // The bonus token the acceptance kernel reads is the LAST of them, so the
+                        // question this answers is whether that column was computed at all.
+                        std::fprintf(stderr, "[mtp] target_tokens | columns=%zu | row=%zu valid=%d |",
+                                     count, row, valid[row]);
+                        const std::size_t shown =
+                            std::min<std::size_t>(count, static_cast<std::size_t>(
+                                                             valid[row] > 0 ? valid[row] : 9));
+                        for (std::size_t index = 0; index < shown; ++index) {
+                            std::fprintf(stderr, " %d", host[row * count + index]);
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                    std::fflush(stderr);
+                }
+            }
+        }
     }
     work_.reset();
 }

@@ -1411,6 +1411,14 @@ private:
                     continue;
                 }
                 OutputDecision decision;
+                if (std::getenv("NINFER_GRAMMAR_DEBUG") != nullptr) {
+                    std::fprintf(stderr, "[grammar] matcher got | row %zu | %u token(s):", row, count);
+                    for (std::size_t index = 0; index < row_tokens.size() && index < 8; ++index) {
+                        std::fprintf(stderr, " %lld", static_cast<long long>(row_tokens[index]));
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
                 try {
                     decision = request->output.preview_model(
                         row_tokens, request->budget->remaining(), request->budget->limit_reason());
