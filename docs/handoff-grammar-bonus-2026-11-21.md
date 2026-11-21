@@ -407,3 +407,48 @@ Where that leaves each direction of a checkpoint:
 That is the real boundary of this topology, and it is why the two structural options remain: change the
 WSL networking mode so the path stops being a user-space relay (needs `wsl --shutdown`, so it must be a
 deliberate step), or put the cache on the engine's side of the boundary.
+
+## 15. Optimization plan for the LMCache link, and the first experiment's result
+
+Targets implied by the measured link (8 connections reach 960 MiB/s on the WSL virtual NIC,
+190-254 MiB/s on one):
+
+| scenario | payload | floor at 1 GB/s | 500 ms reachable? |
+|---|---|---|---|
+| short prefix (1916 tok) | 175 MiB | 0.18 s | yes |
+| growth turn (+31 tok, new chunks only) | ~2 MiB + state | ms | yes |
+| 163k full restore | 2.48 GiB (2.34 GiB KV + 147 MiB state) | 2.3-2.6 s | no - needs 5 GB/s |
+
+Ordered plan, and where each one stands:
+
+1. **Publish only new chunks** - not started. The key is chunk-addressed (one immutable object per 128
+   tokens), so a growth turn only needs the new chunk(s). The client now takes `first_chunk` and
+   `with_state` on `store()` for exactly this, with defaults that keep today's behaviour. What is
+   still missing is the engine side: remembering, per continuing conversation, the frontier that was
+   already published.
+2. **Capture only new pages** - not started; matters for the first capture (2.4 GiB at 705 MB/s =
+   3.4 s, of which only 64 MiB was pinned).
+3. **Store across several connections** - tried and does not work as a client-side fan-out (below).
+4. **Many frames instead of one big msgpack bin** - not started.
+5. **Parallel restore** - not started; needs a chunk range on `kPrepareRetrieve`, which the protocol
+   does not have. This is the only way a 163k restore gets near 1-2 s.
+6. **State image shrink** - not started; 146.8 MiB of every turn regardless of prefix length.
+7. **Endpoint / ZMQ tuning** - endpoint done (bind 0.0.0.0, connect to the WSL address, 5-6x versus
+   127.0.0.1); ZMQ socket buffers/HWM not yet tuned.
+
+### Experiment: sharding one store across the pool (NINFER_LMCACHE_SPLIT_STORE)
+
+Implemented as four contiguous chunk ranges with absolute indices, the last range carrying the state
+image. Result on a 1916-token publish:
+
+    [lmcache] publish failed | 14 chunk(s) | 27525120 byte(s) |
+      sharded store failed on lane 0: receive failed: Resource temporarily unavailable
+    [lmcache] store 174.9 MiB in 5.108 s (34 MiB/s) | kv 28.1 + state 146.8 MiB | ok=0
+
+Lane 0 never received its `prepare_store` reply, so the server serializes a key's store across
+identities. Client-side fan-out cannot work; the server needs an answer for concurrent partial stores
+of one key. The code is reverted; the `first_chunk` / `with_state` parameters stay because item 1 needs
+them and they default to today's behaviour.
+
+Consequence for the plan: item 3 is blocked on a protocol change, and item 1 (client side) is ready
+but useless until the engine tracks the published frontier.

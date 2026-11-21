@@ -219,6 +219,13 @@ public:
         }
         const std::string payload(reinterpret_cast<const char*>(state.data()), state.size());
 
+        // One turn is one call on one connection, and that connection is one ZMQ identity, which the
+        // server pins to one worker thread (affinity_pool.py). Sharding a store across the pool was
+        // tried on 2026-11-21 and does not work: four concurrent stores for the same key leave the
+        // first one waiting for a prepare_store reply that never comes ("receive failed: Resource
+        // temporarily unavailable"), so the server serializes a key's store regardless of identity.
+        // Making this parallel needs a server-side answer for concurrent partial stores of one key,
+        // not a client-side fan-out.
         auto lease = pool_.acquire();
         if (!lease) {
             error_ = "no connection available";

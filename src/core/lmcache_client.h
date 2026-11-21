@@ -140,9 +140,14 @@ public:
     // kv_shape is one chunk's shape and is the same for every chunk; state_shape is the whole image.
     // Both are validated by the server against the registered layout, which is why they are passed
     // in rather than guessed here.
+    // `first_chunk` is the index of the first chunk in `kv_chunks` within the key's whole chunk run,
+    // and `with_state` says whether this call carries the state image. Both exist so one store can be
+    // split across connections: the server validates chunk indices against the key, so a shard has to
+    // say where it starts, and the state describes the whole prefix, so exactly one shard carries it.
     bool store(const CacheKey& key, const std::vector<std::string>& kv_chunks,
                const std::vector<std::int64_t>& kv_shape, const std::string& state,
-               const std::vector<std::int64_t>& state_shape) {
+               const std::vector<std::int64_t>& state_shape, std::int64_t first_chunk = 0,
+               bool with_state = true) {
         if (kv_chunks.empty()) {
             error_ = "store needs at least one KV chunk";
             return false;
@@ -163,19 +168,21 @@ public:
             }
         }
 
-        std::vector<TensorGroupWire> groups(2);
+        std::vector<TensorGroupWire> groups(with_state ? 2 : 1);
         groups[0].chunk_indices.reserve(kv_chunks.size());
         groups[0].tensors.reserve(kv_chunks.size());
         for (std::size_t i = 0; i < kv_chunks.size(); ++i) {
-            groups[0].chunk_indices.push_back(static_cast<std::int64_t>(i));
+            groups[0].chunk_indices.push_back(first_chunk + static_cast<std::int64_t>(i));
             groups[0].tensors.push_back({kv_dtype(), kv_shape, kv_chunks[i]});
         }
-        // The state describes the whole prefix, so it is stored once, under the trailing chunk. The
-        // server only requires chunk indices to be increasing and below the chunk count, not to
-        // cover it -- but a retrieve is a miss unless each group covers its in-window suffix, which
-        // is why the group is registered with window_chunks=1.
-        groups[1].chunk_indices = {static_cast<std::int64_t>(kv_chunks.size()) - 1};
-        groups[1].tensors.push_back({state_dtype(), state_shape, state});
+        if (with_state) {
+            // The state describes the whole prefix, so it is stored once, under the trailing chunk. The
+            // server only requires chunk indices to be increasing and below the chunk count, not to
+            // cover it -- but a retrieve is a miss unless each group covers its in-window suffix, which
+            // is why the group is registered with window_chunks=1.
+            groups[1].chunk_indices = {first_chunk + static_cast<std::int64_t>(kv_chunks.size()) - 1};
+            groups[1].tensors.push_back({state_dtype(), state_shape, state});
+        }
 
         const std::string envelope = encode_grouped_tensor_envelope(groups);
         std::string body;
