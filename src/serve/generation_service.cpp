@@ -728,11 +728,46 @@ bool GenerationService::attach_checkpoint_cache() {
         const int parsed = std::atoi(value);
         if (parsed > 0) { connections = parsed; }
     }
+    // A split restore runs one retrieve per part, so it needs one connection per part. With fewer,
+    // the extra parts simply wait on the pool and the effective concurrency is the pool size -
+    // measured: eight parts over four connections behaved like four. Raising this is safe because
+    // the server binds one worker per ZMQ identity; the connection count is the real limit.
+    if (const char* split = std::getenv("NINFER_RESTORE_SPLIT")) {
+        const int parts = std::atoi(split);
+        if (parts > connections) {
+            std::fprintf(stderr,
+                         "[lmcache] raising connections %d -> %d to match NINFER_RESTORE_SPLIT\n",
+                         connections, parts);
+            connections = parts;
+        }
+    }
     if (!checkpoint_cache_->backend->configure(geometry, load_summary().model_name, connections)) {
-        std::fprintf(stderr, "[lmcache] could not attach (%s); the cache stays off\n",
-                     checkpoint_cache_->backend->error().c_str());
-        checkpoint_cache_.reset();
-        return false;
+        // An eight-connection pool failed to register against this server (measured: "receive
+        // failed: Resource temporarily unavailable" during REGISTER, while four connections attach
+        // reliably). A cache that is off costs a full prefill on every request, so fall back to the
+        // pool size that is known to work instead of leaving it disabled; the split is capped by
+        // whatever actually opened.
+        const std::string first_error = checkpoint_cache_->backend->error();
+        if (connections > 4 &&
+            checkpoint_cache_->backend->configure(geometry, load_summary().model_name, 4)) {
+            std::fprintf(stderr,
+                         "[lmcache] attach failed with %d connections (%s); fell back to 4\n",
+                         connections, first_error.c_str());
+            connections = 4;
+            if (const char* split = std::getenv("NINFER_RESTORE_SPLIT")) {
+                if (std::atoi(split) > connections) {
+                    std::fprintf(stderr,
+                                 "[lmcache] NINFER_RESTORE_SPLIT=%s exceeds %d connections; the "
+                                 "extra parts will queue on the pool\n",
+                                 split, connections);
+                }
+            }
+        } else {
+            std::fprintf(stderr, "[lmcache] could not attach (%s); the cache stays off\n",
+                         first_error.c_str());
+            checkpoint_cache_.reset();
+            return false;
+        }
     }
     const std::size_t chunk = checkpoint_cache_->backend->chunk_tokens();
     const std::size_t chunk_pages = chunk / static_cast<std::size_t>(geometry.page_tokens);

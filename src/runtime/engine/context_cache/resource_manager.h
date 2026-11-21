@@ -93,6 +93,23 @@ public:
 
     // The backend is optional and only consulted when the local pool yields no candidate; an
     // empty one keeps every existing path byte-identical.
+    // The window a publish may occupy in the writer queue.
+    //
+    // This is a byte account, not an allocation: a job already owns its payload, so the window only
+    // decides how many of them may be queued. It used to be a flat 256 MiB, which is smaller than a
+    // single 16k checkpoint (~400 MB), so every large store was refused and fell through to the
+    // synchronous path - 3.1 s of transfer on the thread that just finished the request. The default
+    // now holds one large checkpoint plus room for a small one behind it; NINFER_PUBLISH_WINDOW_MB
+    // overrides it for a machine that can or cannot afford more.
+    [[nodiscard]] static std::size_t publish_window_bytes() {
+        constexpr std::size_t kDefault = 1024ULL * 1024 * 1024;
+        const char* value = std::getenv("NINFER_PUBLISH_WINDOW_MB");
+        if (value == nullptr || *value == '\0') { return kDefault; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed <= 0) { return kDefault; }
+        return static_cast<std::size_t>(parsed) * 1024ULL * 1024ULL;
+    }
+
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs,
                              std::shared_ptr<CheckpointCacheBackend> checkpoint_cache = nullptr)
         : enabled_(enabled), costs_(std::move(costs)),
@@ -100,10 +117,9 @@ public:
           prefix_retention_(prefix_retention_requested()) {
         // Publishing costs about 1.5 s of transport for a 640-token prefix, on the path that just
         // finished capturing. Exporting stays on the calling thread (it touches Program), the
-        // transfer does not. Three prefixes in flight is the budget: beyond that enqueue() refuses
-        // and the caller publishes synchronously rather than dropping the checkpoint.
+        // transfer does not.
         if (checkpoint_cache_ != nullptr) {
-            publish_worker_ = std::make_unique<core::Prefetcher>(256ULL * 1024 * 1024);
+            publish_worker_ = std::make_unique<core::Prefetcher>(publish_window_bytes());
         }
     }
 
