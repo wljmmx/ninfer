@@ -1573,9 +1573,27 @@ private:
                         continuations[row] == ContinuationAction::ApplyTargetControl
                             ? EngineRequestState::ControlReady
                             : EngineRequestState::DecodeReady;
-                    if (terminal_in_batch) {
+                    // A prompt-frontier capture exports the WHOLE prefix to the Host tier before the
+                    // first token can be produced: 163k tokens = 2,558 pages = 2.4 GiB, measured as
+                    // TTFT 1.9 s (one run 3.4 s) against 0.57-0.68 s with the checkpoint cache off,
+                    // reported by the operator as "TTFT is always ~5 s".
+                    //
+                    // The same prefix is published again when the request FINISHES (the checkpoint
+                    // handed back by finish()), and that is the record a later turn or a restarted
+                    // engine actually reuses - so for a turn-by-turn conversation the prompt
+                    // frontier capture buys nothing on the critical path and only delays the first
+                    // token. NINFER_CAPTURE_PROMPT_FRONTIER=0 skips it; the finish-time publish is
+                    // untouched, so cross-process reuse still gets its record.
+                    if (terminal_in_batch || !capture_prompt_frontier_) {
                         instance_.program->skip_capture(*request->sequence);
                         request->model_state = post_capture_state;
+                        if (!terminal_in_batch) {
+                            std::fprintf(stderr,
+                                         "[ckpt] prompt-frontier capture skipped | frontier %u | "
+                                         "finish-time publish keeps the record\n",
+                                         request->base_plan->summary().prompt_tokens);
+                            std::fflush(stderr);
+                        }
                     } else {
                         reserve_active_capture(request, post_capture_state);
                     }
@@ -3866,6 +3884,12 @@ private:
     bool prefill_batch_verbose_ = [] {
         const char* value = std::getenv("NINFER_PREFILL_BATCH");
         return value != nullptr && (value[0] == 'a' || value[0] == 'A');
+    }();
+    // See the capture_ready branch: 0 keeps the prompt-frontier capture off the first-token path
+    // and relies on the finish-time publish for the reusable record.
+    bool capture_prompt_frontier_ = [] {
+        const char* value = std::getenv("NINFER_CAPTURE_PROMPT_FRONTIER");
+        return value == nullptr || value[0] != '0';
     }();
     std::uint64_t prefill_batch_reports_ = 0;
     // Q67/S1: admission probe counters, see try_admit_one.

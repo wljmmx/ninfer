@@ -276,6 +276,21 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         out << " | queue "
             << product::format_pretty_duration(metrics.engine_timing.queue_wait_seconds);
     }
+    // The split behind TTFT. The "prefill" field below is a token rate and cannot say where the
+    // wait went; prepare is the frontend (template, tokenize, media) and engine-wall is everything
+    // from admission to the first committed token: the prompt's own prefill plus whatever a
+    // checkpoint capture or restore does on that path. A cache-hit turn that still reads seconds is
+    // almost always that last term.
+    if (metrics.prepare_seconds > 0.001) {
+        out << " | prepare " << product::format_pretty_duration(metrics.prepare_seconds);
+    }
+    {
+        const double engine_wall = metrics.ttft_seconds - metrics.prepare_seconds -
+                                   metrics.engine_timing.queue_wait_seconds;
+        if (engine_wall > 0.001) {
+            out << " | engine-wall " << product::format_pretty_duration(engine_wall);
+        }
+    }
     if (metrics.prefill_seconds > 0.0) {
         out << " | prefill "
             << product::format_pretty_rate(computed_prefill_tokens / metrics.prefill_seconds,
