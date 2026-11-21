@@ -484,3 +484,87 @@ Consequence: parallelism cannot come from key granularity. It has to come from t
   section 15).
 
 Both are server changes. Nothing client-side can work around them.
+
+## 17. Parallel restore: ranges, the silent drop, and where the cache actually pays
+
+Section 16 predicted the next step would be a chunk range on `kPrepareRetrieve`. That landed, and
+two measurements changed the plan around it.
+
+### 17.1 The payload never reached the cache above 256 MiB
+
+`publish_to_cache` handed the writer thread its token list by move. When `enqueue()` refused the job
+(the window is 256 MiB), the fallback called `backend->store(kept, ...)` on the vector the move had
+already emptied, and `store()` returns immediately on an empty list. The effect was a silent split
+by payload size:
+
+| prefix | payload | result before the fix |
+|---|---|---|
+| 1736 tok | 176 MB | stored |
+| 16k tok | 401,680,384 B | dropped, no log, no server record |
+
+The probe that found it printed `store entered: tokens=0` while `sink` had just reported 252 pages
+exported. Fix: the job captures a copy of the token ids, and a refused enqueue now prints. Measured
+after: `store 382.1 MiB in 3.137 s (122 MiB/s) | ok=1` and `Stored 16000 tokens in 2.912 seconds`
+server-side.
+
+### 17.2 The state image does not compress
+
+Exported 153,954,304 B, then measured on those exact bytes: zstd-1/3/9/19 and zlib-6 all 1.07x, best
+de-interleave stride 4 gives 1.16x, entropy 7.53 bits/byte, 0.4% zeros. Layout split of the image:
+recurrent 150,994,944 (98.1%), conv 2,949,120, hidden 10,240, dflash k/v 0 with spec off. It is real
+high-entropy model state, so "compress the state image" is closed.
+
+### 17.3 Ranges on prepare_retrieve
+
+Server patch (local to `lmcache-src`, commit `b52bdfe`): `prepare_retrieve` takes
+`chunk_begin/chunk_end/state_begin/state_end`, all defaulting to -1 (whole payload). The handler
+slices the KV group and shifts `group_first_chunk`; the inline strategy slices the state tensor.
+KV and state are both `uint8`, so byte slicing is exact.
+
+Client (`ninfer` commit `3cf706b7`): `NINFER_RESTORE_SPLIT=N` runs N contiguous, exhaustive parts,
+each with its own `request_id`. That detail is required, not cosmetic: the server's prefetch job is
+consumed once per request_id, and with a shared one only the first part finds the prefetched objects
+(the other three each timed out at 5.008 s).
+
+Measured, cross-process, same 1736-token key:
+
+| parts | restore |
+|---|---|
+| 1 | 1.42 s |
+| 4 | 0.54-0.80 s |
+| 8 | 0.46-0.66 s |
+
+Sharing one prefetch across parts was tried and does not work: with `NINFER_RESTORE_SHARE` all eight
+parts missed (`cache_n 0`), because the prefetched result is released by the first reader. Every part
+therefore re-prefetches the whole entry, which is why 8 parts is not 4x faster than 1.
+
+### 17.4 The cache does not pay on short prefixes
+
+End to end, 1736-token prefix, engine restarted each round:
+
+| path | total |
+|---|---|
+| cold prefill | 0.8 s (engine-wall 816 ms, prefill 2.4k tok/s) |
+| cache hit, 1 connection | 2.03 s |
+| cache hit, 4-8 connections | 1.09-1.12 s |
+
+So at this size the cache is still slower than not using it. The 16k prefix is the first size
+measured where it wins clearly:
+
+| path | total |
+|---|---|
+| cold prefill | 8.6 s |
+| cache hit, 8 parts | 2.8 s (restore 1.535 s, queue 2.0 s, engine-wall 145 ms) |
+
+Break-even sits where prefill time exceeds restore time, at roughly 3k tok/s prefill and ~250 MiB/s
+restore: a few thousand tokens for this model. Below it the cost model should decline the cache;
+today it does not, which is the next piece of work.
+
+### 17.5 Still open
+
+* `enqueue` refuses anything over 256 MiB, so every large store runs synchronously on the finish
+  path (3.1 s for 16k). The window needs to follow the payload or be configurable.
+* Parts re-prefetch the whole entry; a server-side shared read (or a reference count that outlives
+  the first reader) would make 8 parts actually scale.
+* Restore still ships one message per part; multi-frame streaming was never measured.
+* The cost model does not yet refuse the cache on prefixes where prefill is cheaper.
