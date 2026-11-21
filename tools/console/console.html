@@ -389,7 +389,7 @@
     <label>KV 类型<select id="lKv"><option>bf16</option><option>int8</option><option>fp8</option><option>nvfp4</option><option>k8v4</option><option>rk8v4</option><option>rk4v4</option><option>rk4v4-e8</option><option>rk2v4-e8</option><option>rk4v2-e8</option></select></label>
   </div>
   <details><summary class="sub">额外参数（可选）</summary><div class="opts" id="lOpts"></div></details>
-  <div class="lrow"><label style="flex-direction:row;align-items:center;gap:6px;color:var(--ink);font-size:12.5px"><input type="checkbox" id="lLmcache"> 接入 LMCache</label>
+  <div class="lrow"><label style="flex-direction:row;align-items:center;gap:6px;color:var(--ink);font-size:12.5px"><input type="checkbox" id="lLmcache"> 接入 LMCache<span id="lLmcacheCost" style="color:#e0a030;font-size:11px"></span></label>
     <button id="lStart" class="primary">启动</button><button id="lStop">停止</button><span class="sub" id="lState">—</span></div>
   <pre id="lLog" style="max-height:110px;margin-top:6px;overflow:auto;white-space:pre-wrap;word-break:break-all;width:100%;box-sizing:border-box;font-size:11.5px;line-height:1.45">—</pre>
 </div>
@@ -2480,8 +2480,17 @@ $('clock').textContent = new Date().toLocaleTimeString();
   {
     const saved = localStorage.getItem('ninfer.lmcache');
     if (saved !== null) L('lLmcache').checked = saved === '1';
+    // 实测代价（163k prompt、每轮追加 30 token）：接入时 TTFT 1.9–4.5 s，且开启异步写入会开始
+    // 返 503；不接入时 0.57–0.68 s。取数一次都没发生过（[lmcache] fetch 从未打印），所以在单机
+    // 单实例下它只在付账。数字直接摆在勾选框旁边，避免"勾上就变慢"再被当成引擎问题排查。
+    const showLmcacheCost = () => {
+      const cost = L('lLmcacheCost');
+      if (cost) cost.textContent = L('lLmcache').checked ? '（实测：命中轮 TTFT 1.9–4.5 s，关闭时 0.6 s）' : '';
+    };
     L('lLmcache').addEventListener('change', () =>
       localStorage.setItem('ninfer.lmcache', L('lLmcache').checked ? '1' : '0'));
+    L('lLmcache').addEventListener('change', showLmcacheCost);
+    showLmcacheCost();
   }
   buildOpts(); loadDir((()=>{try{return localStorage.getItem('ninfer.dir')||'';}catch(e){return '';}})()); tickLaunch(); tickLc();
   setInterval(tickLaunch, 1000); setInterval(tickLc, 2000);

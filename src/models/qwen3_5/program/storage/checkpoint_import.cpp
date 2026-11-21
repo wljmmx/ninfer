@@ -213,19 +213,73 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
         // eager copy that was tried before and left the Host extent reading as zeros: that one went
         // through the writable view, this one reads the published extent and only writes to Device.
         bool rollback_pending = false;
-        for (const LogicalKVPageHandle page : pages) {
-            const auto page_host = host_kv_extents->page_view(*text_kv_pages, page);
-            if (!page_host || !page_host->valid()) {
-                rollback_pending = true;
-                break;
+        // ONE transfer call for the whole extent, not one per page.
+        //
+        // DeviceKVPagePool::copy_from_host already merges contiguous Device runs into a few large
+        // copies (and batches them), but it can only do that for the pages it is handed at once.
+        // The per-page form handed it a single-page array, so every page paid its own
+        // cudaMemcpy3DBatchAsync: a 157k-token checkpoint is 2,454 pages, measured at ~2 ms each,
+        // which is exactly the ~5 s of a cache-hit TTFT the operator reported.
+        //
+        // The extent holds this restore's pages at offsets 0..n-1 in order (the reservation was made
+        // for exactly this run), so one whole-extent view plus the page handles in the same order is
+        // a faithful description of the copy. When any page disagrees - a subview, a gap, a foreign
+        // extent - the loop falls back to the per-page path instead of copying a neighbour's bytes.
+        const HostKVAllocationConstView published_view = host_kv_extents->view(*published);
+        bool whole_run = published_view.valid() && published_view.page_count() == pages.size();
+        std::vector<DeviceKVPageHandle> destinations;
+        destinations.reserve(pages.size());
+        if (whole_run) {
+            for (std::size_t index = 0; index < pages.size(); ++index) {
+                const HostKVPageReplica replica = text_kv_pages->host_replica(pages[index]);
+                if (replica.extent != *published || replica.page_offset != index) {
+                    whole_run = false;
+                    break;
+                }
+                destinations.push_back(text_kv_pages->physical(pages[index]));
             }
-            const std::array<DeviceKVPageHandle, 1> destination{text_kv_pages->physical(page)};
-            (void)text_kv_pages->physical_pool().copy_from_host(*page_host, destination,
-                                                                device.transfer_stream);
+        }
+        const auto copy_started = std::chrono::steady_clock::now();
+        TransferWork transfer{};
+        if (whole_run) {
+            transfer = text_kv_pages->physical_pool().copy_from_host(
+                published_view, destinations, device.transfer_stream);
+        } else {
+            destinations.clear();
+            for (const LogicalKVPageHandle page : pages) {
+                const auto page_host = host_kv_extents->page_view(*text_kv_pages, page);
+                if (!page_host || !page_host->valid()) {
+                    rollback_pending = true;
+                    break;
+                }
+                const std::array<DeviceKVPageHandle, 1> destination{text_kv_pages->physical(page)};
+                const TransferWork single = text_kv_pages->physical_pool().copy_from_host(
+                    *page_host, destination, device.transfer_stream);
+                transfer.payload_bytes += single.payload_bytes;
+                transfer.copy_operations += single.copy_operations;
+            }
         }
         if (!rollback_pending &&
             cudaStreamSynchronize(device.transfer_stream) != cudaSuccess) {
             rollback_pending = true;
+        }
+        const double copy_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_started).count();
+        if (!rollback_pending) {
+            // The piece the request log cannot show by itself: a cache-hit TTFT is this plus a few
+            // hundred tokens of prefill, so the payload, the time and the rate belong on one line.
+            std::fprintf(stderr,
+                         "[ckpt] restore copy | pages %zu | %.1f MiB | ops %llu | %.0f ms | "
+                         "%.2f GB/s | %s\n",
+                         pages.size(),
+                         static_cast<double>(transfer.payload_bytes) / (1024.0 * 1024.0),
+                         static_cast<unsigned long long>(transfer.copy_operations),
+                         copy_seconds * 1000.0,
+                         copy_seconds > 0.0
+                             ? static_cast<double>(transfer.payload_bytes) / copy_seconds / 1e9
+                             : 0.0,
+                         whole_run ? "whole extent" : "per page");
+            std::fflush(stderr);
         }
         if (rollback_pending) {
             if (published) { (void)host_kv_extents->release(*published); }
