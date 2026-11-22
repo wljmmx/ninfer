@@ -416,6 +416,24 @@ self._l1_manager.delete(action.keys)     # DISCARD, and the fallback for anythin
 
 `ffn.cpp` 与 `kv_host_split_mirror.h` 里用 `std::vector` 的那几处，若要统一口径可以换成 `PinnedHostBuffer`，但它们分别是受限次数的诊断和默认关闭的实验特性，收益接近 0，这轮不动。
 
+### 4.11.2 多线程多缓冲？实测：单流已经打满 PCIe（2026-11-23）
+
+cudamemcpy-tuner 的核心论断是"一个线程填缓冲区填不快，所以要多个线程、多个缓冲区"。这条论断是否适用于我们，不能靠读代码判断，要有带宽数据。`bench_h2d.cu`（`.temp/kv/`）在同一张 4090（PCIe **Gen4 x16**）上测 pinned 1/2/4/8 流与 pageable 1 流：
+
+| 大小 | pinned 1 流 | 2 流 | 4 流 | 8 流 | pageable 1 流 |
+|---|---|---|---|---|---|
+| 600 MiB | 22.54 GB/s | 22.62 | 22.58 | 22.66 | **16.45 GB/s** |
+| 1024 MiB | 22.57 | 22.60 | 22.54 | 22.56 | **17.52** |
+| 2560 MiB | 22.55 | 22.55 | 22.57 | 22.54 | **17.48** |
+
+三个结论：
+
+1. **pinned 单流 22.55 GB/s 就是 PCIe 4.0 x16 的实测上限**（理论 32 GB/s，实际到不了）。加流没有收益——2/4/8 流全部在 ±0.5% 内。文章里"单线程是天花板"针对的是 **pageable → staging 那一跳的 CPU 拷贝**，不是 `cudaMemcpyAsync` 本身；我们的路径是 pinned，不经过那一跳。
+2. **pageable 是 17.5 GB/s**，比 pinned 低 22%。这量化了"保住 pin"的价值，也说明即使退化成 pageable，也远没有文章里 10 GB/s 那么糟（4090 + 新驱动）。真要在那条路上再挤 20%，才轮到多线程 staging，而那是回退路径，不是常态。
+3. **H2D 在总时间里可以忽略**：2.5 GB @ 22.55 GB/s = **0.11 s**，而 163k 的端到端是 16.3 s。权重 15.6 GiB 理论 0.71 s，实测 3.2 s，差的那 2.5 s 是磁盘随机读（≈4.9 GB/s），不在拷贝路径上。
+
+**所以：不引入 cudamemcpy-tuner 那类改造。** 需要守住的只有一条——restore 前留足内存，别让 `cudaMallocHost` 失败退到 pageable。
+
 ## 5. 环境与入口
 
 | 项 | 值 |
