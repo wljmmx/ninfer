@@ -357,6 +357,43 @@ raw.frontier = kv.frontier;  // …5 个字段…
 
 可选优化（未验证，需要单独一轮）：服务端启动时 `gc.freeze()` 把常驻对象移出扫描范围，并用 `MALLOC_ARENA_MAX=2` 限制 arena 数量；两者都可能降低 RSS 增长与停顿，但会改变服务端行为，不在这轮直接上。
 
+### 4.10.1 服务端有没有自己的回收机制（核实结果）
+
+**没有。** 全仓搜不到 `gc.freeze` / `gc.collect` / `set_threshold` / `malloc_trim` / `MALLOC_ARENA_MAX`（只有 GDS backend 用了 `__slots__`）。淘汰动作的实体是：
+
+```python
+# L1EvictionController.execute_eviction_action
+self._l1_manager.delete(action.keys)     # DISCARD, and the fallback for anything else
+```
+
+也就是说：**淘汰只是把对象从字典里删掉**，交给 CPython 的引用计数销毁，内存回到 glibc 的 arena——而 glibc **不把 arena 还给操作系统**。所以：
+
+- RSS 只涨不落，是这套组合的必然结果，不是"泄漏"；
+- 一旦涨到接近 WSL 的内存上限（31 GB，配 8 GB swap），下一次 lookup 会换页，表现出来就是 30 s 级的超时——而客户端上限也正好是这个量级，所以看着像"服务端不回帧"。
+
+处置仍是**测量前重启服务端**。若要做根本优化，方向是 `gc.freeze()` + `MALLOC_ARENA_MAX=2`（未验证，不在这轮上）。
+
+## 4.11 H2D：我们已经在用哪一档（对照 cudamemcpy-tuner）
+
+那篇 cudamemcpy-tuner 的结论是：pageable 内存做 H2D 时驱动必须先拷进 pinned staging，**这一手 CPU 拷贝是单线程**，于是 1 GB 只有约 10 GB/s；改用多线程填多个 staging buffer 能到 52 GB/s（接近 pinned 的 56 GB/s）。小拷贝（4K–64K）没有收益，收益从 1 MB 以上开始。
+
+对照我们的恢复路径，两件事已经就位：
+
+| 项 | 我们的实现 | 结论 |
+|---|---|---|
+| 批量 DMA | `DeviceKVPagePool::copy_host_pages` 用 **`cudaMemcpy3DBatchAsync`**，默认开启（`NINFER_KV_BATCH_DMA` 未设即开） | 不是逐页 1279 次调用 |
+| Host 端 pinned | `[host-kv] extents=2 pinned=2545 MiB`（163k 实测） | **是 pinned**，DMA 直读，不走 staging |
+
+所以文章里那条慢路径（pageable → staging → 单线程 CPU 拷贝）**在我们的关键路径上不出现**，引入 cmt 没有收益。
+
+真正的风险点是**pin 失败时会退化**：内存紧张的那次出现过
+
+```
+[host-context] pinned 2398 MiB extent refused (cudaMallocHost failed ...); using pageable backing
+```
+
+一旦回退成 pageable，就正好落进文章描述的场景（批量 API 仍然要走驱动内部的 staging）。这也是为什么"restore 前留足内存"不只是为了避免 `bad_alloc`，还是为了保住 pinned 这条快路。
+
 ## 5. 环境与入口
 
 | 项 | 值 |
