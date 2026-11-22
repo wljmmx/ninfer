@@ -585,15 +585,24 @@ public:
     // carries [first_chunk, end) and names those absolute indices. Zero means "publish the whole run",
     // which is what every caller did before this parameter existed.
     // Bytes per store message. One 163k checkpoint is 2.5 GB, and the server does not answer a
-    // message that large; 512 MiB keeps every part in the range that has been answered reliably.
+    // message that large: measured 64.7 s for a single 2.5 GB store at 4 GB L1, against 0.42-1.24 s
+    // per 64 MB part at 6 GB (38 parts, about 20 s in total). The part size therefore follows the
+    // same rule as the restore split -- keep every message in the range the server answers quickly.
     // NINFER_PUBLISH_PART_MB overrides it.
     [[nodiscard]] static std::size_t publish_part_bytes() {
-        constexpr std::size_t kDefault = 512ULL * 1024 * 1024;
+        constexpr std::size_t kDefault = 64ULL * 1024 * 1024;
         const char* value = std::getenv("NINFER_PUBLISH_PART_MB");
-        if (value == nullptr || *value == '\0') { return kDefault; }
-        const long parsed = std::strtol(value, nullptr, 10);
-        if (parsed <= 0) { return kDefault; }
-        return static_cast<std::size_t>(parsed) * 1024ULL * 1024ULL;
+        std::size_t resolved = kDefault;
+        if (value != nullptr && *value != '\0') {
+            const long parsed = std::strtol(value, nullptr, 10);
+            if (parsed > 0) { resolved = static_cast<std::size_t>(parsed) * 1024ULL * 1024ULL; }
+        }
+        if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+            std::fprintf(stderr, "[publish] part_bytes=%zu (default=%zu env=%s)\n", resolved,
+                         kDefault, value == nullptr ? "<unset>" : value);
+            std::fflush(stderr);
+        }
+        return resolved;
     }
 
     bool publish_job(std::span<const TokenId> prompt_tokens,

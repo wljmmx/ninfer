@@ -274,9 +274,35 @@ public:
         }
         // Split the payload across connections. The server assembles a restore in ~0.15 s and then
         // pushes 181 MB down one socket; the link carries far more than that when asked in parallel.
-        if (const char* split_text = std::getenv("NINFER_RESTORE_SPLIT")) {
-            const int parts = std::atoi(split_text);
-            if (parts > 1) { return restore_split(key, cache_key, parts, kv, state); }
+        //
+        // Sizing follows the payload, not the machine, because the two costs pull opposite ways: an
+        // extra part costs a connection and re-sends the state image (156 MB, fixed), while leaving a
+        // large run on one socket serialises it. Measured against 243f95a: 657 MB as one message
+        // 5.2-5.9 s, 503 MB over four parts 3.49 s, 2.51 GB over four parts 15.9 s. One part per
+        // ~250 MB, capped at four -- the prefetch reservation that serves the shared state object
+        // carries four read locks (four parts all read it; the fifth would lose the race).
+        int parts = 1;
+        const char* split_text = std::getenv("NINFER_RESTORE_SPLIT");
+        const int from_env = split_text != nullptr ? std::atoi(split_text) : 0;
+        // Explicit 1 means "one message": that is the only way to exercise the single-message path
+        // now that the default is derived. Unset or 0 derives from the payload.
+        if (from_env > 1) {
+            parts = from_env;
+        } else if (from_env != 1) {
+            const std::size_t chunk = static_cast<std::size_t>(config_.chunk_tokens());
+            if (chunk != 0 && chunk_bytes() != 0) {
+                const std::size_t bytes = (key.tokens.size() / chunk) * chunk_bytes();
+                constexpr std::size_t kPartTarget = 250ULL * 1024 * 1024;
+                const std::size_t wanted = (bytes + kPartTarget - 1) / kPartTarget;
+                parts = static_cast<int>(std::min<std::size_t>(4, std::max<std::size_t>(1, wanted)));
+            }
+        }
+        if (parts > 1) { return restore_split(key, cache_key, parts, kv, state); }
+        if (std::getenv("NINFER_LMCACHE_PROBE") != nullptr) {
+            std::fprintf(stderr, "[lmcache] restore parts=%d (from_env=%d chunk=%lld bytes=%zu)\n",
+                         parts, from_env, static_cast<long long>(config_.chunk_tokens()),
+                         static_cast<std::size_t>(chunk_bytes()));
+            std::fflush(stderr);
         }
         auto lease = pool_.acquire();
         if (!lease) {
