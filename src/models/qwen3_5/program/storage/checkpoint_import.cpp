@@ -106,6 +106,11 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
     // checks below are about the SHAPE, so they are stated once for both -- a streamed record states
     // its page count instead of dividing a byte vector.
     const bool streamed = static_cast<bool>(kv.fill);
+    if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+        std::fprintf(stderr, "[kvt] import: streamed=%d pages=%u bytes=%zu fill=%d\n",
+                     streamed ? 1 : 0, kv.page_count, kv.kv_bytes.size(), kv.fill ? 1 : 0);
+        std::fflush(stderr);
+    }
     if (streamed && kv.page_count == 0) {
         error = "a streamed checkpoint must state its page count";
         return std::nullopt;

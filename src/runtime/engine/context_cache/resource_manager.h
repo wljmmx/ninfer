@@ -289,8 +289,19 @@ public:
             }
         }
         // One of the two travels on: bytes already in hand, or the producer that will write them.
+        if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[lmcache] cached: fill=%d pages=%u bytes=%zu\n",
+                         static_cast<bool>(cached->fill) ? 1 : 0, cached->page_count,
+                         cached->kv_bytes.size());
+            std::fflush(stderr);
+        }
         kv.kv_bytes = std::move(cached->kv_bytes);
         kv.fill     = std::move(cached->fill);
+        if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[lmcache] export: fill=%d pages=%u\n",
+                         static_cast<bool>(kv.fill) ? 1 : 0, kv.page_count);
+            std::fflush(stderr);
+        }
         // The cache stores bytes and the page count, not coverage history. A restored page has no
         // local content epoch, so zero is the honest value; it only feeds the "did this page change
         // under me" check, which cannot apply to bytes that were just written.

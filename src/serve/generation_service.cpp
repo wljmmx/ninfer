@@ -276,8 +276,13 @@ public:
         // Streaming first: the header carries the state image and one chunk (156 MB), never the run.
         // The import path then hands its reserved extent back through `fill`, so the 2.5 GB never
         // exists twice. NINFER_LMCACHE_STREAM=0 keeps the whole-payload restore for A/B.
+        // Streaming is opt-in until the export type is unified: the header succeeds and the import
+        // then rejects the record because `fill` does not survive the trip from CachedCheckpoint into
+        // the importer's CheckpointExport (measured: cached fill=1, export fill=1, import fill=0), so
+        // enabling it by default would turn every hit into a miss. NINFER_LMCACHE_STREAM=1 turns it on
+        // for whoever finishes that unification.
         const char* stream_flag = std::getenv("NINFER_LMCACHE_STREAM");
-        const bool want_stream  = !(stream_flag != nullptr && std::atoi(stream_flag) == 0);
+        const bool want_stream  = stream_flag != nullptr && std::atoi(stream_flag) != 0;
         bool streamed           = false;
         if (want_stream && bridge_->restore_header(key, &state)) {
             streamed = true;
@@ -350,6 +355,9 @@ public:
             out.page_count = static_cast<std::uint32_t>((kv_total + tail.size()) / page_bytes_);
             out.fill       = [this, key, kv_total, tail](std::span<std::byte> dest,
                                                    std::string* error) {
+                std::fprintf(stderr, "[lmcache] fill enter: dest %zu B, kv %zu B, tail %zu B\n",
+                             dest.size(), kv_total, tail.size());
+                std::fflush(stderr);
                 std::lock_guard<std::mutex> fill_guard(bridge_mutex_);
                 if (kv_total + tail.size() > dest.size()) {
                     if (error != nullptr) { *error = "destination is smaller than the record"; }
