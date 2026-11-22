@@ -112,12 +112,33 @@ Failed to read prefetched object ObjectKey(... object_group_id=1 ...) from L1 st
 3. 单条 2.67 GB 消息的传输异常值得单独查一次（libzmq 大消息 + WSL relay），它决定“不分片”这条路能否作为兜底。
 
 
+## 4.3 生产已切到上游版本（2026-11-22 晚）
+
+生产 `6555` 从 `a5c2364`+3 提交 切到 **`243f95a`（上游 #6815）+ 区间补丁 + key 缓存**，启动参数不变（`--chunk-size 128 --max-workers 8 --eviction-policy LRU`，`--http-port 18080` 契约保持）。回滚点：`/home/wljmmx/prod-rollback-commit.txt`（`cabab66`），改动前的工作区备份 `/home/wljmmx/prod-probes-before-upgrade-20261122.patch`。
+
+切换过程中确认的三件事，都会直接影响 163k：
+
+1. **key 缓存必须移植。** `243f95a` 上 `_resolve_obj_keys_by_group` 没有缓存，每片 store 重算 1278×2 个 blake3：实测 **10 s/片**（移植后 0.001–0.002 s/片，服务端 `group key cache MISS resolved ... in 0.002 s`）。补丁：`docs/lmcache-patches/01b-upstream-dev243-prod-all.patch`（= 区间 + 探针 + key 缓存，可直接 apply 到干净的 `243f95a`）。
+2. **`state` 读锁在 `243f95a` 上不再是障碍。** 在 `243f95a` 上 4 片分片恢复**全部**读到 `object_group_id=1`（此前在 dev243 早期观测到只有 2–3 片能读）。163k 的 4 片各 600 MB，`fetch` 8.8–11.9 s，全部 `ok=1`。
+3. **L1 容量必须 ≥ 6 GB。** 4 GB 装 163k 的 2.55 GB 时，38 片的 store 退化成 **1 次 `Stored 163584 tokens in 64.7 s`**，客户端 30 s 超时，且随后读取 1244/1278 个 chunk `does not exist`（容量挤出）。6 GB 下 38 片全部成功、每片 0.42–1.24 s。
+
+生产链路实测（6 GB L1，`start_163.cmd 4 90000`）：
+
+| 项 | 结果 |
+|---|---|
+| 32k 写入 | 8 片，每片 0.42–1.6 s |
+| 32k 恢复 | `cache_n 32751`（99.98%），split=4 total **3.486 s** |
+| 163k 写入 | 38 片，每片 0.42–1.24 s，总计约 20 s |
+| 163k 恢复 | 4 片全部 `ok=1`（8.8–11.9 s/片），随后引擎导入阶段 `bad allocation` |
+
+**163k 现在只剩最后一个障碍：内存。** 本机 63.7 GB，`vmmemWSL` 工作集 21.4 GB / 私有 30.8 GB（`.wslconfig` 没有 `autoMemoryReclaim`），`ninfer-serve` 私有 23.2 GB，系统 `free` 仅 13.7 GB。恢复路径需要 2.5 GB 目的地 + 引擎把同一份字节导入页池/host context，峰值 ~5 GB 连续内存，`bad allocation` 就出在这里。要么释放 WSL 内存（需 `wsl --shutdown`，会停掉 WSL 内的 docker/tailscale），要么把导入改成流式（不再需要 2.5 GB 中间缓冲）。
+
 ## 5. 环境与入口
 
 | 项 | 值 |
 |---|---|
 | 引擎二进制 | `R:\infer-release-20261119\ninfer-serve.exe`（保留 `.prev-*` 回滚点） |
-| 生产服务端 | WSL `/home/wljmmx/lmcache-src`，6555，8 GB L1，`/home/wljmmx/l3-lmcache.log` |
+| 生产服务端 | WSL `/home/wljmmx/lmcache-src`，**`243f95a`(detached) + `01b-upstream-dev243-prod-all.patch`**，6555，L1 6 GB，`/home/wljmmx/l3-lmcache.log`。回滚点 `cabab66` 见 `/home/wljmmx/prod-rollback-commit.txt` |
 | 上游服务端 | `/home/wljmmx/lmcache-dev243`（worktree，`243f95a` + 区间补丁），6556，日志 `/home/wljmmx/l3-dev243.log` |
 | 上游启动器 | `H:\TeleAgentWorks\.temp\kv\lmc_dev243.py`（注入 sys.path、禁用 editable finder） |
 | 客户端启动脚本 | `H:\TeleAgentWorks\.temp\kv\start_engine.cmd`（16k）、`start_163.cmd`（256k 单车道）、`start_dev.cmd`（连 6556） |
