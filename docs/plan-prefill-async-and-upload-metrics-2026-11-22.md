@@ -86,6 +86,32 @@ release_live_host_extents(row);        // live_host_extents_[row] → HostKVExte
 3. 验收：`[trim-probe] truncated N -> 0, pool allocated X -> X-N`，且第二个 163k 请求
    `cache 163,680 (100.0%)`、TTFT ~12 s、`requests_paused` 恒 0。
 
+## 计划四：无图时的批量提交兜底（本轮新增要求）
+
+代码事实（`ffn.cpp` / `model_instance.cpp`）：
+
+- 整步 CUDA Graph 在 24 GB 卡上**结构性关闭**：`model_instance.cpp:2157` 要求专家池装下全部层
+  （`every_layer`），12 GB 池做不到，于是 `[graph] skipped: layer needs host fetch`，
+  `graph_ok = false`。
+- **按层图已经存在**：`LayerGraphs`（`ffn.cpp:814-926`）默认开启（`NINFER_LAYER_GRAPH` 未设即 on），
+  按 bank + 参数地址做 key 缓存 capture，命中就 `cudaGraphLaunch`；在 `ffn.cpp:2546`
+  （全驻留快速路径）与 `ffn.cpp:2670`（一般 MoE 路径）被调用。
+- **缺口**：需要 host fetch 的 split 路径无法 capture（capture 内不允许 stream sync），
+  该层只能逐 kernel 提交，而且 fetch 在关键路径上。实测 `submit 28.3 s / ~80 chunk`
+  ≈ 350 ms/chunk，与"每 chunk 等一次专家上传"吻合。
+
+因此"无图时的批量提交兜底"不是再造图，而是：
+
+1. **把 split 层切成两段各录一张图**：fetch 之前与之后分别 capture，fetch 留在两张图之间，
+   每层从"逐 kernel"变成"3 次提交"；
+2. **让 fetch 离开关键路径**：`ExpertPrefetchQueue`（`expert_prefetch.cpp:218`）已存在，
+   由控制器按 `value > 0.5` 启用（`ffn.cpp:2458`）；先确认 27B 这套权重上它是否被打开，
+   打开后上传与计算重叠，350 ms/chunk 应显著下降；
+3. **取证口径**：`NINFER_LAYER_GRAPH_DEBUG=1`（`[graph-key]`）与
+   `NINFER_LAYER_GRAPH_REPORT=1`（captures/replays）——`captures` 持续增长而 `replays` 不动
+   说明 key 每次变、图没命中，问题在参数地址而不是图；
+4. **验收**：同一冷 163k，`submit` 从 28.3 s 降到 < 8 s，`prefill` ≥ 1.9k tok/s，门禁三项不变。
+
 ## 已知的其它结论（不要重复踩）
 
 - 容量方案不成立：`--kv-capacity 327680`（=5120 页，2×2558）被拒
