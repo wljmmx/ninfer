@@ -746,9 +746,14 @@ class Launcher:
     }
 
     def __init__(self, exe: Path, roots: list[Path], log_path: Path, attach,
-                 lmcache_probe=None, engine_host: str = "127.0.0.1") -> None:
+                 lmcache_probe=None, engine_host: str = "127.0.0.1",
+                 lmcache_endpoint: str = "tcp://127.0.0.1:6555") -> None:
         self.exe = exe
         self.engine_host = engine_host           # 127.0.0.1 default; 0.0.0.0 exposes the API on the LAN
+        # The client reaches the WSL-side server through whichever address the operator names. On
+        # this box the mirror-mode address is the fast one: 127.0.0.1 goes through the user-mode
+        # relay, which is fine for a lookup and measurably slower for a 2.5 GB prefix.
+        self.lmcache_endpoint = lmcache_endpoint
         self.roots = [root for root in roots if root.is_dir()]
         self.log_path = log_path
         self.attach = attach                     # give the collector the URL we just started
@@ -962,7 +967,7 @@ class Launcher:
                     return {"ok": False,
                             "error": "LMCache is not answering on 18080; start it first"}
                 env["NINFER_LMCACHE_RESTORE"] = "1"
-                env["NINFER_LMCACHE_ENDPOINT"] = "tcp://127.0.0.1:6555"
+                env["NINFER_LMCACHE_ENDPOINT"] = self.lmcache_endpoint
                 env["NINFER_LMCACHE_CHUNK_TOKENS"] = "128"
 
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1458,6 +1463,11 @@ def main() -> int:
     parser.add_argument("--engine-host", default="127.0.0.1",
                         help="address the engine the panel starts binds to; 0.0.0.0 exposes it on "
                              "the LAN, 127.0.0.1 keeps it local to this machine")
+    parser.add_argument("--lmcache-endpoint", default=os.environ.get("NINFER_LMCACHE_ENDPOINT")
+                        or "tcp://127.0.0.1:6555",
+                        help="LMCache server the engine connects to when the page ticks LMCache; "
+                             "the mirror-network address (e.g. tcp://10.222.222.1:6555) is the fast "
+                             "one, 127.0.0.1 goes through the user-mode relay")
     parser.add_argument("--engine", default="http://127.0.0.1:11438",
                         help="ninfer serve base URL; 'none' disables the engine source")
     parser.add_argument("--engine-key", default="",
@@ -1496,7 +1506,8 @@ def main() -> int:
                       if args.engine and args.engine != "none" else None)
     Handler.launcher = Launcher(exe, roots, log_path, attach,
                                 lmcache_probe=lambda: bool(Handler.lmcache and Handler.lmcache._probe()),
-                                engine_host=args.engine_host)
+                                engine_host=args.engine_host,
+                                lmcache_endpoint=args.lmcache_endpoint)
     Handler.lmcache = ScriptService(Path(__file__).resolve().parent / "start_lmcache.cmd",
                                    Path(__file__).resolve().parent / "lmcache-service.log",
                                    "lmcache", probe_url=args.upstream)

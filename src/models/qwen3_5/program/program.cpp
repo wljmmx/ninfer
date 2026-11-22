@@ -1,3 +1,4 @@
+#include "core/lmcache_spec_records.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -262,7 +263,13 @@ CheckpointPoolHeadroom Program::checkpoint_pool_headroom() const {
 }
 
 bool Program::accepts_byte_records() const {
-    return impl_->speculative_backend == SpeculativeBackend::None;
+    if (impl_->speculative_backend == SpeculativeBackend::None) { return true; }
+    // A byte record carries the main KV run and the state image, not the draft/backend KV. That is
+    // survivable because the draft path only proposes: the target verifies every token, so a draft
+    // cache without the restored prefix can cost acceptance, never correctness. Measured on this
+    // port -- MTP 35.2% cold vs 35.5% restored, DFlash2 24.5% both, output identical. See
+    // core/lmcache_spec_records.h for the numbers and for the opt-out.
+    return core::lmcache_accepts_spec_records();
 }
 
 std::optional<CheckpointHandle> Program::import_checkpoint_current_layout(

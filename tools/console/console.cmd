@@ -25,10 +25,23 @@ if not defined PY (
   exit /b 3
 )
 
-echo console : http://127.0.0.1:%PORT%/
-echo metrics : http://127.0.0.1:%PORT%/api/lmcache.json
-echo gpu     : http://127.0.0.1:%PORT%/api/gpu.json
-echo engine  : http://127.0.0.1:%PORT%/api/engine.json  (%ENGINE%)
+rem LAN mode: the page and the engine it starts listen on every interface. The engine banner says
+rem `auth disabled`, so this is only safe on a network you trust. Set LAN=0 to stay on 127.0.0.1.
+set "LAN=1"
+set "HOST=127.0.0.1"
+set "EHOST=127.0.0.1"
+if not "%LAN%"=="0" set "HOST=0.0.0.0"
+if not "%LAN%"=="0" set "EHOST=0.0.0.0"
+
+rem LMCache endpoint handed to an engine the page starts. The mirror-network address is the fast one
+rem on this box; 127.0.0.1 also works but every byte goes through the user-mode relay, which is what
+rem a 2.5 GB prefix restore notices. Set it before this script to use another server.
+if not defined NINFER_LMCACHE_ENDPOINT set "NINFER_LMCACHE_ENDPOINT=tcp://10.222.222.1:6555"
+
+echo console : http://%HOST%:%PORT%/   (engine on %EHOST%)
+echo metrics : http://%HOST%:%PORT%/api/lmcache.json
+echo gpu     : http://%HOST%:%PORT%/api/gpu.json
+echo engine  : http://%HOST%:%PORT%/api/engine.json  (%ENGINE%)
 echo python  : %PY%
 echo.
 echo Requires the LMCache server on http://127.0.0.1:18080/metrics (optional).
@@ -36,7 +49,10 @@ echo Pick a .ninfer file in the page to start the engine; nothing is shown until
 echo Models root defaults to R:\model; add --models-root DIR to change it.
 echo Press Ctrl+C to stop.
 echo.
-%PY% "%HERE%lmcache_console.py" --port %PORT% --engine %ENGINE%
+rem The engine talks to LMCache through the mirror-network address: 127.0.0.1 also works, but it
+rem goes through the user-mode relay, which is measurably slower for a multi-gigabyte prefix.
+if not defined NINFER_LMCACHE_ENDPOINT set "NINFER_LMCACHE_ENDPOINT=tcp://10.222.222.1:6555"
+%PY% "%HERE%lmcache_console.py" --port %PORT% --engine %ENGINE% --host %HOST% --engine-host %EHOST% --lmcache-endpoint "%NINFER_LMCACHE_ENDPOINT%"
 if errorlevel 1 (
   echo.
   echo The console exited with %ERRORLEVEL%.

@@ -13,6 +13,7 @@
 // the bytes. Stated here rather than left as a surprise later.
 
 #include "core/checkpoint_fingerprint.h"
+#include "core/lmcache_spec_records.h"
 #include "core/state_image_shards.h"
 #include "models/qwen3_5/program/program_impl.h"
 
@@ -67,11 +68,13 @@ std::optional<CheckpointHandle> ProgramImpl::import_checkpoint_current_layout(
     std::shared_ptr<const PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
     std::string* error, bool pin_pages) {
     // Same rule the disk tier states for itself in `tier_open`: a record that arrived as bytes
-    // carries the main KV run and the state image, never the draft/backend KV, so a request running
-    // a speculative backend would be bound to a prefix half of which has no pages. Refusing here
-    // makes that an ordinary cold prefill (the request still answers) instead of a 500 from the
-    // first decode step's coverage check.
-    if (speculative_backend != SpeculativeBackend::None) {
+    // carries the main KV run and the state image, never the draft/backend KV. Restoring it under a
+    // speculative backend is allowed by default because that backend only proposes -- the target
+    // verifies every token, so the missing draft prefix costs acceptance at worst. Measured, with
+    // identical greedy output: MTP 35.2% cold vs 35.5% restored, DFlash2 24.5% both. The switch and
+    // its opt-out live in core/lmcache_spec_records.h.
+    if (speculative_backend != SpeculativeBackend::None &&
+        !ninfer::core::lmcache_accepts_spec_records()) {
         if (error != nullptr) {
             *error = speculative_backend == SpeculativeBackend::Mtp
                          ? "a checkpoint-cache record carries no MTP draft KV; this engine runs MTP"
