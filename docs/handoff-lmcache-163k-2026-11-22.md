@@ -212,6 +212,36 @@ ninfer-serve.exe   404512256 B   ← 正确命名（构建产物就叫 ninfer-se
 
 同一个 6555 进程连续跑了十几轮 163k/32k 的 store+restore 之后，RSS 从 9.1 GB 涨到 **14.3 GB**，lookup 开始出现 30 s 超时（`has 30.005 s`），restore 也随之失败。这不是容量或锁的问题，是服务端进程自身的状态累积。**每次正式测量前重启一次服务端**，否则数字不可比。
 
+## 4.7 auto 的预留与写入准入（2026-11-22 晚，已实现）
+
+### 4.7.1 auto 容量按 8/7 预留
+
+恢复要留下 `capacity/8` 的 reserve（给当前请求 decode 用），所以“容量 = max-context 页数”这个上界永远恢复不了最大前缀。实测 `--max-context 32768`：
+
+```
+capacity | KV 32,768 tokens, auto | pages 512/512
+restore declined: 512 page(s) + 64 reserved, 512 of 512 free
+```
+
+因为 reserve 也是容量的 1/8，加上“1/8 的 1/8”仍然不够（576 页时 reserve 变成 72）。正确的关系是 `capacity >= need * 8/7`，已按此实现（`startup.cpp`，只作用于 `KvCapacityMode::Automatic`，explicit 容量不动）：
+
+| max-context | 之前 pages | 现在 pages | 32k 前缀恢复 |
+|---|---|---|---|
+| 32768 | 512 | **586** | ✅ `cache_n 32751`，restore 3.018 s |
+| 256000 | 4000 | **4571** | ✅ `cache_n 163680`，端到端 22.1 s |
+
+### 4.7.2 超限写入直接拒绝
+
+LMCache 自身的淘汰是有限的（`trigger_watermark 0.8`、`eviction_ratio 0.2`、LRU），但**单条超过容量时会自我淘汰**：4 GB L1 写入 2.55 GB 的 163k checkpoint，写到一半就跨过 80% 水位，把刚写的 chunk 挤掉，下一次 lookup 缺 1244/1278 —— 带宽花了，缓存还不完整。
+
+客户端现在在 store 之前做准入：单条超过 **L1 的一半** 就不写。L1 大小由 `NINFER_LMCACHE_L1_MB` 告知（默认 6144，对应生产 `--l1-size-gb 6`），也就是单条上限 3 GiB：
+
+```
+[lmcache] store refused: 172.1 MiB is over the 0.0 MiB entry limit (half of NINFER_LMCACHE_L1_MB); this prefix stays uncached
+```
+
+分工是清楚的：**客户端管“这条该不该进来”**（超限拒绝，避免自我淘汰），**服务端管“进来的之间谁留下”**（LRU 按水位淘汰最久未用的）。
+
 ## 5. 环境与入口
 
 | 项 | 值 |

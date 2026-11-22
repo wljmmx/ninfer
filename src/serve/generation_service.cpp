@@ -365,6 +365,29 @@ public:
         if (!ready_.load() || bridge_ == nullptr || prompt_tokens.empty()) { return; }
         if (write_disabled_.load(std::memory_order_relaxed)) { return; }
         if (checkpoint.page_bytes == 0 || checkpoint.kv_bytes.empty()) { return; }
+        // A store larger than the cache can hold evicts what it just wrote. Measured: a 2.55 GB
+        // checkpoint against a 4 GB L1 crossed the 80% watermark while it was still arriving, and the
+        // next lookup found 1244 of 1278 chunks gone -- the cache had spent the bandwidth to become
+        // incoherent. Refusing keeps entries whole, and the limit is half the L1 the server was told
+        // about (NINFER_LMCACHE_L1_MB, default 6144), so one entry can never be the whole cache. The
+        // server's own LRU (trigger 0.8, evict 0.2) then decides between entries that do fit.
+        const std::size_t store_bytes =
+            checkpoint.kv_bytes.size() + [&checkpoint] {
+                std::size_t total = 0;
+                for (const std::string& shard : checkpoint.state_shards) { total += shard.size(); }
+                return total;
+            }();
+        if (store_bytes > store_entry_limit_bytes()) {
+            if (!too_big_told_.exchange(true)) {
+                std::fprintf(stderr,
+                             "[lmcache] store refused: %.1f MiB is over the %.1f MiB entry limit "
+                             "(half of NINFER_LMCACHE_L1_MB); this prefix stays uncached\n",
+                             static_cast<double>(store_bytes) / 1048576.0,
+                             static_cast<double>(store_entry_limit_bytes()) / 1048576.0);
+                std::fflush(stderr);
+            }
+            return;
+        }
         ++stores_;
         // Q70/13.4: the second half of the hit-rate shutdown. A write costs bytes and a round trip;
         // it only pays if something reads it back. Eight lookups with zero restores is not a ratio
@@ -596,8 +619,20 @@ public:
     // per 64 MB part at 6 GB (38 parts, about 20 s in total). The part size therefore follows the
     // same rule as the restore split -- keep every message in the range the server answers quickly.
     // NINFER_PUBLISH_PART_MB overrides it.
-    [[nodiscard]] static std::size_t publish_part_bytes() {
-        constexpr std::size_t kDefault = 64ULL * 1024 * 1024;
+    // Largest checkpoint this client will hand to the server, as half of the server's L1. The client
+    // does not query the server for its size, so the operator states it once; the default matches the
+    // production launch (--l1-size-gb 6).
+    [[nodiscard]] static std::size_t store_entry_limit_bytes() {
+        std::size_t l1_mib = 6144;
+        if (const char* value = std::getenv("NINFER_LMCACHE_L1_MB");
+            value != nullptr && *value != '\0') {
+            const long parsed = std::strtol(value, nullptr, 10);
+            if (parsed > 0) { l1_mib = static_cast<std::size_t>(parsed); }
+        }
+        return (l1_mib / 2) << 20;
+    }
+
+    [[nodiscard]] static std::size_t publish_part_bytes() {        constexpr std::size_t kDefault = 64ULL * 1024 * 1024;
         const char* value = std::getenv("NINFER_PUBLISH_PART_MB");
         std::size_t resolved = kDefault;
         if (value != nullptr && *value != '\0') {
@@ -799,6 +834,7 @@ private:
     std::atomic<std::uint64_t> misses_{0};
     std::atomic<std::uint64_t> stores_{0};
     std::atomic<bool> write_disabled_{false};
+    std::atomic<bool> too_big_told_{false};
     std::atomic<bool> ready_{false};
     std::atomic<std::uint64_t> sequence_{0};
     std::size_t page_bytes_ = 0;

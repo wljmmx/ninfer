@@ -1436,10 +1436,21 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     // logical capacity, and the overflow is handled by the eviction contract. An "expandable"
     // curve over a pinned arena is what the runtime validator rejects - and it is genuinely
     // meaningless here, because that growth is paid for by eviction, not by bytes.
+    // An automatic capacity stops at max_concurrency x max_context, which is exactly what a prefix of
+    // max_context length needs -- and a restore must also leave the pool a reserve, because the cache
+    // client holds back an eighth of the pool so the request's own decode still finds pages. The
+    // reserve is proportional, so the ceiling has to be too: need + need/8 <= capacity means
+    // capacity >= need * 8/7. Measured on the way there: an eighth on top of 512 pages gave 576, the
+    // reserve then became 72, and the restore was still refused ("512 + 72 of 576").
+    const std::uint64_t automatic_ceiling =
+        options.kv_capacity.mode == KvCapacityMode::Automatic ? (maximum_pages64 + 6) / 7 : 0;
+    if (maximum_pages64 + automatic_ceiling > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("automatic KV page ceiling exceeds uint32");
+    }
     const std::uint32_t maximum_pages =
         declared_resident_pages(minimum_pages).has_value()
             ? minimum_pages
-            : static_cast<std::uint32_t>(maximum_pages64);
+            : static_cast<std::uint32_t>(maximum_pages64 + automatic_ceiling);
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
