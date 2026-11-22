@@ -122,6 +122,29 @@ release_live_host_extents(row);        // live_host_extents_[row] → HostKVExte
    说明 key 每次变、图没命中，问题在参数地址而不是图；
 4. **验收**：同一冷 163k，`submit` 从 28.3 s 降到 < 8 s，`prefill` ≥ 1.9k tok/s，门禁三项不变。
 
+## 计划五：prefill 计量与按形状构图（2026-11-23 实测）
+
+双探针（`NINFER_CHUNK_HOST_PROF` + `NINFER_ADVANCE_PROF`）同一次冷 163k：
+
+```
+[advance-prof] cursor=2048 chunk=562.8 commit=0.0 tail=0.0 total=562.9 ms
+[chunk-host]   tokens=2048 prep=0.0 layers=179.4 tail=0.0 total=179.4 ms
+[chunk-host]   tokens=2048 prep=0.0 layers=191.9 tail=0.0 total=192.0 ms
+req#1 done | submit 27.1s devwait 1m13.0s boundary 3.2s | 120.4 s | 1611 tok/s
+```
+
+1. **每 chunk 约 563 ms** = host 提交 190 ms + GPU ~370 ms；host 部分是 **3 ms/层 × 60 层**，
+   与上下文几乎无关（179 → 192 ms）。`commit_sequence_kv` / `settle_state_fork` / `copy_tail`
+   都是 0.0 ms，不是嫌疑。
+2. **prefill 不做图捕获**（`text.cpp:3038` 注释 "A chunk is never graph captured"），所以整步图
+   修复只对 decode 生效——这解释了为什么图开了 `submit` 仍 27 s。
+3. **相位计量重复计入**：`prefill_impl` 尾部已经 `ctx_.synchronize()`，`advance_prefill` 末尾
+   又 `timing.begin_wait()` 记 devwait 73 s；`submit + devwait + boundary ≈ engine-wall`，
+   两个相位在分摊同一段 GPU 时间。**先修计量再看优化比例**，判据：
+   `submit + devwait + boundary ≈ engine-wall ±5%` 且不超 100%。
+4. 之后再做 **prefill 层栈按形状捕获**（key = `(len, bank)`，参照 `ffn.cpp:814-926` 的
+   `LayerGraphs`），目标把那 190 ms/chunk 压下去；验收 `submit < 8 s`、`prefill ≥ 1.9k tok/s`。
+
 ## 已知的其它结论（不要重复踩）
 
 - 容量方案不成立：`--kv-capacity 327680`（=5120 页，2×2558）被拒
