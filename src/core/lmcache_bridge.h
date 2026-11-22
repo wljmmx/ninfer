@@ -302,9 +302,16 @@ public:
         }
         RestorePayload got;
         const auto began = std::chrono::steady_clock::now();
-        if (!lease->has(cache_key) ||
-            !lease->fetch(cache_key, &got, 0, 1, 0, state_bytes)) {
-            error_ = lease->error().empty() ? "not cached" : lease->error();
+        if (!lease->has(cache_key)) {
+            error_ = lease->error().empty() ? "header lookup missed" : lease->error();
+            std::fprintf(stderr, "[lmcache] header: lookup missed (%s)\n", error_.c_str());
+            std::fflush(stderr);
+            return false;
+        }
+        if (!lease->fetch(cache_key, &got, 0, 1, 0, state_bytes)) {
+            error_ = lease->error().empty() ? "header fetch failed" : lease->error();
+            std::fprintf(stderr, "[lmcache] header: fetch failed (%s)\n", error_.c_str());
+            std::fflush(stderr);
             return false;
         }
         const double seconds =

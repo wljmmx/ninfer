@@ -273,7 +273,15 @@ public:
         const auto fetch_started = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> guard(bridge_mutex_);
         ++fetches_;
-        if (!bridge_->restore(key, &kv, &state)) {
+        // Streaming first: the header carries the state image and one chunk (156 MB), never the run.
+        // The import path then hands its reserved extent back through `fill`, so the 2.5 GB never
+        // exists twice. NINFER_LMCACHE_STREAM=0 keeps the whole-payload restore for A/B.
+        const char* stream_flag = std::getenv("NINFER_LMCACHE_STREAM");
+        const bool want_stream  = !(stream_flag != nullptr && std::atoi(stream_flag) == 0);
+        bool streamed           = false;
+        if (want_stream && bridge_->restore_header(key, &state)) {
+            streamed = true;
+        } else if (!bridge_->restore(key, &kv, &state)) {
             // Q70/13.4: the first half of the hit-rate shutdown. A lookup that reached the bridge
             // and came back empty is a miss; an early return above is not counted, because it never
             // asked.
@@ -288,9 +296,9 @@ public:
         ++hits_;
         const double fetch_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - fetch_started).count();
-        std::fprintf(stderr, "[lmcache] fetch %zu KV byte(s) + %zu state byte(s) in %.3f s\n",
-                     kv.size(), state.size(), fetch_seconds);
-        if (page_bytes_ == 0 || kv.size() % page_bytes_ != 0) { return std::nullopt; }
+        std::fprintf(stderr, "[lmcache] fetch %zu KV byte(s) + %zu state byte(s) in %.3f s (%s)\n",
+                     kv.size(), state.size(), fetch_seconds, streamed ? "header" : "payload");
+        if (page_bytes_ == 0) { return std::nullopt; }
 
         const std::size_t chunk_bytes_total = chunk_bytes_;
         if (chunk_bytes_total == 0) { return std::nullopt; }
@@ -314,23 +322,57 @@ public:
         // Q64 2d-2b-4: the same arithmetic the store side uses, from the same header. The restore side
         // used to re-derive the frontier from the byte count and re-do the page rounding by hand, which
         // is how "coverage" could mean 384 here and 467 there in one build.
+        // Chunk-aligned run, then the tail. plan_restore needs the SIZE of the KV run, and a streamed
+        // record has no byte vector to measure: the run is exactly the whole chunks of the coverage,
+        // and whatever remains rides in the state object (and is copied into the same extent by fill).
+        if (chunk_tokens_ == 0) { return std::nullopt; }
+        const std::size_t run_chunks =
+            static_cast<std::size_t>(valid_tokens) / static_cast<std::size_t>(chunk_tokens_);
+        const std::size_t kv_total = run_chunks * chunk_bytes_total;
         const auto plan = ninfer::core::lmcache::plan_restore(
-            kv.size(), valid_tokens, object->tail.size(), chunk_bytes_total, chunk_tokens_,
+            kv_total, valid_tokens, object->tail.size(), chunk_bytes_total, chunk_tokens_,
             page_bytes_, page_tokens_);
         if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
             std::fprintf(stderr,
                          "[kvt-debug] restore prompt=%zu valid=%u kv_bytes=%zu chunks=%zu "
-                         "frontier=%zu tail_pages=%zu tail_bytes=%zu page=%zu\n",
-                         prompt_tokens.size(), valid_tokens, kv.size(), plan.chunks, plan.frontier,
-                         plan.tail_pages, object->tail.size(), page_bytes_);
+                         "frontier=%zu tail_pages=%zu tail_bytes=%zu page=%zu streamed=%d\n",
+                         prompt_tokens.size(), valid_tokens, kv_total, plan.chunks, plan.frontier,
+                         plan.tail_pages, object->tail.size(), page_bytes_, streamed ? 1 : 0);
             std::fflush(stderr);
         }
         if (plan.chunks == 0) { return std::nullopt; }
         out.frontier = static_cast<std::uint32_t>(plan.frontier);
-        out.kv_bytes = std::move(kv);
-        if (plan.tail_pages != 0) {
-            const auto tail = object->tail.first(plan.tail_pages * page_bytes_);
-            out.kv_bytes.insert(out.kv_bytes.end(), tail.begin(), tail.end());
+        if (streamed) {
+            const std::size_t tail_bytes = plan.tail_pages * page_bytes_;
+            std::vector<std::byte> tail(object->tail.begin(),
+                                        object->tail.begin() +
+                                            static_cast<std::ptrdiff_t>(tail_bytes));
+            out.page_count = static_cast<std::uint32_t>((kv_total + tail.size()) / page_bytes_);
+            out.fill       = [this, key, kv_total, tail](std::span<std::byte> dest,
+                                                   std::string* error) {
+                std::lock_guard<std::mutex> fill_guard(bridge_mutex_);
+                if (kv_total + tail.size() > dest.size()) {
+                    if (error != nullptr) { *error = "destination is smaller than the record"; }
+                    return false;
+                }
+                if (kv_total != 0 && !bridge_->restore_into(key, dest.first(kv_total))) {
+                    if (error != nullptr) { *error = bridge_->error(); }
+                    return false;
+                }
+                if (!tail.empty()) { std::memcpy(dest.data() + kv_total, tail.data(), tail.size()); }
+                return true;
+            };
+            std::fprintf(stderr, "[lmcache] header: %zu chunk(s) + %zu tail B -> %u page(s), streamed\n",
+                         run_chunks, tail.size(), out.page_count);
+            std::fflush(stderr);
+        } else {
+            if (kv.size() % page_bytes_ != 0) { return std::nullopt; }
+            out.kv_bytes = std::move(kv);
+            if (plan.tail_pages != 0) {
+                const auto tail = object->tail.first(plan.tail_pages * page_bytes_);
+                out.kv_bytes.insert(out.kv_bytes.end(), tail.begin(), tail.end());
+            }
+            out.page_count = static_cast<std::uint32_t>(out.kv_bytes.size() / page_bytes_);
         }
         out.valid_tokens = valid_tokens;
         // One element: the image travels whole (v6 1n). The sharded layout exists for transport
