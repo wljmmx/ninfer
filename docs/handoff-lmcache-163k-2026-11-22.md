@@ -394,6 +394,28 @@ self._l1_manager.delete(action.keys)     # DISCARD, and the fallback for anythin
 
 一旦回退成 pageable，就正好落进文章描述的场景（批量 API 仍然要走驱动内部的 staging）。这也是为什么"restore 前留足内存"不只是为了避免 `bad_alloc`，还是为了保住 pinned 这条快路。
 
+### 4.11.1 全项目 H2D 核实（不止 LMCache）
+
+扫了 `src/` 下所有 `cudaMemcpy*` / `cuMemcpyHtoD` / `cudaMallocHost` / `cudaHostAlloc` / `cudaHostRegister`（69 处）+ 统一封装 `copy_bytes_status` / `try_copy_bytes`（44 个调用点），按"HOST 端是不是 pinned、是否批量、调用频率"分：
+
+| 场景 | 位置 | host 端 | 传输方式 | 频率 | 结论 |
+|---|---|---|---|---|---|
+| KV 页恢复 | `paged_kv_cache.cpp` `copy_from_host` | **pinned extent**（实测 `pinned=2545 MiB`） | `cudaMemcpy3DBatchAsync`（默认开） | 每请求 | ✅ 已在最快档 |
+| KV 页降级 D2H | 同上 `copy_to_host` | pinned | batch | 每请求 | ✅ |
+| 权重加载 | `materializer.cpp:51/341` | **`PinnedHostBuffer`** | 单次大块 | 一次 | ✅（瓶颈是磁盘，见下） |
+| MoE route table 镜像 | `expert_stream.cpp:1061` | **`PinnedHostBuffer`**（显式 memcpy 进 stage） | 单次 | 每层每步 | ✅ |
+| MoE expert 权重 | `expert_cache.cpp` 1320/1370/1441/1465 | `PinnedHostBuffer` | 单块 | 每 token（未命中时） | ✅ |
+| expert 预测 ids（D2H） | `ffn.cpp:1105/1779` | `std::vector` | 几百字节 | 可选路径 | 无收益（太小） |
+| FFN 层输出诊断（D2H） | `ffn.cpp:1843–1883` | `std::vector` | 小块 | **仅 `NINFER_LAYER_OUT_PROBE` 且限 400 次** | 不影响 |
+| KV CPU split 镜像 | `kv_host_split_mirror.h` 134–185 | `std::vector` | 多次 D2H | 仅启用实验特性 `decide_cpu_kv_split` | 不影响默认 |
+| 诊断/导出 | `diagnostics.cpp`、`kv_dump.h`、`verify_probe.h` | `std::vector` | 小块 | 按需 | 不影响 |
+
+**结论：默认配置下不存在"pageable + 大量小块 H2D"的生产路径**，文章描述的 staging 慢路径不出现，`cudamemcpy-tuner` 那类 hook 没有收益。
+
+一个值得记下的观察：权重加载 15.6 GiB 用 3.2 s（≈4.9 GB/s），虽然已经是 pinned，但**远低于 PCIe 能力**——瓶颈在磁盘的随机读，不在 H2D。想缩短启动时间要动的是预读/并行读，不是拷贝路径。
+
+`ffn.cpp` 与 `kv_host_split_mirror.h` 里用 `std::vector` 的那几处，若要统一口径可以换成 `PinnedHostBuffer`，但它们分别是受限次数的诊断和默认关闭的实验特性，收益接近 0，这轮不动。
+
 ## 5. 环境与入口
 
 | 项 | 值 |
