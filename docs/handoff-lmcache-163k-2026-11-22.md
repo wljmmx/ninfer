@@ -316,6 +316,47 @@ raw.frontier = kv.frontier;  // …5 个字段…
 
 `NINFER_LMCACHE_STREAM=0` 可回退到整份载荷路径；header 失败也会自动回退。
 
+## 4.9 内存归因：流式 vs 整份（2026-11-23 凌晨，实测）
+
+`NINFER_MEM_PROBE=1` 让恢复路径在四个点打印进程 private / working set / peak（`GetProcessMemoryInfo`）：
+
+| 点 | 位置 |
+|---|---|
+| `restore-begin` | 发 lookup 之前 |
+| `after-header` | 拿到 state（156 MB）之后 |
+| `restore-ready` | `restore_prefix` 返回前（整份路径下 kv_bytes 仍在） |
+| `fill-done` | `fill` 写完引擎 extent |
+
+同一请求、同一服务端，163k：
+
+| 路径 | begin | 结束点 | 净增 |
+|---|---|---|---|
+| **流式** | 23.94 GB | 26.52 GB（fill-done） | **+2.58 GB** |
+| 整份 | 23.94 GB | 27.40 GB（restore-ready） | **+3.46 GB** |
+
+- header 只花 **0.14 GB**（就是 state 镜像），不碰 KV —— 这是流式的关键。
+- 流式的净增基本就是"引擎 extent 2.5 GB + 两片在途"，**没有第二份前缀**。
+- 整份路径在 extent 之外还压着 `kv_bytes`，这就是 0.88 GB 的差。
+- 注意 `peak` 一栏（31.5 GB）是进程历史高水位，含更早的阶段，**只有逐阶段 delta 有意义**。
+
+## 4.10 服务端 RSS 长测增长（2026-11-23 凌晨，定位到范围）
+
+现象：同一个 6555 进程连跑十几轮 163k 的 store+restore 后，RSS 9.1 GB → **14.3 GB**，随后 lookup 出现 30 s 超时（`has 30.005 s`），restore 随之失败；重启服务端立即恢复。
+
+排除项：
+
+- **不是会话泄漏。** `SessionManager` 有 `DEFAULT_SESSION_TTL = 600`（10 分钟）和 60 s 间隔的清理线程，`get_or_create(request_id)` 创建的会话会被回收。
+- **不是 L1 超限。** L1 6 GB 是预分配，eviction（watermark 0.8 / ratio 0.2）在跑。
+
+指向的原因：
+
+- 服务端**没有任何 GC 配置**（全仓无 `gc.freeze` / `gc.collect` / `set_threshold`）。每个 chunk 是一个对象，163k 一次就是 1279 个，多轮之后存活对象数万；CPython 的分代 GC 要扫全部，加上 glibc arena 不把释放的内存还给系统，RSS 只涨不落。
+- WSL 只有 31 GB 且配了 8 GB swap，RSS 涨到 14 GB 后接近上限，**换页**把 lookup 拖到 30 s 级 —— 这解释了为什么"重启就好"，也解释了为什么超时值恰好是客户端上限而不是服务端处理时间。
+
+当下的处置（已验证有效）：**每次正式测量前重启 6555**。
+
+可选优化（未验证，需要单独一轮）：服务端启动时 `gc.freeze()` 把常驻对象移出扫描范围，并用 `MALLOC_ARENA_MAX=2` 限制 arena 数量；两者都可能降低 RSS 增长与停顿，但会改变服务端行为，不在这轮直接上。
+
 ## 5. 环境与入口
 
 | 项 | 值 |
