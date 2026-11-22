@@ -144,7 +144,23 @@ public:
         // Restore is best-effort: a healthy round trip is about 1.3 s, so a much longer wait only
         // means the server is not answering -- and there it answers with silence, not an error. The
         // default 120 s would turn one bad payload into a two-minute request.
-        client.receive_timeout_ms = 5000;
+        //
+        // 5000 ms was measured on a 16k prefix and is NOT a bound on the server's work: it is the
+        // client's RCVTIMEO, so on a large prefix it fires while the server is still assembling and
+        // every symptom downstream (EAGAIN, "receive failed", a store whose commit never arrives)
+        // describes this constant rather than a fault. That cost a long hunt on 163k, where the
+        // timeout always read 5.000-5.017 s regardless of shard size -- a timeout, not a transfer.
+        //
+        // 30 s, not 120 s: a 32k prefix measured 5.2 s of transfer (657 MB at ~126 MB/s), so 5 s
+        // could not serve it at all, while a server that is really gone should not hold a request for
+        // two minutes. A miss never reaches the transfer -- has() gates it -- so this is the worst
+        // case for a server that answered the lookup and then stopped.
+        client.receive_timeout_ms = 30000;
+        if (const char* timeout_ms = std::getenv("NINFER_LMCACHE_TIMEOUT_MS");
+            timeout_ms != nullptr && *timeout_ms != '\0') {
+            const int parsed = std::atoi(timeout_ms);
+            if (parsed > 0) { client.receive_timeout_ms = parsed; }
+        }
         // A fresh id per process start: the server does not replace the layout of an id it already
         // knows.
         const std::int64_t instance =

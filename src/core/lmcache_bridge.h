@@ -15,11 +15,13 @@
 #include "core/lmcache_client.h"
 #include "core/lmcache_wire.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <span>
 #include <string>
@@ -391,90 +393,165 @@ private:
         struct PartResult {
             bool ok = false;
             std::string error;
-            RestorePayload payload;
             std::int64_t chunk_begin = 0;
             std::int64_t chunk_end   = 0;
         };
         std::vector<PartResult> results(width);
-        std::vector<std::future<void>> tasks;
-        tasks.reserve(width);
         const auto started = std::chrono::steady_clock::now();
-        for (std::size_t i = 0; i < width; ++i) {
-            // Contiguous, exhaustive cover of both ranges: chunk i owns [chunks*i/parts, chunks*(i+1)/parts)
-            // and byte i owns the same fraction of the state object. Together they reassemble exactly.
-            const std::int64_t cb = chunks * static_cast<std::int64_t>(i) / static_cast<std::int64_t>(width);
-            const std::int64_t ce =
-                chunks * static_cast<std::int64_t>(i + 1) / static_cast<std::int64_t>(width);
-            const std::int64_t sb =
-                state_bytes * static_cast<std::int64_t>(i) / static_cast<std::int64_t>(width);
-            const std::int64_t se =
-                state_bytes * static_cast<std::int64_t>(i + 1) / static_cast<std::int64_t>(width);
-            results[i].chunk_begin = cb;
-            results[i].chunk_end   = ce;
-            tasks.push_back(std::async(std::launch::async, [this, &key, &results, i, cb, ce, sb,
-                                                            se]() {
-                BridgeKey slice_key = key;
-                slice_key.request_id += "-p" + std::to_string(i);
-                const CacheKey slice = make_key(slice_key);
-                PartResult& out      = results[i];
-                const auto wait_began = std::chrono::steady_clock::now();
-                auto lease           = pool_.acquire();
-                const auto has_began  = std::chrono::steady_clock::now();
-                if (!lease) {
-                    out.error = "no connection available";
-                    return;
-                }
-                const bool matched = lease->has(slice);
-                const auto fetch_began = std::chrono::steady_clock::now();
-                if (!matched) {
-                    out.error = "not cached";
-                } else {
-                    out.ok = lease->fetch(slice, &out.payload, cb, ce, sb, se);
-                    if (!out.ok) { out.error = lease->error(); }
-                }
-                const auto done = std::chrono::steady_clock::now();
-                const auto secs = [](auto from, auto to) {
-                    return std::chrono::duration<double>(to - from).count();
-                };
-                std::fprintf(stderr,
-                             "[lmcache] split part %zu: acquire %.3f s, has %.3f s, fetch %.3f s "
-                             "(ok=%d%s%s)\n",
-                             i, secs(wait_began, has_began), secs(has_began, fetch_began),
-                             secs(fetch_began, done), out.ok ? 1 : 0,
-                             out.error.empty() ? "" : " | ", out.error.c_str());
-                std::fflush(stderr);
-            }));
+
+        // Fill the destination in place instead of assembling it afterwards. The old shape held the
+        // whole payload (2.5 GB at 163k) next to the destination and then inserted chunk by chunk,
+        // and the caller still has to copy the destination into engine pages -- three live copies of
+        // the same bytes. At 64 GB with WSL holding 18 GB that is what turned a working retrieve into
+        // "bad allocation". Pre-sizing means a part writes into its own disjoint slice as it lands.
+        const std::size_t want_kv    = static_cast<std::size_t>(chunks) * chunk_bytes();
+        const std::size_t want_state = static_cast<std::size_t>(state_bytes);
+        if (kv != nullptr) { kv->assign(want_kv, std::byte{0}); }
+        if (state != nullptr) { state->assign(want_state, std::byte{0}); }
+        const std::size_t part_chunk_bytes = chunk_bytes();
+
+        // How many parts may hold a payload at once. Bandwidth scales with this, peak memory with it
+        // too: 4 x 600 MB in flight was enough to fail the allocation above.
+        std::size_t inflight = 2;
+        if (const char* text = std::getenv("NINFER_RESTORE_INFLIGHT")) {
+            const int parsed = std::atoi(text);
+            if (parsed > 0) { inflight = static_cast<std::size_t>(parsed); }
         }
-        for (auto& task : tasks) { task.get(); }
+
+        // Shared-lookup, per wave. With a distinct request_id per part every part looks up the WHOLE
+        // key and takes its own read lock on the same objects; the L1 read lock is what makes an
+        // object readable to unsafe_read, and only the reservation that took it can consume it, so
+        // the parts that lost the race see KEY_NOT_READABLE ("exists but cannot be read").
+        //
+        // One lookup per wave, shared by that wave's parts, is the unit that works: a measured
+        // reservation carries two read locks (four parts: the first two read the state image, the
+        // other two were refused), so a wave must not exceed what one lookup provides, and each wave
+        // needs its own -- the locks are consumed, not shared for the whole restore.
+        const bool share_lookup = std::getenv("NINFER_RESTORE_SHARE_LOOKUP") != nullptr;
+
+        for (std::size_t base = 0; base < width; base += inflight) {
+            const std::size_t last = std::min(width, base + inflight);
+            const std::size_t wave = base / inflight;
+            // Each wave names itself, so its lookup reserves a fresh set of read locks.
+            BridgeKey wave_key = key;
+            if (share_lookup) { wave_key.request_id += "-w" + std::to_string(wave); }
+            if (share_lookup) {
+                auto probe = pool_.acquire();
+                if (!probe) {
+                    error_ = "no connection available for the wave lookup";
+                    if (kv != nullptr) { kv->clear(); }
+                    if (state != nullptr) { state->clear(); }
+                    return false;
+                }
+                const auto began = std::chrono::steady_clock::now();
+                const bool ok    = probe->has(make_key(wave_key));
+                const double seconds =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+                std::fprintf(stderr, "[lmcache] split wave %zu lookup %.3f s (ok=%d%s%s)\n", wave,
+                             seconds, ok ? 1 : 0, probe->error().empty() ? "" : " | ",
+                             probe->error().c_str());
+                std::fflush(stderr);
+                if (!ok) {
+                    error_ = probe->error().empty() ? "wave lookup missed" : probe->error();
+                    if (kv != nullptr) { kv->clear(); }
+                    if (state != nullptr) { state->clear(); }
+                    return false;
+                }
+            }
+            std::vector<std::future<void>> tasks;
+            for (std::size_t i = base; i < last; ++i) {
+                // Contiguous, exhaustive cover of both ranges: chunk i owns
+                // [chunks*i/parts, chunks*(i+1)/parts) and byte i the same fraction of the state
+                // object. Together they reassemble exactly.
+                const std::int64_t cb =
+                    chunks * static_cast<std::int64_t>(i) / static_cast<std::int64_t>(width);
+                const std::int64_t ce =
+                    chunks * static_cast<std::int64_t>(i + 1) / static_cast<std::int64_t>(width);
+                const std::int64_t sb =
+                    state_bytes * static_cast<std::int64_t>(i) / static_cast<std::int64_t>(width);
+                const std::int64_t se =
+                    state_bytes * static_cast<std::int64_t>(i + 1) / static_cast<std::int64_t>(width);
+                results[i].chunk_begin = cb;
+                results[i].chunk_end   = ce;
+                tasks.push_back(std::async(std::launch::async, [this, wave_key, &results, kv, state,
+                                                                i, cb, ce, sb, se, share_lookup,
+                                                                part_chunk_bytes]() {
+                    BridgeKey slice_key = wave_key;
+                    if (!share_lookup) { slice_key.request_id += "-p" + std::to_string(i); }
+                    const CacheKey slice = make_key(slice_key);
+                    PartResult& out      = results[i];
+                    const auto wait_began = std::chrono::steady_clock::now();
+                    auto lease           = pool_.acquire();
+                    const auto has_began  = std::chrono::steady_clock::now();
+                    if (!lease) {
+                        out.error = "no connection available";
+                        return;
+                    }
+                    const bool matched = share_lookup ? true : lease->has(slice);
+                    const auto fetch_began = std::chrono::steady_clock::now();
+                    RestorePayload payload;
+                    if (!matched) {
+                        out.error = "not cached";
+                    } else {
+                        out.ok = lease->fetch(slice, &payload, cb, ce, sb, se);
+                        if (!out.ok) { out.error = lease->error(); }
+                    }
+                    const auto done = std::chrono::steady_clock::now();
+                    // Copy straight into this part's slice, then drop the payload. The ranges are
+                    // disjoint by construction, so no lock is needed.
+                    if (out.ok && kv != nullptr) {
+                        const std::size_t want = static_cast<std::size_t>(ce - cb) * part_chunk_bytes;
+                        const std::size_t at   = static_cast<std::size_t>(cb) * part_chunk_bytes;
+                        std::size_t written    = 0;
+                        for (const std::string& chunk : payload.kv_chunks) {
+                            if (written + chunk.size() > want || at + want > kv->size()) { break; }
+                            std::memcpy(kv->data() + at + written,
+                                        reinterpret_cast<const std::byte*>(chunk.data()),
+                                        chunk.size());
+                            written += chunk.size();
+                        }
+                        if (written != want) {
+                            out.ok    = false;
+                            out.error = "kv slice is " + std::to_string(written) + " B, expected " +
+                                        std::to_string(want) + " B";
+                        }
+                    }
+                    if (out.ok && state != nullptr) {
+                        const std::size_t want = static_cast<std::size_t>(se - sb);
+                        if (payload.state.size() != want || static_cast<std::size_t>(sb) + want > state->size()) {
+                            out.ok    = false;
+                            out.error = "state slice is " + std::to_string(payload.state.size()) +
+                                        " B, expected " + std::to_string(want) + " B";
+                        } else if (want != 0) {
+                            std::memcpy(state->data() + sb,
+                                        reinterpret_cast<const std::byte*>(payload.state.data()), want);
+                        }
+                    }
+                    const auto secs = [](auto from, auto to) {
+                        return std::chrono::duration<double>(to - from).count();
+                    };
+                    std::fprintf(stderr,
+                                 "[lmcache] split part %zu: acquire %.3f s, has %.3f s, fetch %.3f s "
+                                 "(ok=%d%s%s)\n",
+                                 i, secs(wait_began, has_began), secs(has_began, fetch_began),
+                                 secs(fetch_began, done), out.ok ? 1 : 0,
+                                 out.error.empty() ? "" : " | ", out.error.c_str());
+                    std::fflush(stderr);
+                }));
+            }
+            for (auto& task : tasks) { task.get(); }
+        }
         const double total =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
-        std::size_t kv_before = kv != nullptr ? kv->size() : 0;
-        std::size_t state_before = state != nullptr ? state->size() : 0;
-        if (kv != nullptr) { kv->clear(); }
-        if (state != nullptr) { state->clear(); }
         for (std::size_t i = 0; i < width; ++i) {
-            if (!results[i].ok) {
-                error_ = "restore part " + std::to_string(i) + " failed: " + results[i].error;
-                if (kv != nullptr) { kv->resize(kv_before); }
-                if (state != nullptr) { state->resize(state_before); }
-                return false;
-            }
-            if (kv != nullptr) {
-                for (const std::string& chunk : results[i].payload.kv_chunks) {
-                    const auto* bytes = reinterpret_cast<const std::byte*>(chunk.data());
-                    kv->insert(kv->end(), bytes, bytes + chunk.size());
-                }
-            }
-            if (state != nullptr) {
-                const std::string& piece = results[i].payload.state;
-                state->insert(state->end(), reinterpret_cast<const std::byte*>(piece.data()),
-                              reinterpret_cast<const std::byte*>(piece.data()) + piece.size());
-            }
+            if (results[i].ok) { continue; }
+            error_ = "restore part " + std::to_string(i) + " failed: " + results[i].error;
+            if (kv != nullptr) { kv->clear(); }
+            if (state != nullptr) { state->clear(); }
+            return false;
         }
-        const std::size_t want_kv =
-            static_cast<std::size_t>(chunks) * chunk_bytes();
-        const std::size_t want_state = static_cast<std::size_t>(state_bytes);
+
         const bool sized = (kv == nullptr || kv->size() == want_kv) &&
                            (state == nullptr || state->size() == want_state);
         std::fprintf(stderr,

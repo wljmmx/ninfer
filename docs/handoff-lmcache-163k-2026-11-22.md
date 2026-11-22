@@ -1,7 +1,9 @@
 # LMCache 前缀缓存交接文档（2026-11-22）
 
 > 目标：让 ninfer 引擎把 KV checkpoint 存进 LMCache，并在后续请求中复用，覆盖 agent 多轮对话的增长场景。
-> 结论先行：**16k 与 32k 已可用；163k 写入完整但读取卡在 5 秒；对话裁剪不可复用（设计使然）。**
+> 结论先行：**16k 与 32k 已可用；163k 写入完整、服务端读取也完整（2.81 s / 2.67 GB），客户端受内存与 state 读锁限制尚未打通；对话裁剪不可复用（设计使然）。**
+>
+> **2026-11-22 晚更正**：第 4 节原来的“5 秒卡在服务端 / 请求没进 handler”结论是错的。5 秒是**客户端 `RCVTIMEO`**（`generation_service.cpp` 里写死 5000 ms）。下面第 4 节已按新证据整体重写，请以本节为准。
 
 ## 1. 可用矩阵（全部为实测）
 
@@ -11,7 +13,7 @@
 | 32k 跨进程恢复 | 6556（`243f95a`） | `cache_n 32,751`（99.98%），11.7 s，restore 5.4 s |
 | 多轮增长 A+B+C → +D | 两者 | 命中 2237/2244，只发增量 `chunk 17 of 23`（12.2 MB KV） |
 | 对话裁剪（去掉开头） | 两者 | `cache_n 0`，全量重写 —— 链式哈希的必然结果 |
-| 163k 跨进程 | 6556（含区间移植） | 写入完整（38 片，服务端 `Stored 163584 tokens`）；读取 5 s 超时 |
+| 163k 跨进程 | 6556（含区间移植） | 写入完整（38 片）；服务端读取完整 2.81 s / 2.67 GB；客户端分片受 state 读锁与内存限制（见第 4 节） |
 
 ## 2. 已修复的缺陷（全部有实测证据）
 
@@ -34,8 +36,9 @@
 2. **`prepare_retrieve` 的参数个数必须与服务端签名一致。**
    客户端多发或少发都由服务端 `unwrap_request_payloads` 抛 `ValueError`，而 `mq.py` 的异常分支**不回帧**——客户端只看到 `receive failed: Resource temporarily unavailable`，服务端 INFO 级日志里什么也没有。这是本项目最长的一次误判（追了很久的“超时”）。
 
-3. **5 秒不是超时。**
-   `SPLIT=2/4/16`（每片 1.25 GB / 600 MB / 150 MB）全部是 5.00 s，说明是常量。服务端 `blocking reply` 计时探针显示：`ping`/`lookup` 有回复日志，`prepare_retrieve` **一条都没有**——handler 在 5 秒内没有返回。
+3. **5 秒是客户端的 `RCVTIMEO`，不是服务端的处理时间。**（2026-11-22 晚更正）
+   `generation_service.cpp` 把它写死成 `client.receive_timeout_ms = 5000`（原注释按 16k 调的）。`SPLIT=2/4/16` 全部 5.000 s 正是因为这是超时值本身，与载荷大小无关。把超时放开后，服务端在 2.81 s 内就返回了完整回复——此前的“服务端卡住 / 请求没进 handler”全部是这条超时造成的假象。
+   另一个推论：**32k 实测传输 5.2–5.9 s，本来就不可能被 5 s 装下**，“≥32k 必然 miss”里至少有一部分是这条超时，而不只是 prefetch 不启动。
 
 4. **对话裁剪无法复用，不是 bug。**
    `chunk_hash[i] = H(chunk_i, chunk_hash[i-1])`，序列开头一变，整条链失配。实测 `B+C+D` 命中 0。若要支持，只能换 content-addressed 哈希（上游的 dedup 只在 blend 模块）。
@@ -43,44 +46,71 @@
 5. **state image 不可压缩。**
    153,954,304 B，zstd/zlib 全部 1.07×，去交错最好 1.16×，熵 7.53 bits/byte。其中 recurrent 占 98.1%。每轮都要重传，是短前缀不划算的主因。
 
-## 4. 163k 的精确卡点
+## 4. 163k 的真实卡点（2026-11-22 晚重写）
+
+### 4.0 先把 5 秒解释掉
+
+客户端 `Connection::call()` 用的是阻塞 `zmq_msg_recv`，唯一的超时来源就是该 socket 的 `ZMQ_RCVTIMEO`，而 `generation_service.cpp` 在 attach 时把它设成 **5000 ms**。因此：
 
 ```
-写入：publish part 0..37 全部执行，服务端连续 Stored 163584 tokens   ✅
-查询：lookup 正常（0.06 s），服务端有 Prefetch request completed 日志  ✅
-读取：fetch 5.000 s → receive failed                              ❌
-服务端：prepare_retrieve 的 blocking reply 日志从未出现            ❌
+fetch 5.000 s → receive failed: Resource temporarily unavailable   ← EAGAIN，是 RCVTIMEO 到期
 ```
 
-两条未解：
+不是服务端慢，也不是没有回帧。把超时放开到 30–60 s 之后，服务端日志立刻给出完整过程：
 
-1. **服务端**：`prepare_retrieve` 处理 320 个对象（600 MB）超过 5 秒没有返回。需要 `py-spy dump` 抓栈，确认卡在 `read_prefetched_results` 还是 `encode_grouped_tensors`。
-2. **客户端**：`RCVTIMEO` 明确设为 120 s，但实际 5.00 s 就返回 EAGAIN。说明这个 socket 上有别的机制在 5 秒打断接收（`wait_prefetch` 残留状态、`ZMQ_HANDSHAKE_IVL`、或 `ROUTER_MANDATORY` 的丢弃路径）。
+```
+retrieve read: start group of 1278 key(s) at t+0.000 s
+retrieve read: objects ready (1278) at t+0.002 s
+retrieve phases: read groups=[1278, 1] in 0.428 s
+retrieve phases: encode 2.382 s, total 2.810 s, bytes=2668621476
+blocking reply: wait 2.861 s, encode 0.631 s, queue 0.000 s, 2668621505 B
+```
 
-**下一步建议顺序**：
-1. `pip install py-spy`，读取进行到 3 秒时 `py-spy dump --pid <server>`（本机 `ptrace_scope=1` 且 sudo 需密码，py-spy 会 Permission Denied，需要放宽或改用 `faulthandler`）；
-2. 若栈在编码/读对象，考虑把每片降到 100 MB 以下（`NINFER_RESTORE_SPLIT=24`）再测；
-3. 若栈在等锁，查 `read_prefetched_results` 与 prefetch 的锁生命周期。
+**结论：服务端在 2.81 s 内正确组装了 2.67 GB 的回复，问题 100% 在客户端。**
 
-### 4.1 最后一次观测（2026-11-22 12:2x）
+另一个被这条超时污染的旧结论：`restore_fanout` 的“共用 request_id 时 4/4 分支各 5.008 s 失败”。那 4 个分支是**超时**，不是 miss，不能用来证明“prefetch 一个 request_id 只能消费一次”。
 
-在 `InlineTransferStrategy.prepare_retrieve` 与 handler 都加了分段计时后，跑一次 163k 读取：
+### 4.1 现在真正剩下的两个障碍（都有实测定位）
 
-- 服务端 `retrieve plan` 计数 = **0**（handler 里的日志一条都没打）
-- 服务端无新的 `Error handling operation prepare_retrieve`
-- 客户端仍然是 `fetch 5.000–5.017 s → receive failed`
+**障碍一：单条 2.67 GB 消息传不回客户端。**
 
-也就是说：**`prepare_retrieve` 这条请求没有到达 handler**。可能的落点是 ZMQ 层（`ROUTER_MANDATORY=1` 下 identity 不匹配会静默丢弃）或 `_handle_request` 的解码分支。
+不分片时服务端 2.81 s 发完，但客户端在 60 s 内都没把这一条消息收完（`receive failed`）。而分片传输时每片 600 MB 只要 6.4–8.7 s（≈93 MB/s，两片并行 ≈186 MB/s）。所以**必须分片**，单大消息这条路径在这套 ZMQ + relay 上不可用。
 
-**这改变了下一步的方向**：不再是“handler 慢”，而是“请求没进 handler”。建议先用 `probe_zmq_frames.py` 手工发一条 `prepare_retrieve`（带真实 key 与 instance_id），确认服务端在该路径上是否回帧；若不回，问题在传输层而非业务逻辑。
+**障碍二：state 镜像只有一个读锁，而每个分片都要读它。**
 
-### 4.2 5 秒的归属仍未定
+分片后 KV 组全部读成功（`objects ready (319)/(320)`），失败的永远是 `object_group_id=1` 的同一个 state 对象：
 
-- 客户端 `RCVTIMEO` = 120 s，但 5.00 s 就 EAGAIN；
-- `SPLIT=2/4/16` 全部 5.00 s，与载荷大小无关；
-- 服务端无对应日志。
+```
+Failed to read prefetched object ObjectKey(... object_group_id=1 ...) from L1 storage:
+    The specified key exists but cannot be read.
+```
 
-优先怀疑客户端 socket 上的残留状态（`wait_prefetch` 之后复用同一连接），可在 `call()` 里打印每次 `zmq_getsockopt(ZMQ_RCVTIMEO)` 的实际值来确认。
+原因链：`read_prefetched_results` **不加读锁**（`unsafe_read` 只检查 `read_lock.is_locked()`），读锁由 `lookup` 的 prefetch 预留；每个分片读完自己的片后 `finish_read_prefetched` 释放一次，而预留里该对象的读锁数量来自注册时的 `ShardReplicationDesc.num_kv_readers`（我们没声明，默认 1）。实测一次预留够 2–3 片读，第 3–4 片就被拒。
+
+可行的修法（按推荐顺序）：
+1. 注册时给 state 组声明 `group_tp_replicas`，使 `num_kv_readers = 分片数`（协议原生机制，`GroupedObjectKeys.num_kv_readers`）。
+2. 服务端把 state 对象按 `request_id` 读一次并缓存，各分片从缓存切片。
+3. 一轮 lookup 只覆盖一波分片（`NINFER_RESTORE_SHARE_LOOKUP=1` 已实现：每波各自 lookup，因为实测一波能拿到 2 个读锁）。
+
+**障碍三（新发现）：客户端内存峰值。**
+
+4 片 × 600 MB 载荷 + 2.5 GB 拼装缓冲 + 引擎导入，在 63.7 GB 机器上直接 `bad allocation`——因为 WSL 常驻 18.3 GB（8 GB L1 + torch），系统空闲只有约 9.7 GB。已把拼装改成**就地填充**（`kv->assign(want_kv)` + 每片直接写自己的偏移），省掉一次 2.5 GB 拷贝，并加了 `NINFER_RESTORE_INFLIGHT`（默认 2）限制并行片数；但 163k 仍然需要约 5 GB 余量。
+
+### 4.2 当前状态与下一步
+
+| 项 | 状态 |
+|---|---|
+| 16k 恢复 | ✅ `cache_n` 100%，restore 1.72 s |
+| 32k 恢复 | ✅ `cache_n 32751`（99.98%），传输 5.2–5.9 s |
+| 163k 写入 | ✅ 38 片，服务端连续 `Stored 163584 tokens` |
+| 163k 服务端读取 | ✅ 2.81 s / 2.67 GB |
+| 163k 客户端分片读取 | ⚠️ KV 全通，state 抢锁失败；且内存余量紧 |
+
+下一步（按价值排序）：
+1. 注册时声明 `num_kv_readers = 分片数` → 163k 四片并行应能跑通（预计 ~7 s 传输）。
+2. 若内存仍不够，让 restore 直接写进引擎页（流式导入），彻底不再需要 2.5 GB 中间缓冲。
+3. 单条 2.67 GB 消息的传输异常值得单独查一次（libzmq 大消息 + WSL relay），它决定“不分片”这条路能否作为兜底。
+
 
 ## 5. 环境与入口
 
@@ -111,7 +141,9 @@
 |---|---|
 | store（16k，4 片） | 382 MiB / 2.74 s（139 MiB/s） |
 | restore（16k，4 片） | 1.72 s（match 0.005 s + transfer） |
-| restore（32k，单消息） | 5.4 s |
+| restore（32k，单消息） | 5.2–5.9 s（657 MB，≈126 MB/s） |
+| restore（163k 分片，每片 600 MB） | 6.4–8.7 s/片，两片并行 ≈186 MB/s |
+| 客户端接收超时 | 默认 30 s（原 5 s，见第 4.0 节；`NINFER_LMCACHE_TIMEOUT_MS` 可覆盖） |
 | 服务端组装 | 181 MB 读 0.016 s + 编码 0.137 s = 0.153 s |
 | 单连接上限 | 254 MiB/s（裸链路 4 连接 722 MiB/s） |
 | 短前缀盈亏平衡 | 约几千 token（1736 token 时缓存 1.1 s > prefill 0.8 s） |
@@ -122,3 +154,5 @@
 - 不要在未打补丁的服务端上使用 6 参数形式（静默失败）。
 - 不要用 `--max-context` 推断 KV 容量（`--kv-capacity` 才是）。
 - 不要在没有 `NINFER_PUBLISH_PROBE` 的情况下判断“缓存没生效”——失败路径大多是无日志的。
+- **不要在 HTTP 响应返回后立刻结束引擎。** 发布是异步的：32k 的 8 个分片在响应之后还要 10–20 s 才写完（服务端 `Stored ...` 日志是唯一的完成信号）。测“写入→重启→读取”时必须等服务端日志，否则读到的必然 miss，很容易误判成回归。
+- 不要用 `Test-Path`/手工拼接的绝对路径去操作构建产物：本机 Defender 会在 404 MB 新链接的 exe 上短暂让路径不可见（`Test-Path` 返回 False、`Copy-Item` 报 path not found）。用 `Get-ChildItem` 取到的 `FullName` 再复制。
