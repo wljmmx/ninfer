@@ -2552,6 +2552,47 @@ private:
         return false;
     }
 
+    // Could pausing somebody hand `lane` the pages it is short of? Another resident lane can be
+    // paused, and a paused request can have its snapshot revoked. When neither exists, pausing this
+    // lane is a self-inflicted deadlock: the only victim is the request itself, and nothing is left
+    // running to drive it back.
+    [[nodiscard]] bool other_pause_candidate(std::uint32_t lane) const {
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            if (other != lane && slots_[other]) { return true; }
+        }
+        for (const auto& request : paused_) {
+            if (request && request->suspended && request->suspended->has_snapshot()) { return true; }
+        }
+        return false;
+    }
+
+    // The pool could not produce the page this step needs and there is no other holder to pause for
+    // it. That is the arena being full, not a transient shortage, so the request is refused as the
+    // length property it is. The sequence is aborted first so its pages go back: without that the
+    // pool stays over its edge and the next request is refused in turn.
+    void refuse_kv_pool_exhausted(const std::shared_ptr<Request>& request,
+                                  ContextResourceUsage shortage) {
+        const auto usage = instance_.program->physical_usage();
+        if (request->sequence) {
+            auto aborted                = instance_.program->abort(*request->sequence);
+            request->generation_timings = aborted.timings;
+            request->speculative_stats  = std::move(aborted.speculative);
+        }
+        complete_error(
+            request,
+            std::make_exception_ptr(RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                "the KV pool is full and nothing can be reclaimed for this step: needed_main_pages=" +
+                    std::to_string(shortage.main_kv_pages) + " needed_backend_pages=" +
+                    std::to_string(shortage.backend_kv_pages) + " needed_state_slots=" +
+                    std::to_string(shortage.state_slots) + " needed_host_bytes=" +
+                    std::to_string(shortage.host_bytes) + " resident=" +
+                    std::to_string(usage.occupied.main_kv_pages) + " of " +
+                    std::to_string(usage.capacity.main_kv_pages) +
+                    " page(s) (a retained prefix and a request this size do not both fit: lower "
+                    "max_context, or serve one long prefix at a time)")));
+    }
+
     bool pause_resident(std::uint32_t lane) {
         if (instance_.program->has_context_transaction()) { return false; }
         auto request       = slots_[lane];
@@ -3140,6 +3181,21 @@ private:
                     if (priority == lane) { return; }
                     // Leave the retry loop for this candidate (not the pass): the next lane gets its
                     // own turn, and the refused one is already finished.
+                    refused_lane = true;
+                    break;
+                }
+                // A pause is a promise that some other holder can give the pages back. When this is
+                // the only resident request and nothing is paused with a snapshot, nobody can: the
+                // victim would be this request, and no timer drives a paused lane back. Measured at
+                // 256K (2026-11-22, reproduced with --spec none, so it is not the draft backend): a
+                // 163k prompt cold-prefilling beside a 2558-page restored prefix filled the
+                // 4,682-page pool, the next page would not come, and the only request paused itself
+                // -- paused=1 running=0, 2% host, ten minutes, until the client gave up. Refusing it
+                // is the length property it is: the caller gets an answer, and the engine keeps
+                // serving.
+                if (!other_pause_candidate(lane)) {
+                    refuse_kv_pool_exhausted(request, result.shortage);
+                    if (priority == lane) { return; }
                     refused_lane = true;
                     break;
                 }
