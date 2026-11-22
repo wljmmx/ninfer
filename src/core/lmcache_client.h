@@ -233,16 +233,25 @@ public:
         {
             msgpack::Writer instance;
             instance.integer(registered_->instance_id);
-            msgpack::Writer ranges[4];
-            ranges[0].integer(chunk_begin);
-            ranges[1].integer(chunk_end);
-            ranges[2].integer(state_begin);
-            ranges[3].integer(state_end);
-            if (!call(kPrepareRetrieve,
-                      {encode_cache_key(key), instance.take(), ranges[0].take(), ranges[1].take(),
-                       ranges[2].take(), ranges[3].take()},
-                      &body)) {
-                return false;
+            // Upstream dropped the range arguments from prepare_retrieve (they exist only in this
+            // deployment's patch). NINFER_LMCACHE_NO_RANGES sends the two-payload form that both the
+            // stock server and the patched one accept, at the cost of not being able to split.
+            if (std::getenv("NINFER_LMCACHE_NO_RANGES") != nullptr) {
+                if (!call(kPrepareRetrieve, {encode_cache_key(key), instance.take()}, &body)) {
+                    return false;
+                }
+            } else {
+                msgpack::Writer ranges[4];
+                ranges[0].integer(chunk_begin);
+                ranges[1].integer(chunk_end);
+                ranges[2].integer(state_begin);
+                ranges[3].integer(state_end);
+                if (!call(kPrepareRetrieve,
+                          {encode_cache_key(key), instance.take(), ranges[0].take(),
+                           ranges[1].take(), ranges[2].take(), ranges[3].take()},
+                          &body)) {
+                    return false;
+                }
             }
         }
         if (!read_field_bool(body, "success")) {

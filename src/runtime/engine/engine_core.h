@@ -1279,6 +1279,15 @@ private:
                     "publish", request->id,
                     std::chrono::duration<double>(Clock::now() - publish_started).count(),
                     request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
+            } else if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+                // A finish without a checkpoint explains a cache that never receives the prefix: the
+                // whole publish path below is skipped, and the only symptom is a miss on the next
+                // request. Print it rather than leaving it silent.
+                std::fprintf(stderr,
+                             "[publish] finish produced NO checkpoint | req %llu | prompt %u\n",
+                             static_cast<unsigned long long>(request->id),
+                             request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
+                std::fflush(stderr);
             }
             const auto release_started = Clock::now();
             resources_.finish(*instance_.program, request->continuation_owner, *request->base_plan,

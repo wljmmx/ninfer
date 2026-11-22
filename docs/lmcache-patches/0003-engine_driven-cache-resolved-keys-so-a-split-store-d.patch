@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ninfer-local <ninfer-local@localhost>
+Date: Sun, 22 Nov 2026 10:16:51 +0800
+Subject: [PATCH] engine_driven: cache resolved keys so a split store does not
+ re-hash every part
+
+Every part re-resolved the whole key: 1278 chunks x 2 groups of blake3, measured at 9.7 s per
+64 MiB part on a 163k prefix. A 38-part store therefore spent ~370 s in hashing and the client
+gave up at its 120 s receive timeout after 12 parts, leaving two thirds of the KV unwritten and
+every later lookup a miss. Cache the resolution by (request_id, end, groups) - start is not part
+of its identity because resolving always walks from token 0. Measured after: 0.003 s per
+resolution, all 38 parts sent, server records Stored 163584 tokens.
+---
+ .../modules/engine_driven_transfer.py         | 42 ++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+index d941460..7fd1d61 100644
+--- a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+@@ -280,7 +280,26 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+             ``keys[g][c]`` is chunk ``c``'s key in group ``g``
+             (``ObjectKey.object_group_id == g``).
+         """
+-        return self._ctx.resolve_obj_keys(key, list(range(num_groups)))
++        # One entry is enough: the parts of a store arrive in sequence and name the same key. The
++        # signature deliberately omits `start`: resolving builds every chunk of the key from token 0,
++        # so a per-part start made the cache miss on every part (measured: 9.7 s per 64 MiB part on a
++        # 163k prefix, 38 parts against a 120 s receive timeout).
++        import time as _kc_time
++        signature = (key.request_id, key.end, num_groups)
++        cached = getattr(self, "_group_key_cache", None)
++        if cached is not None and cached[0] == signature:
++            logger.info("group key cache HIT (end=%d groups=%d)", key.end, num_groups)
++            return cached[1]
++        began = _kc_time.perf_counter()
++        keys = self._ctx.resolve_obj_keys(key, list(range(num_groups)))
++        logger.info(
++            "group key cache MISS resolved end=%d groups=%d in %.3f s",
++            key.end,
++            num_groups,
++            _kc_time.perf_counter() - began,
++        )
++        self._group_key_cache = (signature, keys)
++        return keys
+ 
+     def _group_keys_for(
+         self, entry: "EngineDrivenContextEntry", key: IPCCacheServerKey
+@@ -516,6 +535,14 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+         """
+         entry, strategy = self._resolve_for_transfer(instance_id)
+         group_keys = self._group_keys_for(entry, key)
++        logger.info(
++            "store plan: groups=%s key_end=%d first_hash=%s request_id=%s",
++            None if group_keys is None else [len(g) for g in group_keys],
++            key.end,
++            (group_keys[0][0].chunk_hash[:8].hex()
++             if group_keys and group_keys[0] else None),
++            key.request_id,
++        )
+         if skipped_chunks:
+             if group_keys is None or len(skipped_chunks) != len(group_keys):
+                 raise ValueError(
+@@ -647,6 +674,19 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+                 group_first_chunk[0] = group_first_chunk[0] + begin
+             else:
+                 group_first_chunk = [begin] + [0] * (len(group_keys) - 1)
++        logger.info(
++            "retrieve plan: first_hash=%s windows=%s groups=%s first_chunk=%s "
++            "range=(%d,%d,%d,%d)",
++            (group_keys[0][0].chunk_hash[:8].hex()
++             if group_keys and group_keys[0] else None),
++            entry.metadata.group_windows,
++            None if group_keys is None else [len(g) for g in group_keys],
++            list(group_first_chunk),
++            chunk_begin,
++            chunk_end,
++            state_begin,
++            state_end,
++        )
+         response = strategy.prepare_retrieve(
+             key=key,
+             instance_id=instance_id,

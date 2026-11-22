@@ -200,8 +200,24 @@ public:
             }
         }
 
+        if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+            std::fprintf(stderr, "[lmcache] fetch candidates:");
+            for (const std::size_t value : attempts) { std::fprintf(stderr, " %zu", value); }
+            std::fprintf(stderr, " (prompt %zu, chunk %zu)\n", prompt_tokens.size(),
+                         chunk_tokens_);
+            std::fflush(stderr);
+        }
+
         for (const std::size_t length : attempts) {
             const auto attempt = prompt_tokens.first(length);
+            // The length actually asked for decides the key, and a key that is shorter than what was
+            // stored can never match. A 163k request was seen asking for 18432 tokens (144 chunks)
+            // while its store used 163584, so print both sides of that decision.
+            if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+                std::fprintf(stderr, "[lmcache] fetch attempt %zu of %zu token(s)\n", length,
+                             prompt_tokens.size());
+                std::fflush(stderr);
+            }
             if (auto restored = restore_prefix(attempt)) {
                 // The run that came from the cache is not captured: record its coverage so the next
                 // request in this process can find it without another round trip.

@@ -417,17 +417,32 @@ private:
                 slice_key.request_id += "-p" + std::to_string(i);
                 const CacheKey slice = make_key(slice_key);
                 PartResult& out      = results[i];
+                const auto wait_began = std::chrono::steady_clock::now();
                 auto lease           = pool_.acquire();
+                const auto has_began  = std::chrono::steady_clock::now();
                 if (!lease) {
                     out.error = "no connection available";
                     return;
                 }
-                if (!lease->has(slice)) {
+                const bool matched = lease->has(slice);
+                const auto fetch_began = std::chrono::steady_clock::now();
+                if (!matched) {
                     out.error = "not cached";
-                    return;
+                } else {
+                    out.ok = lease->fetch(slice, &out.payload, cb, ce, sb, se);
+                    if (!out.ok) { out.error = lease->error(); }
                 }
-                out.ok = lease->fetch(slice, &out.payload, cb, ce, sb, se);
-                if (!out.ok) { out.error = lease->error(); }
+                const auto done = std::chrono::steady_clock::now();
+                const auto secs = [](auto from, auto to) {
+                    return std::chrono::duration<double>(to - from).count();
+                };
+                std::fprintf(stderr,
+                             "[lmcache] split part %zu: acquire %.3f s, has %.3f s, fetch %.3f s "
+                             "(ok=%d%s%s)\n",
+                             i, secs(wait_began, has_began), secs(has_began, fetch_began),
+                             secs(fetch_began, done), out.ok ? 1 : 0,
+                             out.error.empty() ? "" : " | ", out.error.c_str());
+                std::fflush(stderr);
             }));
         }
         for (auto& task : tasks) { task.get(); }

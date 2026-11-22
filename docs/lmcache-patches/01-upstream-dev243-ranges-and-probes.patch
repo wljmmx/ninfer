@@ -1,0 +1,135 @@
+diff --git a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+index 731d79b..54f84a4 100644
+--- a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+@@ -650,6 +650,10 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+         self,
+         key: IPCCacheServerKey,
+         instance_id: int,
++        chunk_begin: int = -1,
++        chunk_end: int = -1,
++        state_begin: int = -1,
++        state_end: int = -1,
+     ) -> PrepareRetrieveResponse:
+         """Prepare prefetched chunks and begin observing a successful transfer.
+ 
+@@ -678,12 +682,29 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+                 group_first_chunk.append(first)
+                 narrowed.append(g_keys[first:])
+             group_keys = narrowed
++        # Narrow the KV group and pass the state range through. Both default to -1, which is the
++        # whole payload - the behaviour an unmodified caller expects.
++        state_slice = None
++        if state_begin >= 0 or state_end >= 0:
++            state_slice = (state_begin, state_end)
++        if group_keys is not None and len(group_keys) > 0 and (chunk_begin >= 0 or chunk_end >= 0):
++            kv_keys = group_keys[0]
++            begin = 0 if chunk_begin < 0 else min(chunk_begin, len(kv_keys))
++            end = len(kv_keys) if chunk_end < 0 else min(chunk_end, len(kv_keys))
++            if end < begin:
++                end = begin
++            group_keys[0] = kv_keys[begin:end]
++            if group_first_chunk:
++                group_first_chunk[0] = group_first_chunk[0] + begin
++            else:
++                group_first_chunk = [begin] + [0] * (len(group_keys) - 1)
+         response = strategy.prepare_retrieve(
+             key=key,
+             instance_id=instance_id,
+             resolve_obj_keys=self._resolve_single_group_obj_keys,
+             group_keys=group_keys,
+             group_first_chunk=group_first_chunk,
++            state_slice=state_slice,
+         )
+         session = self._ctx.session_manager.get_or_create(key.request_id)
+         session.extras["retrieve_start_time"] = time.perf_counter()
+diff --git a/lmcache/v1/multiprocess/modules/server_transfer.py b/lmcache/v1/multiprocess/modules/server_transfer.py
+index 38e0ace..c6fbe99 100644
+--- a/lmcache/v1/multiprocess/modules/server_transfer.py
++++ b/lmcache/v1/multiprocess/modules/server_transfer.py
+@@ -382,6 +382,7 @@ class InlineTransferStrategy(TransferStrategy):
+         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+         group_keys: "list[list[ObjectKey]] | None" = None,
+         group_first_chunk: "Sequence[int]" = (),
++        state_slice: "tuple[int, int] | None" = None,
+     ) -> PrepareRetrieveResponse:
+         """Read prefetched objects and return a typed inline tensor payload.
+ 
+@@ -426,6 +427,15 @@ class InlineTransferStrategy(TransferStrategy):
+                         prefetched_keys, l1_owners=owners
+                     )
+ 
++        if state_slice is not None and len(group_chunks) > 1 and group_chunks[1]:
++            # A split restore asks for one byte range of the state image per part; the client
++            # concatenates the pieces in part order.
++            _sb, _se = state_slice
++            _t = group_chunks[1][0]
++            _n = _t.numel()
++            _b = 0 if _sb < 0 else min(_sb, _n)
++            _e = _n if _se < 0 else min(_se, _n)
++            group_chunks[1][0] = _t.reshape(-1)[_b:_e].clone()
+         if grouped:
+             firsts = list(group_first_chunk) or [0] * len(group_keys)
+             data = encode_grouped_tensors(
+diff --git a/lmcache/v1/multiprocess/transport/zmq_impl/mq.py b/lmcache/v1/multiprocess/transport/zmq_impl/mq.py
+index 4365f49..7613f53 100644
+--- a/lmcache/v1/multiprocess/transport/zmq_impl/mq.py
++++ b/lmcache/v1/multiprocess/transport/zmq_impl/mq.py
+@@ -7,6 +7,7 @@ from typing import Any, Callable, Generic, TypeVar, get_type_hints
+ import inspect
+ import queue
+ import threading
++import time
+ 
+ # Third Party
+ import msgspec
+@@ -268,11 +269,15 @@ class MessageQueueServer(RequestServer):
+         affinity_key = hash(prefix_frames[0])
+         future = handler_entry(payloads, affinity_key=affinity_key)
+ 
++        _t_submit = time.perf_counter()
++
+         def _notify_response(fut: Future):
+             try:
+                 response = fut.result()
++                _t_handler = time.perf_counter()
+                 response_cls = handler_entry.get_response_class()
+                 b_response = msgspec_encode(response, cls=response_cls)
++                _t_encode = time.perf_counter()
+                 frames_to_send = (
+                     prefix_frames + [b_response]
+                     if response is not None
+@@ -281,6 +286,14 @@ class MessageQueueServer(RequestServer):
+ 
+                 self.output_queue.put(frames_to_send)
+                 self._output_efd.notify()
++                _t_queued = time.perf_counter()
++                logger.info(
++                    "blocking reply: wait %.3f s, encode %.3f s, queue %.3f s, %d B",
++                    _t_handler - _t_submit,
++                    _t_encode - _t_handler,
++                    _t_queued - _t_encode,
++                    len(b_response),
++                )
+ 
+             except Exception as exc:
+                 operation = decode_operation(prefix_frames[2])
+diff --git a/lmcache/v1/transport/request_client.py b/lmcache/v1/transport/request_client.py
+index 9a15e64..279a2c9 100644
+--- a/lmcache/v1/transport/request_client.py
++++ b/lmcache/v1/transport/request_client.py
+@@ -171,7 +171,13 @@ class RequestClient(Protocol):
+ 
+     @rpc_method
+     def prepare_retrieve(
+-        self, key: IPCCacheServerKey, instance_id: int
++        self,
++        key: IPCCacheServerKey,
++        instance_id: int,
++        chunk_begin: int = -1,
++        chunk_end: int = -1,
++        state_begin: int = -1,
++        state_end: int = -1,
+     ) -> MessagingFuture[PrepareRetrieveResponse]: ...
+ 
+     @rpc_method

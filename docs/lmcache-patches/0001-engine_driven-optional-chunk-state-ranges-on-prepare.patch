@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ninfer-local <ninfer-local@localhost>
+Date: Sat, 21 Nov 2026 23:16:52 +0800
+Subject: [PATCH] engine_driven: optional chunk/state ranges on
+ prepare_retrieve
+
+The client now splits one restore across connections because the payload is 181 MB and the
+link carries far more when asked in parallel. A range defaults to -1, which means no
+restriction, so an unmodified caller receives exactly the old bytes.
+
+  * engine_driven_transfer: slice the KV group by chunk range before the strategy reads
+    anything, and shift group_first_chunk so the encoded indices stay absolute;
+  * server_transfer: the inline strategy slices the state tensor by byte range after it is
+    cloned, and logs read/encode/total time so the split can be priced;
+  * transport/base: the rpc signature the zmq server dispatches on.
+
+Local patch for this deployment, not intended for upstream as-is.
+---
+ .../modules/engine_driven_transfer.py         | 21 +++++++++++++++++++
+ .../multiprocess/modules/server_transfer.py   | 18 ++++++++++++++++
+ lmcache/v1/multiprocess/transport/base.py     |  8 ++++++-
+ 3 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+index ba6890c..d941460 100644
+--- a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+@@ -599,6 +599,10 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+         self,
+         key: IPCCacheServerKey,
+         instance_id: int,
++        chunk_begin: int = -1,
++        chunk_end: int = -1,
++        state_begin: int = -1,
++        state_end: int = -1,
+     ) -> PrepareRetrieveResponse:
+         """Retrieve prefetched chunks and return serialized CPU tensors.
+ 
+@@ -627,12 +631,29 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+                 group_first_chunk.append(first)
+                 narrowed.append(g_keys[first:])
+             group_keys = narrowed
++        # Slice the KV group and pass the state range through. A caller that wants the whole thing
++        # sends -1 and gets exactly what it used to get.
++        state_slice = None
++        if state_begin >= 0 or state_end >= 0:
++            state_slice = (state_begin, state_end)
++        if group_keys is not None and len(group_keys) > 0 and (chunk_begin >= 0 or chunk_end >= 0):
++            kv_keys = group_keys[0]
++            begin = 0 if chunk_begin < 0 else min(chunk_begin, len(kv_keys))
++            end = len(kv_keys) if chunk_end < 0 else min(chunk_end, len(kv_keys))
++            if end < begin:
++                end = begin
++            group_keys[0] = kv_keys[begin:end]
++            if group_first_chunk:
++                group_first_chunk[0] = group_first_chunk[0] + begin
++            else:
++                group_first_chunk = [begin] + [0] * (len(group_keys) - 1)
+         response = strategy.prepare_retrieve(
+             key=key,
+             instance_id=instance_id,
+             resolve_obj_keys=self._resolve_single_group_obj_keys,
+             group_keys=group_keys,
+             group_first_chunk=group_first_chunk,
++            state_slice=state_slice,
+         )
+         session = self._ctx.session_manager.get_or_create(key.request_id)
+         session.extras["retrieve_start_time"] = time.perf_counter()
+diff --git a/lmcache/v1/multiprocess/modules/server_transfer.py b/lmcache/v1/multiprocess/modules/server_transfer.py
+index 88c6903..6a3a76e 100644
+--- a/lmcache/v1/multiprocess/modules/server_transfer.py
++++ b/lmcache/v1/multiprocess/modules/server_transfer.py
+@@ -152,6 +152,7 @@ class TransferStrategy(abc.ABC):
+         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+         group_keys: "list[list[ObjectKey]] | None" = None,
+         group_first_chunk: "Sequence[int]" = (),
++        state_slice: "tuple[int, int] | None" = None,
+     ) -> PrepareRetrieveResponse:
+         """Prepare source resources for a retrieve request.
+ 
+@@ -382,6 +383,7 @@ class InlineTransferStrategy(TransferStrategy):
+         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+         group_keys: "list[list[ObjectKey]] | None" = None,
+         group_first_chunk: "Sequence[int]" = (),
++        state_slice: "tuple[int, int] | None" = None,
+     ) -> PrepareRetrieveResponse:
+         """Read prefetched objects and return a typed inline tensor payload.
+ 
+@@ -399,6 +401,8 @@ class InlineTransferStrategy(TransferStrategy):
+             else None
+         )
+ 
++        import time as _rt_time
++        _rt_t0 = _rt_time.perf_counter()
+         group_chunks: list[list[torch.Tensor]] = []
+         for g_keys in group_keys:
+             prefetched_keys: list[ObjectKey] = []
+@@ -426,6 +430,14 @@ class InlineTransferStrategy(TransferStrategy):
+                         prefetched_keys, l1_owners=owners
+                     )
+ 
++        if state_slice is not None and len(group_chunks) > 1 and group_chunks[1]:
++            _sb, _se = state_slice
++            _t = group_chunks[1][0]
++            _n = _t.numel()
++            _b = 0 if _sb < 0 else min(_sb, _n)
++            _e = _n if _se < 0 else min(_se, _n)
++            group_chunks[1][0] = _t.reshape(-1)[_b:_e].clone()
++        _rt_t1 = _rt_time.perf_counter()
+         if multi_group:
+             firsts = list(group_first_chunk) or [0] * len(group_keys)
+             data = encode_grouped_tensors(
+@@ -436,6 +448,12 @@ class InlineTransferStrategy(TransferStrategy):
+             )
+         else:
+             data = encode_tensors(group_chunks[0])
++        _rt_t2 = _rt_time.perf_counter()
++        logger.info(
++            'retrieve timing: read %.3f s, encode %.3f s, total %.3f s, groups=%d bytes=%d',
++            _rt_t1 - _rt_t0, _rt_t2 - _rt_t1, _rt_t2 - _rt_t0,
++            len(group_keys), len(data),
++        )
+         return PrepareRetrieveResponse(success=True, data=data, context={})
+ 
+     def commit_retrieve(
+diff --git a/lmcache/v1/multiprocess/transport/base.py b/lmcache/v1/multiprocess/transport/base.py
+index 7d8612c..984ffb9 100644
+--- a/lmcache/v1/multiprocess/transport/base.py
++++ b/lmcache/v1/multiprocess/transport/base.py
+@@ -150,7 +150,13 @@ class RequestClient(Protocol):
+ 
+     @rpc_method
+     def prepare_retrieve(
+-        self, key: IPCCacheServerKey, instance_id: int
++        self,
++        key: IPCCacheServerKey,
++        instance_id: int,
++        chunk_begin: int = -1,
++        chunk_end: int = -1,
++        state_begin: int = -1,
++        state_end: int = -1,
+     ) -> MessagingFuture[PrepareRetrieveResponse]: ...
+ 
+     @rpc_method

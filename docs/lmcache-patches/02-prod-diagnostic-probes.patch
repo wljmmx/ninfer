@@ -1,0 +1,77 @@
+diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
+index 2bc63e7..786859e 100644
+--- a/lmcache/v1/distributed/storage_manager.py
++++ b/lmcache/v1/distributed/storage_manager.py
+@@ -436,6 +436,19 @@ class StorageManager:
+             )
+         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
+         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
++        if failed_keys:
++            # A key that fails completion stays reserved and therefore invisible to readers, yet
++            # the engine-driven store reports success. Print it: this is the only place that knows.
++            kinds: dict[str, int] = {}
++            for key in failed_keys:
++                name = str(finish_result[key])
++                kinds[name] = kinds.get(name, 0) + 1
++            logger.warning(
++                "finish_write: %d of %d key(s) did NOT complete: %s",
++                len(failed_keys),
++                len(finish_result),
++                kinds,
++            )
+         self._event_bus.publish(
+             Event(
+                 event_type=EventType.SM_WRITE_FINISHED,
+diff --git a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+index 7fd1d61..a6ead5e 100644
+--- a/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/engine_driven_transfer.py
+@@ -644,6 +644,12 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
+             ValueError: If no non-GPU context is registered for the given
+                 instance ID.
+         """
++        logger.info(
++            "prepare_retrieve enter: request_id=%s end=%d instance=%d",
++            key.request_id,
++            key.end,
++            instance_id,
++        )
+         entry, strategy = self._resolve_for_transfer(instance_id)
+         group_keys = self._group_keys_for(entry, key)
+         group_first_chunk: list[int] = []
+diff --git a/lmcache/v1/multiprocess/modules/server_transfer.py b/lmcache/v1/multiprocess/modules/server_transfer.py
+index 309cd9b..a49f7d1 100644
+--- a/lmcache/v1/multiprocess/modules/server_transfer.py
++++ b/lmcache/v1/multiprocess/modules/server_transfer.py
+@@ -243,6 +243,12 @@ class InlineTransferStrategy(TransferStrategy):
+             ``True`` when every reserved object was written.
+         """
+         reserved_dict = self._storage_manager.reserve_write(obj_keys, layout_desc)
++        logger.info(
++            "write chunks: obj_keys=%d reserved=%d (instance_id=%d)",
++            len(obj_keys),
++            len(reserved_dict),
++            instance_id,
++        )
+         written_keys: list[ObjectKey] = []
+         try:
+             for idx, obj_key in enumerate(obj_keys):
+diff --git a/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi b/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi
+index 2764486..598c557 100644
+--- a/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi
++++ b/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/common_pb2.pyi
+@@ -40,7 +40,7 @@ class EventIpcHandleResult(_message.Message):
+     SUCCESS_FIELD_NUMBER: _ClassVar[int]
+     event_ipc_handle: bytes
+     success: bool
+-    def __init__(self, event_ipc_handle: _Optional[bytes] = ..., success: _Optional[bool] = ...) -> None: ...
++    def __init__(self, event_ipc_handle: _Optional[bytes] = ..., success: bool = ...) -> None: ...
+ 
+ class BlockIdGroup(_message.Message):
+     __slots__ = ("block_ids",)
+@@ -68,4 +68,4 @@ class EngineGroupInfo(_message.Message):
+     sw_size_tokens: int
+     extra_object_group_tag: int
+     recurrent_state: bool
+-    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: _Optional[bool] = ...) -> None: ...
++    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ...) -> None: ...

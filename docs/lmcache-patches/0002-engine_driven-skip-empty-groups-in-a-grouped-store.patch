@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ninfer-local <ninfer-local@localhost>
+Date: Sun, 22 Nov 2026 00:03:49 +0800
+Subject: [PATCH] engine_driven: skip empty groups in a grouped store
+
+---
+ lmcache/v1/multiprocess/modules/server_transfer.py | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/lmcache/v1/multiprocess/modules/server_transfer.py b/lmcache/v1/multiprocess/modules/server_transfer.py
+index 6a3a76e..309cd9b 100644
+--- a/lmcache/v1/multiprocess/modules/server_transfer.py
++++ b/lmcache/v1/multiprocess/modules/server_transfer.py
+@@ -359,12 +359,14 @@ class InlineTransferStrategy(TransferStrategy):
+             for g_keys, (g_indices, g_chunks), g_layout in zip(
+                 group_keys, decoded, group_layouts, strict=True
+             ):
+-                ok = (
+-                    self._write_chunks(
+-                        instance_id, [g_keys[i] for i in g_indices], g_chunks, g_layout
+-                    )
+-                    and ok
+-                )
++                selected = [g_keys[i] for i in g_indices]
++                if not selected:
++                    # A split store sends an empty group for the state image it does not carry,
++                    # because the flat single-group path would demand a chunk for every key. An
++                    # empty selection is not a write: reserve_write([]) is rejected, and the
++                    # handler then answers nothing at all - the client only sees a receive timeout.
++                    continue
++                ok = self._write_chunks(instance_id, selected, g_chunks, g_layout) and ok
+             return ok
+ 
+         obj_keys = resolve_obj_keys(key)
