@@ -620,8 +620,21 @@ private:
                     if (!matched) {
                         out.error = "not cached";
                     } else {
-                        out.ok = lease->fetch(slice, &payload, cb, ce, sb, se);
-                        if (!out.ok) { out.error = lease->error(); }
+                        // A part is fetched whole into host memory before it is copied out, so this
+                        // is where a prefix the machine cannot stage announces itself. It has to be
+                        // a failed part, never an escaping bad_alloc: a throw here unwinds through
+                        // the importer into the engine's worker, and the worker's answer to any
+                        // exception is `failed_ = true` -- every later request then gets a 503.
+                        // Measured 2026-11-22 (256K, MTP, 163k prefix, commit at 87 of 96 GB):
+                        // std::bad_alloc during the split fetch bricked the server until restart.
+                        // A restore that cannot be staged is a miss: the request prefills cold.
+                        try {
+                            out.ok = lease->fetch(slice, &payload, cb, ce, sb, se);
+                            if (!out.ok) { out.error = lease->error(); }
+                        } catch (const std::bad_alloc&) {
+                            out.ok    = false;
+                            out.error = "host allocation failed while staging this part";
+                        }
                     }
                     const auto done = std::chrono::steady_clock::now();
                     // Copy straight into this part's slice, then drop the payload. The ranges are

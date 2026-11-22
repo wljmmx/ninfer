@@ -309,10 +309,26 @@ public:
         const char* stream_flag = std::getenv("NINFER_LMCACHE_STREAM");
         const bool want_stream  = !(stream_flag != nullptr && std::atoi(stream_flag) == 0);
         bool streamed           = false;
-        if (want_stream && bridge_->restore_header(key, &state)) {
+        // Staging a header (the state image) or a whole payload is a plain host allocation, and a
+        // machine that cannot spare it must lose the restore, not the engine: an escaping bad_alloc
+        // reaches the worker, whose response to any exception is to fail every future request.
+        bool header_ok = false;
+        bool payload_ok = false;
+        try {
+            header_ok = want_stream && bridge_->restore_header(key, &state);
+            if (!header_ok) { payload_ok = bridge_->restore(key, &kv, &state); }
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr,
+                         "[lmcache] restore abandoned: host allocation failed for the header/payload "
+                         "(this request prefills cold)\n");
+            std::fflush(stderr);
+            ++misses_;
+            return std::nullopt;
+        }
+        if (header_ok) {
             streamed = true;
             log_process_memory("after-header");
-        } else if (!bridge_->restore(key, &kv, &state)) {
+        } else if (!payload_ok) {
             // Q70/13.4: the first half of the hit-rate shutdown. A lookup that reached the bridge
             // and came back empty is a miss; an early return above is not counted, because it never
             // asked.
