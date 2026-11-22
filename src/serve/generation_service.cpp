@@ -32,11 +32,36 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace ninfer::serve {
 
 #if NINFER_HAVE_LMCACHE
 namespace {
+#if defined(_WIN32)
+// Memory attribution for the restore path. The whole point of streaming is that the prefix stops
+// existing twice, and that claim is only measurable as "private bytes before / after", not as an
+// outside sample that also catches prefill. Off unless NINFER_MEM_PROBE is set.
+void log_process_memory(const char* tag) {
+    if (std::getenv("NINFER_MEM_PROBE") == nullptr) { return; }
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                sizeof(counters))) {
+        std::fprintf(stderr, "[mem] %-14s private %.2f GB  ws %.2f GB  peak %.2f GB\n", tag,
+                     static_cast<double>(counters.PrivateUsage) / 1073741824.0,
+                     static_cast<double>(counters.WorkingSetSize) / 1073741824.0,
+                     static_cast<double>(counters.PeakPagefileUsage) / 1073741824.0);
+        std::fflush(stderr);
+    }
+}
+#else
+void log_process_memory(const char*) {}
+#endif
+
 // The tag the program publishes is the KvCacheStorage numbering. Naming it in the log is what makes
 // "which format was this entry stored under" answerable without decoding the key.
 [[nodiscard]] std::string_view kv_format_name(std::uint32_t tag) {
@@ -270,6 +295,7 @@ public:
         // Timed, because "the cache took 0.9 s" and "the cache took 0.2 s" lead to different next
         // steps, and the serve log's queue_wait_seconds covers the whole admission path (fetch, import,
         // Device copies) without saying how much of it is the cache.
+        log_process_memory("restore-begin");
         const auto fetch_started = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> guard(bridge_mutex_);
         ++fetches_;
@@ -285,6 +311,7 @@ public:
         bool streamed           = false;
         if (want_stream && bridge_->restore_header(key, &state)) {
             streamed = true;
+            log_process_memory("after-header");
         } else if (!bridge_->restore(key, &kv, &state)) {
             // Q70/13.4: the first half of the hit-rate shutdown. A lookup that reached the bridge
             // and came back empty is a miss; an early return above is not counted, because it never
@@ -367,6 +394,7 @@ public:
                     return false;
                 }
                 if (!tail.empty()) { std::memcpy(dest.data() + kv_total, tail.data(), tail.size()); }
+                log_process_memory("fill-done");
                 return true;
             };
             std::fprintf(stderr, "[lmcache] header: %zu chunk(s) + %zu tail B -> %u page(s), streamed\n",
@@ -384,6 +412,7 @@ public:
         out.valid_tokens = valid_tokens;
         // One element: the image travels whole (v6 1n). The sharded layout exists for transport
         // sizing, not for import. The header and the tail stay here -- neither is part of the image.
+        log_process_memory("restore-ready");
         out.state_shards.emplace_back(reinterpret_cast<const char*>(object->image.data()),
                                       object->image.size());
         return out;

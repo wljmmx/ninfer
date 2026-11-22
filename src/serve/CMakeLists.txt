@@ -29,6 +29,10 @@ ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
   PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib ninfer_product_config
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_grammar CUDA::cudart)
+# GetProcessMemoryInfo, for the restore memory attribution (privates/working set per phase).
+if(WIN32)
+  target_link_libraries(ninfer_serve PRIVATE Psapi)
+endif()
 
 # The checkpoint cache is the only thing here that needs libzmq, and it is optional: without the
 # library every other feature still builds and the cache simply reports itself as unavailable.
