@@ -1433,15 +1433,39 @@ function renderFleetLive(){
 
   const pages = rt.device_main_kv_occupied_pages, cap = budget.kv_capacity_page_groups;
   const ratio = (pages != null && cap) ? Math.min(100, pages / cap * 100) : null;
-  $('f-vram').innerHTML = '—<small>GiB</small>';
-  $('f-vram-r').textContent = 'KV ' + fmtInt(pages) + ' / ' + fmtInt(cap) + ' 页';
-  $('f-vram-bar').innerHTML = ratio == null ? '' :
-    '<i style="width:' + ratio.toFixed(0) + '%;background:var(--accent)"></i>';
-  $('f-vram-sub').textContent = '逻辑 KV 占用；serve 不发布物理显存，硬件读数见下方 NVML';
+  // Physical VRAM/RAM come from NVML and Win32, not from the engine: an engine that is loaded
+  // publishes logical KV pages, so these two panels used to go blank exactly when a loaded engine
+  // made them worth reading. The engine's numbers stay in the sub-line instead of replacing them.
+  const vramUsed = GPU.ok && GPU.cur ? GPU.cur.vram_used_mib : null;
+  const vramTotal = GPU.ok && GPU.cur ? GPU.cur.vram_total_mib : null;
+  if (vramUsed != null && vramTotal) {
+    const pct = Math.min(100, vramUsed / vramTotal * 100);
+    $('f-vram').innerHTML = (vramUsed / 1024).toFixed(1) + '<small>GiB</small>';
+    $('f-vram-r').textContent = '物理 ' + (vramUsed / 1024).toFixed(1) + ' / ' + (vramTotal / 1024).toFixed(1) + ' GiB · NVML';
+    $('f-vram-bar').innerHTML = '<i style="width:' + pct.toFixed(0) + '%;background:' +
+      (pct > 92 ? 'var(--warn)' : 'var(--accent)') + '"></i>';
+    $('f-vram-sub').textContent = '逻辑 KV ' + fmtInt(pages) + ' / ' + fmtInt(cap) + ' 页（引擎自报）';
+  } else {
+    $('f-vram').innerHTML = '—<small>GiB</small>';
+    $('f-vram-r').textContent = 'KV ' + fmtInt(pages) + ' / ' + fmtInt(cap) + ' 页';
+    $('f-vram-bar').innerHTML = ratio == null ? '' :
+      '<i style="width:' + ratio.toFixed(0) + '%;background:var(--accent)"></i>';
+    $('f-vram-sub').textContent = '逻辑 KV 占用；NVML 硬件读数不可用';
+  }
 
-  $('f-ram').innerHTML = '—<small>GiB</small>';
-  $('f-ram-bar').innerHTML = '';
-  $('f-ram-sub').textContent = 'serve 不发布进程 RSS / 主机分配区读数';
+  const ram = GPU.ok ? GPU.ram : null;
+  if (ram && ram.total_mib) {
+    const used = ram.total_mib - ram.avail_mib;
+    $('f-ram').innerHTML = (used / 1024).toFixed(1) + '<small>GiB</small>';
+    $('f-ram-bar').innerHTML = '<i style="width:' +
+      Math.min(100, used / ram.total_mib * 100).toFixed(0) + '%;background:var(--accent2)"></i>';
+    $('f-ram-sub').textContent = '物理内存 ' + (ram.total_mib / 1024).toFixed(0) + ' GiB 总 · 可用 ' +
+      (ram.avail_mib / 1024).toFixed(1) + ' GiB（Win32）';
+  } else {
+    $('f-ram').innerHTML = '—<small>GiB</small>';
+    $('f-ram-bar').innerHTML = '';
+    $('f-ram-sub').textContent = '主机内存读数不可用';
+  }
   $('f-disk').innerHTML = LC.ok ? fmtGiB(LC.l1mem) : '—<small>GiB</small>';
   $('f-disk-bar').innerHTML = LC.ok && LC.ratio != null
     ? '<i style="width:' + Math.min(100, LC.ratio * 100).toFixed(0) + '%;background:var(--accent2)"></i>' : '';
@@ -2267,6 +2291,7 @@ async function pollGpu(){
   GPU.limit = j.power_limit_w;
   GPU.hist = {power:(j.history&&j.history.power)||[], sm:(j.history&&j.history.sm)||[], temp:(j.history&&j.history.temp)||[]};
   GPU.pcie = j.pcie || null;
+  GPU.ram = j.ram || null;
   renderGpu();
 }
 function renderGpu(){

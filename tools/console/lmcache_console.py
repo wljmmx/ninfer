@@ -161,6 +161,45 @@ NVML_EVENT_BITS = (
 )
 
 
+class NvmlMemory(ctypes.Structure):
+    """nvmlMemory_t: three sizes in bytes."""
+
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+class MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def host_memory() -> dict:
+    """System RAM as Windows reports it, in MiB.
+
+    The page has to show physical VRAM and RAM while an engine owns the card. The engine
+    publishes logical KV pages, not hardware counters, so the two panels used to go blank at
+    exactly the moment a loaded engine made them interesting.
+    """
+    try:
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return {}
+        mib = 1024.0 * 1024.0
+        return {"total_mib": status.ullTotalPhys / mib,
+                "avail_mib": status.ullAvailPhys / mib,
+                "load_percent": float(status.dwMemoryLoad)}
+    except Exception:  # noqa: BLE001 - a missing Win32 call must not take the console down
+        return {}
+
+
 class GpuCollector:
     """Samples NVML telemetry on a side thread and keeps a short history.
 
@@ -168,7 +207,6 @@ class GpuCollector:
     trap here. When NVML is unusable the snapshot reports ok=false with a reason instead
     of fake zeros, and per-field failures leave that field absent for the same reason.
     """
-
     HISTORY = 60        # ~1 minute at 1 Hz
     PCIE_EVERY = 5      # every ~5 s; each call blocks ~31 ms on this thread
 
@@ -181,6 +219,7 @@ class GpuCollector:
         "nvmlDeviceGetCurrentClocksEventReasons": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong)],
         "nvmlDeviceGetPowerManagementLimit": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)],
         "nvmlDeviceGetPcieThroughput": [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)],
+        "nvmlDeviceGetMemoryInfo": [ctypes.c_void_p, ctypes.POINTER(NvmlMemory)],
     }
     REQUIRED = (
         "nvmlDeviceGetHandleByIndex",
@@ -253,6 +292,12 @@ class GpuCollector:
                 sample["fan"] = u.value
             if nvml.nvmlDeviceGetCurrentClocksEventReasons(h, ctypes.byref(ull)) == 0:
                 sample["events"] = ull.value
+            if hasattr(nvml, "nvmlDeviceGetMemoryInfo"):
+                memory = NvmlMemory()
+                if nvml.nvmlDeviceGetMemoryInfo(h, ctypes.byref(memory)) == 0 and memory.total:
+                    # Physical VRAM, which the engine never publishes: it reports logical KV pages.
+                    sample["vram_used_mib"]  = memory.used / 1048576.0
+                    sample["vram_total_mib"] = memory.total / 1048576.0
             with self.lock:
                 self.current = sample
                 for key in ("power", "sm", "mem", "temp", "fan"):
@@ -291,6 +336,7 @@ class GpuCollector:
             "event_reasons": {"mask": mask, "active": active},
             "history": hist,
             "pcie": pcie,
+            "ram": host_memory(),
             "samples": max((len(v) for v in hist.values()), default=0),
         }
 
