@@ -172,6 +172,13 @@ public:
             return false;
         }
         ready_.store(true);
+        // Unconditional build tag. Twice now a freshly linked binary on R: kept behaving like the
+        // previous one (512 MB store parts, no probe output) while the file's hash matched the build,
+        // so the first question for any measurement is "which build is this".
+        std::fprintf(stderr, "[lmcache] BUILD TAG auto1 | store part %zu B | restore split derived=%d\n",
+                     publish_part_bytes(),
+                     std::getenv("NINFER_RESTORE_SPLIT") == nullptr ? 1 : 0);
+        std::fflush(stderr);
         // 13.4: jobs the previous process accepted and did not confirm. Replaying after ready means
         // the same publish path the writer thread uses; a record is removed only after publish
         // returns, so a crash during replay leaves it for the next start.
