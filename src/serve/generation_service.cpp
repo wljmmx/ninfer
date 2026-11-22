@@ -506,7 +506,15 @@ public:
         std::call_once(writer_once_, [this] {
             // Read once, at the first store: a cache either writes behind the request or in front of
             // it, and flipping mid-run would make the two indistinguishable in a log.
-            async_write_ = std::getenv("NINFER_LMCACHE_ASYNC_WRITE") != nullptr;
+            //
+            // Behind the request is the default, because a cache write does not make the request
+            // any better. Measured on a cold 163k prompt (RTX 4090, 256K): the prefill's boundary
+            // phase was 40.1 s with the store in the request's path and 6.8 s behind it, and the
+            // whole request 142.9 s vs 109.3 s. The price is one extra copy of the checkpoint in
+            // host memory (2.5 GB at 163k), so the switch stays available for a machine that cannot
+            // afford it: NINFER_LMCACHE_ASYNC_WRITE=0 puts the store back in front.
+            const char* async_flag = std::getenv("NINFER_LMCACHE_ASYNC_WRITE");
+            async_write_            = !(async_flag != nullptr && std::atoi(async_flag) == 0);
             if (async_write_) { writer_ = std::thread([this] { write_loop(); }); }
         });
         // A record is chunk-addressed and a conversation only ever appends, so the chunks this turn
