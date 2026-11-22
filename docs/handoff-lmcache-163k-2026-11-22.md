@@ -1,7 +1,7 @@
 # LMCache 前缀缓存交接文档（2026-11-22）
 
 > 目标：让 ninfer 引擎把 KV checkpoint 存进 LMCache，并在后续请求中复用，覆盖 agent 多轮对话的增长场景。
-> 结论先行：**16k 与 32k 已可用；163k 写入完整、服务端读取也完整（2.81 s / 2.67 GB），客户端受内存与 state 读锁限制尚未打通；对话裁剪不可复用（设计使然）。**
+> 结论先行：**16k / 32k / 163k 全部打通。** 163k 实测 `cache_n 163680`（99.996%），端到端 **24.1 s** vs 冷启动 117.6 s；32k 端到端 9.4 s、恢复 3.49 s。对话裁剪不可复用是链式哈希的设计使然，不是缺陷。
 >
 > **2026-11-22 晚更正**：第 4 节原来的“5 秒卡在服务端 / 请求没进 handler”结论是错的。5 秒是**客户端 `RCVTIMEO`**（`generation_service.cpp` 里写死 5000 ms）。下面第 4 节已按新证据整体重写，请以本节为准。
 
@@ -101,15 +101,18 @@ Failed to read prefetched object ObjectKey(... object_group_id=1 ...) from L1 st
 | 项 | 状态 |
 |---|---|
 | 16k 恢复 | ✅ `cache_n` 100%，restore 1.72 s |
-| 32k 恢复 | ✅ `cache_n 32751`（99.98%），传输 5.2–5.9 s |
-| 163k 写入 | ✅ 38 片，服务端连续 `Stored 163584 tokens` |
-| 163k 服务端读取 | ✅ 2.81 s / 2.67 GB |
-| 163k 客户端分片读取 | ⚠️ KV 全通，state 抢锁失败；且内存余量紧 |
+| 32k 恢复 | ✅ `cache_n 32751`（99.98%），split=4 恢复 3.49 s，端到端 9.4 s |
+| 163k 写入 | ✅ 38 片，每片 0.42–1.24 s |
+| 163k 服务端读取 | ✅ 2.81 s / 2.67 GB 编码完成 |
+| 163k 客户端分片读取 | ✅ 4 片全部成功，`restore split=4 total 15.875 s`，`cache_n 163680`，端到端 24.1 s |
 
-下一步（按价值排序）：
-1. 注册时声明 `num_kv_readers = 分片数` → 163k 四片并行应能跑通（预计 ~7 s 传输）。
-2. 若内存仍不够，让 restore 直接写进引擎页（流式导入），彻底不再需要 2.5 GB 中间缓冲。
-3. 单条 2.67 GB 消息的传输异常值得单独查一次（libzmq 大消息 + WSL relay），它决定“不分片”这条路能否作为兜底。
+第 4.1 节里的三个障碍最终是这样解掉的：**state 读锁**在 `243f95a` 上不成立（4 片都读到）；**内存**不是靠 `wsl --shutdown`，而是停掉已无用的 dev243 服务端（6556，占 13.1 GB）——生产 L1 数据因此没有被清空；**单条 2.67 GB 消息**用分片绕开，未再深究。
+
+剩下的都是优化项，不是阻塞：
+1. 把 `NINFER_PUBLISH_PART_MB` 与 `NINFER_RESTORE_SPLIT` 写进生产启动脚本（现在 `start_engine.cmd` 仍是 32768 上下文、不分片，32k 以上恢复会被容量判断直接跳过）。
+2. 传输入账：聚合约 155 MB/s（4 片各 46–93 MB/s），若提到 8 片但要控制峰值内存（4 片已占 2.4 GB 载荷 + 2.5 GB 目的地）。
+3. 注册时声明 state 组 `num_kv_readers = 分片数`，让这条路径不再依赖“一次预留恰好给够锁”的现状。
+4. 流式导入（不再需要 2.5 GB 中间缓冲）可以把 163k 的内存门槛再降一半。
 
 
 ## 4.3 生产已切到上游版本（2026-11-22 晚）
@@ -129,7 +132,7 @@ Failed to read prefetched object ObjectKey(... object_group_id=1 ...) from L1 st
 | 32k 写入 | 8 片，每片 0.42–1.6 s |
 | 32k 恢复 | `cache_n 32751`（99.98%），split=4 total **3.486 s** |
 | 163k 写入 | 38 片，每片 0.42–1.24 s，总计约 20 s |
-| 163k 恢复 | 4 片全部 `ok=1`（8.8–11.9 s/片），随后引擎导入阶段 `bad allocation` |
+| 163k 恢复 | **4 片全部 `ok=1`，`restore split=4 total 15.875 s`，`cache_n 163680`（99.996%），端到端 24.1 s**（冷启动 117.6 s） |
 
 **163k 现在只剩最后一个障碍：内存。** 本机 63.7 GB，`vmmemWSL` 工作集 21.4 GB / 私有 30.8 GB（`.wslconfig` 没有 `autoMemoryReclaim`），`ninfer-serve` 私有 23.2 GB，系统 `free` 仅 13.7 GB。恢复路径需要 2.5 GB 目的地 + 引擎把同一份字节导入页池/host context，峰值 ~5 GB 连续内存，`bad allocation` 就出在这里。要么释放 WSL 内存（需 `wsl --shutdown`，会停掉 WSL 内的 docker/tailscale），要么把导入改成流式（不再需要 2.5 GB 中间缓冲）。
 
@@ -163,7 +166,8 @@ Failed to read prefetched object ObjectKey(... object_group_id=1 ...) from L1 st
 | store（16k，4 片） | 382 MiB / 2.74 s（139 MiB/s） |
 | restore（16k，4 片） | 1.72 s（match 0.005 s + transfer） |
 | restore（32k，单消息） | 5.2–5.9 s（657 MB，≈126 MB/s） |
-| restore（163k 分片，每片 600 MB） | 6.4–8.7 s/片，两片并行 ≈186 MB/s |
+| restore（163k 分片，4×600 MB） | `split=4 total 15.875 s`，2.51 GB KV + 156 MB state，聚合 ≈155 MB/s |
+| 163k 端到端 | 24.1 s（`cache_n 163680`）vs 冷启动 117.6 s |
 | 客户端接收超时 | 默认 30 s（原 5 s，见第 4.0 节；`NINFER_LMCACHE_TIMEOUT_MS` 可覆盖） |
 | 服务端组装 | 181 MB 读 0.016 s + 编码 0.137 s = 0.153 s |
 | 单连接上限 | 254 MiB/s（裸链路 4 连接 722 MiB/s） |
