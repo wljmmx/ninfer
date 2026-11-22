@@ -204,7 +204,20 @@ struct CachedCheckpoint {
     // frontier, which is the same number whenever a capture set it.
     std::uint32_t valid_tokens = 0;
     std::size_t page_bytes   = 0;
+    // Pages the record covers. A backend that fills the payload on demand has no byte vector to
+    // divide, so it states the count here; one that carries bytes may leave it zero and the count
+    // comes from kv_bytes.size() / page_bytes as before.
+    std::uint32_t page_count = 0;
+    // Bytes already in hand. Mutually exclusive with `fill`: a producer either has the payload or can
+    // write it into a destination, never both.
     std::vector<std::byte> kv_bytes;
+    // Payload written on demand, straight into the destination the engine will import from -- one
+    // contiguous host view of page_count x page_bytes. Called exactly once, after the engine has
+    // reserved the pages and knows how many there are, so the whole prefix never exists as a second
+    // copy. A network cache streams its parts here; a producer holding the bytes leaves it empty and
+    // passes kv_bytes. Both shapes meet at the same import code, which is the point: the streaming
+    // path is not a second importer with its own rules.
+    std::function<bool(std::span<std::byte> destination, std::string* error)> fill;
     // One entry for a whole state image. The sharded layout exists for transport sizing, not for
     // import, so a cache that sends the image whole passes a single element.
     std::vector<std::string> state_shards;

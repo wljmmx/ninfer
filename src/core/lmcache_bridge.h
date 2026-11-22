@@ -263,6 +263,92 @@ public:
     // questions and only one of them is a prefetch target: a match is a hash lookup and should be
     // milliseconds, a transfer is the payload and is proportional to bytes. Reporting the sum (as
     // fetch() used to) hides which one a change moved.
+    // Streaming restore, in the two calls the import path needs.
+    //
+    // `restore_header` answers "how much text does this record cover" without moving the payload: one
+    // chunk of KV makes the grouped request legal and the state image arrives whole (156 MB). The
+    // caller derives the page count from it, reserves the engine's host extent, and then hands that
+    // extent to `restore_into`, which streams every part straight into it. The prefix therefore never
+    // exists twice -- which is the whole reason this pair exists, because holding it once cost 2.5 GB
+    // at 163k on a machine where WSL already had 13 GB.
+    // How many parts this payload is fetched in. One rule, used by every restore entry point: one
+    // part per ~128 MB of KV, capped at four because the prefetch reservation that serves the shared
+    // state object carries four read locks. NINFER_RESTORE_SPLIT=1 forces the single-message path;
+    // unset or 0 derives.
+    [[nodiscard]] int split_parts(const BridgeKey& key) const {
+        const char* split_text = std::getenv("NINFER_RESTORE_SPLIT");
+        const int from_env     = split_text != nullptr ? std::atoi(split_text) : 0;
+        if (from_env > 1) { return from_env; }
+        if (from_env == 1) { return 1; }
+        const std::size_t chunk = static_cast<std::size_t>(config_.chunk_tokens());
+        if (chunk == 0 || chunk_bytes() == 0) { return 1; }
+        const std::size_t bytes = (key.tokens.size() / chunk) * chunk_bytes();
+        constexpr std::size_t kPartTarget = 128ULL * 1024 * 1024;
+        const std::size_t wanted          = (bytes + kPartTarget - 1) / kPartTarget;
+        return static_cast<int>(std::min<std::size_t>(4, std::max<std::size_t>(1, wanted)));
+    }
+
+    bool restore_header(const BridgeKey& key, std::vector<std::byte>* state) {
+        const CacheKey cache_key = make_key(key);
+        auto lease               = pool_.acquire();
+        if (!lease) {
+            error_ = "no connection available";
+            return false;
+        }
+        const auto state_bytes = static_cast<std::int64_t>(config_.state.object_bytes());
+        if (state_bytes <= 0) {
+            error_ = "state geometry not known";
+            return false;
+        }
+        RestorePayload got;
+        const auto began = std::chrono::steady_clock::now();
+        if (!lease->has(cache_key) ||
+            !lease->fetch(cache_key, &got, 0, 1, 0, state_bytes)) {
+            error_ = lease->error().empty() ? "not cached" : lease->error();
+            return false;
+        }
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+        std::fprintf(stderr, "[lmcache] header: state %zu B in %.3f s\n", got.state.size(), seconds);
+        std::fflush(stderr);
+        if (state != nullptr) {
+            state->assign(reinterpret_cast<const std::byte*>(got.state.data()),
+                          reinterpret_cast<const std::byte*>(got.state.data()) + got.state.size());
+        }
+        return true;
+    }
+
+    // Writes the payload into `dest`, which the caller sized from the page count. Same part sizing,
+    // same lookup rules and the same range arithmetic as restore(); only the destination differs.
+    bool restore_into(const BridgeKey& key, std::span<std::byte> dest) {
+        const CacheKey cache_key = make_key(key);
+        int parts                = split_parts(key);
+        if (parts > 1) { return restore_split_into(key, cache_key, parts, dest, nullptr); }
+        auto lease = pool_.acquire();
+        if (!lease) {
+            error_ = "no connection available";
+            return false;
+        }
+        RestorePayload got;
+        if (!lease->has(cache_key) || !lease->fetch(cache_key, &got)) {
+            error_ = lease->error().empty() ? "not cached" : lease->error();
+            return false;
+        }
+        std::size_t written = 0;
+        for (const std::string& chunk : got.kv_chunks) {
+            if (written + chunk.size() > dest.size()) { break; }
+            std::memcpy(dest.data() + written,
+                        reinterpret_cast<const std::byte*>(chunk.data()), chunk.size());
+            written += chunk.size();
+        }
+        if (written != dest.size()) {
+            error_ = "restore wrote " + std::to_string(written) + " B of " +
+                     std::to_string(dest.size()) + " B";
+            return false;
+        }
+        return true;
+    }
+
     bool restore(const BridgeKey& key, std::vector<std::byte>* kv, std::vector<std::byte>* state) {
         const CacheKey cache_key = make_key(key);
         // Probe: the server binds a worker to the ZMQ identity, so connections should run on
@@ -282,26 +368,11 @@ public:
         // big loses more to the socket than it saves in copies); 2.51 GB over four parts 15.9 s.
         // One part per ~128 MB of KV, capped at four -- the prefetch reservation that serves the
         // shared state object carries four read locks (four parts all read it; a fifth would lose).
-        int parts = 1;
-        const char* split_text = std::getenv("NINFER_RESTORE_SPLIT");
-        const int from_env = split_text != nullptr ? std::atoi(split_text) : 0;
-        // Explicit 1 means "one message": that is the only way to exercise the single-message path
-        // now that the default is derived. Unset or 0 derives from the payload.
-        if (from_env > 1) {
-            parts = from_env;
-        } else if (from_env != 1) {
-            const std::size_t chunk = static_cast<std::size_t>(config_.chunk_tokens());
-            if (chunk != 0 && chunk_bytes() != 0) {
-                const std::size_t bytes = (key.tokens.size() / chunk) * chunk_bytes();
-                constexpr std::size_t kPartTarget = 128ULL * 1024 * 1024;
-                const std::size_t wanted = (bytes + kPartTarget - 1) / kPartTarget;
-                parts = static_cast<int>(std::min<std::size_t>(4, std::max<std::size_t>(1, wanted)));
-            }
-        }
+        const int parts = split_parts(key);
         if (parts > 1) { return restore_split(key, cache_key, parts, kv, state); }
         if (std::getenv("NINFER_LMCACHE_PROBE") != nullptr) {
-            std::fprintf(stderr, "[lmcache] restore parts=%d (from_env=%d chunk=%lld bytes=%zu)\n",
-                         parts, from_env, static_cast<long long>(config_.chunk_tokens()),
+            std::fprintf(stderr, "[lmcache] restore parts=%d (chunk=%lld bytes=%zu)\n", parts,
+                         static_cast<long long>(config_.chunk_tokens()),
                          static_cast<std::size_t>(chunk_bytes()));
             std::fflush(stderr);
         }
@@ -404,6 +475,23 @@ private:
     // cache entry; only the session differs.
     bool restore_split(const BridgeKey& key, const CacheKey& base_key, int parts,
                        std::vector<std::byte>* kv, std::vector<std::byte>* state) {
+        // Bytes-in-hand wrapper: size the destination, then run the one streaming implementation.
+        // Keeping a single body is the point -- a second importer with its own range arithmetic is
+        // how the two paths drift apart, which is what the handoff notes kept warning about.
+        const auto chunk_tok      = static_cast<std::int64_t>(config_.chunk_tokens());
+        const std::int64_t chunks = chunk_tok > 0 ? base_key.end / chunk_tok : 0;
+        const std::size_t want_kv =
+            chunks > 0 ? static_cast<std::size_t>(chunks) * chunk_bytes() : 0;
+        if (kv != nullptr) {
+            kv->assign(want_kv, std::byte{0});
+            return restore_split_into(key, base_key, parts,
+                                      std::span<std::byte>(kv->data(), kv->size()), state);
+        }
+        return restore_split_into(key, base_key, parts, {}, state);
+    }
+
+    bool restore_split_into(const BridgeKey& key, const CacheKey& base_key, int parts,
+                            std::span<std::byte> dest, std::vector<std::byte>* state) {
         const auto width      = static_cast<std::size_t>(parts);
         const auto chunk_tok  = static_cast<std::int64_t>(config_.chunk_tokens());
         if (chunk_tok <= 0) {
@@ -433,7 +521,11 @@ private:
         // "bad allocation". Pre-sizing means a part writes into its own disjoint slice as it lands.
         const std::size_t want_kv    = static_cast<std::size_t>(chunks) * chunk_bytes();
         const std::size_t want_state = static_cast<std::size_t>(state_bytes);
-        if (kv != nullptr) { kv->assign(want_kv, std::byte{0}); }
+        if (!dest.empty() && dest.size() != want_kv) {
+            error_ = "restore destination is " + std::to_string(dest.size()) + " B, expected " +
+                     std::to_string(want_kv) + " B";
+            return false;
+        }
         if (state != nullptr) { state->assign(want_state, std::byte{0}); }
         const std::size_t part_chunk_bytes = chunk_bytes();
 
@@ -466,7 +558,6 @@ private:
                 auto probe = pool_.acquire();
                 if (!probe) {
                     error_ = "no connection available for the wave lookup";
-                    if (kv != nullptr) { kv->clear(); }
                     if (state != nullptr) { state->clear(); }
                     return false;
                 }
@@ -480,7 +571,6 @@ private:
                 std::fflush(stderr);
                 if (!ok) {
                     error_ = probe->error().empty() ? "wave lookup missed" : probe->error();
-                    if (kv != nullptr) { kv->clear(); }
                     if (state != nullptr) { state->clear(); }
                     return false;
                 }
@@ -500,7 +590,7 @@ private:
                     state_bytes * static_cast<std::int64_t>(i + 1) / static_cast<std::int64_t>(width);
                 results[i].chunk_begin = cb;
                 results[i].chunk_end   = ce;
-                tasks.push_back(std::async(std::launch::async, [this, wave_key, &results, kv, state,
+                tasks.push_back(std::async(std::launch::async, [this, wave_key, &results, dest, state,
                                                                 i, cb, ce, sb, se, share_lookup,
                                                                 part_chunk_bytes]() {
                     BridgeKey slice_key = wave_key;
@@ -526,13 +616,13 @@ private:
                     const auto done = std::chrono::steady_clock::now();
                     // Copy straight into this part's slice, then drop the payload. The ranges are
                     // disjoint by construction, so no lock is needed.
-                    if (out.ok && kv != nullptr) {
+                    if (out.ok && !dest.empty()) {
                         const std::size_t want = static_cast<std::size_t>(ce - cb) * part_chunk_bytes;
                         const std::size_t at   = static_cast<std::size_t>(cb) * part_chunk_bytes;
                         std::size_t written    = 0;
                         for (const std::string& chunk : payload.kv_chunks) {
-                            if (written + chunk.size() > want || at + want > kv->size()) { break; }
-                            std::memcpy(kv->data() + at + written,
+                            if (written + chunk.size() > want || at + want > dest.size()) { break; }
+                            std::memcpy(dest.data() + at + written,
                                         reinterpret_cast<const std::byte*>(chunk.data()),
                                         chunk.size());
                             written += chunk.size();
@@ -574,16 +664,15 @@ private:
         for (std::size_t i = 0; i < width; ++i) {
             if (results[i].ok) { continue; }
             error_ = "restore part " + std::to_string(i) + " failed: " + results[i].error;
-            if (kv != nullptr) { kv->clear(); }
             if (state != nullptr) { state->clear(); }
             return false;
         }
 
-        const bool sized = (kv == nullptr || kv->size() == want_kv) &&
+        const bool sized = (dest.empty() || dest.size() == want_kv) &&
                            (state == nullptr || state->size() == want_state);
         std::fprintf(stderr,
                      "[lmcache] restore split=%d total %.3f s | kv %zu/%zu B, state %zu/%zu B%s\n",
-                     parts, total, kv != nullptr ? kv->size() : 0, want_kv,
+                     parts, total, dest.size(), want_kv,
                      state != nullptr ? state->size() : 0, want_state, sized ? "" : "  SIZE MISMATCH");
         std::fflush(stderr);
         if (!sized) {

@@ -102,7 +102,16 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
         error = "checkpoint export carries no pages";
         return std::nullopt;
     }
-    if (kv.kv_bytes.size() != kv.page_bytes * static_cast<std::size_t>(kv.page_count)) {
+    // Two shapes of the same record: bytes in hand, or a producer that writes them on demand. The
+    // checks below are about the SHAPE, so they are stated once for both -- a streamed record states
+    // its page count instead of dividing a byte vector.
+    const bool streamed = static_cast<bool>(kv.fill);
+    if (streamed && kv.page_count == 0) {
+        error = "a streamed checkpoint must state its page count";
+        return std::nullopt;
+    }
+    if (!streamed &&
+        kv.kv_bytes.size() != kv.page_bytes * static_cast<std::size_t>(kv.page_count)) {
         error = "KV bytes do not match page_count x page_bytes";
         return std::nullopt;
     }
@@ -192,7 +201,22 @@ std::optional<TierSource> ProgramImpl::import_checkpoint_source(
             error = "Host extent is smaller than the restored payload";
             return std::nullopt;
         }
-        std::memcpy(view.data(), kv.kv_bytes.data(), expected);
+        if (kv.fill) {
+            // The producer writes the extent itself. Same destination, same length, same failure
+            // contract as the memcpy below -- the only difference is that the bytes were never held
+            // anywhere else, which is the whole point at 2.5 GB.
+            std::string fill_error;
+            if (!kv.fill(std::span<std::byte>(view.data(), expected), &fill_error)) {
+                host_kv_extents->abort(*reservation);
+                for (const LogicalKVPageHandle page : pages) { (void)text_kv_pages->release(page); }
+                (void)state_store->release(*state);
+                error = fill_error.empty() ? "the checkpoint source could not fill the pages"
+                                           : std::move(fill_error);
+                return std::nullopt;
+            }
+        } else {
+            std::memcpy(view.data(), kv.kv_bytes.data(), expected);
+        }
         if (std::getenv("NINFER_KVT_DEBUG") != nullptr) {
             std::fprintf(stderr,
                          "[kvt-debug] import write view=%p first=%02x last=%02x expected=%zu "

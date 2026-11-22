@@ -259,11 +259,16 @@ public:
             return std::nullopt;
         }
         auto cached = checkpoint_cache_->fetch(tokens);
-        if (!cached || cached->page_bytes == 0 || cached->kv_bytes.empty()) { return std::nullopt; }
+        if (!cached || cached->page_bytes == 0) { return std::nullopt; }
+        // A streamed record carries no byte vector by design; its producer fills the extent instead.
+        if (!cached->fill && cached->kv_bytes.empty()) { return std::nullopt; }
 
         typename Model::CheckpointExport kv;
         kv.page_bytes = cached->page_bytes;
-        kv.page_count = static_cast<std::uint32_t>(cached->kv_bytes.size() / cached->page_bytes);
+        kv.page_count = cached->page_count != 0
+                            ? cached->page_count
+                            : static_cast<std::uint32_t>(cached->kv_bytes.size() /
+                                                         cached->page_bytes);
         if (kv.page_count == 0) { return std::nullopt; }
         // A restored checkpoint holds Device pages for as long as it exists (import reserves them and
         // the Host-only copy is promoted lazily), so a restore that takes the last free page does not
@@ -283,7 +288,9 @@ public:
                 return std::nullopt;
             }
         }
+        // One of the two travels on: bytes already in hand, or the producer that will write them.
         kv.kv_bytes = std::move(cached->kv_bytes);
+        kv.fill     = std::move(cached->fill);
         // The cache stores bytes and the page count, not coverage history. A restored page has no
         // local content epoch, so zero is the honest value; it only feeds the "did this page change
         // under me" check, which cannot apply to bytes that were just written.

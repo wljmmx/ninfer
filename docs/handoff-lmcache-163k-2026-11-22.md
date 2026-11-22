@@ -242,6 +242,69 @@ LMCache 自身的淘汰是有限的（`trigger_watermark 0.8`、`eviction_ratio 
 
 分工是清楚的：**客户端管“这条该不该进来”**（超限拒绝，避免自我淘汰），**服务端管“进来的之间谁留下”**（LRU 按水位淘汰最久未用的）。
 
+## 4.8 流式导入的接口设计（2026-11-22 夜，接口已落地）
+
+### 4.8.1 为什么要这一层
+
+恢复路径的峰值不是 KV 本身，而是它同时存在三份：
+
+| 位置 | 163k 时 |
+|---|---|
+| 客户端下载缓冲（`CachedCheckpoint::kv_bytes`） | 2.5 GB |
+| 引擎 host extent（`writable_view`） | 2.5 GB |
+| Device 副本（import 最后一步的 copy_from_host） | 2.5 GB |
+
+`resource_manager.h` 已经把缓冲 `std::move` 进 `CheckpointExport`，所以前两份是"两份"而不是三份；`checkpoint_import.cpp:195` 的 `memcpy(view.data(), kv.kv_bytes.data(), expected)` 是唯一一次整块拷贝。要降峰值，只能让下载**直接写进 `view.data()`**。
+
+### 4.8.2 抽象：一个导入器，两种数据来源
+
+不是给 LMCache 单开一条导入路径，而是把"字节从哪来"抽象掉：
+
+```cpp
+// include/ninfer/types.h  CachedCheckpoint
+std::uint32_t page_count = 0;                                   // 没有字节向量时由来源自己报
+std::vector<std::byte> kv_bytes;                                // 来源甲：字节已在手
+std::function<bool(std::span<std::byte>, std::string*)> fill;   // 来源乙：按需写入给定目的地
+```
+
+`CheckpointExport`（`program_impl.h`）持有同一个 `fill`，于是：
+
+- **没有 LMCache**：`fetch` 不参与，checkpoint 来自引擎自己的 capture，`kv_bytes` 有值，`fill` 为空；
+- **有 LMCache 且走老路径**：`kv_bytes` 有值，`fill` 为空；
+- **有 LMCache 且走流式**：`kv_bytes` 为空，`page_count` 有值，`fill` 有值。
+
+三种情况在 `checkpoint_import.cpp` 汇合，只有一处分支：
+
+```cpp
+if (kv.fill) { kv.fill(span(view.data(), expected), &error); }
+else         { std::memcpy(view.data(), kv.kv_bytes.data(), expected); }
+```
+
+形状校验也合并成一句：流式记录必须自报 `page_count`，非流式记录仍按 `kv_bytes.size() == page_count × page_bytes` 校验。
+
+### 4.8.3 已落地的三处
+
+| 文件 | 改动 |
+|---|---|
+| `include/ninfer/types.h` | `CachedCheckpoint` 加 `page_count` 与 `fill` |
+| `program_impl.h` | `CheckpointExport` 加 `fill` |
+| `checkpoint_import.cpp` | 形状校验按来源分支；`memcpy` 变成 `fill`/`memcpy` 二选一，失败时释放 extent 与页 |
+| `resource_manager.h` | `page_count` 可由来源提供；`fill` 透传；不再要求 `kv_bytes` 非空 |
+| `lmcache_bridge.h` | `split_parts()` 统一分片规则；`restore_split_into(span)` 成为唯一实现，`restore_split(vector)` 只是它的分配包装；新增 `restore_header()`（只取 state 和图页数）与 `restore_into(span)`（写进调用方缓冲） |
+
+### 4.8.4 还差最后一处接线（尚未启用）
+
+`generation_service.cpp` 的 `restore_prefix()` 仍是"`restore()` 一次拿全部"。要启用流式，它要变成：
+
+1. `restore_header()` 取 state（156 MB）→ `decode_state_object` 得 `valid_tokens`
+2. 用 `plan_restore` 算 `page_count`，写进 `CachedCheckpoint::page_count`
+3. 设 `fill`：`restore_into(dest.first(kv_bytes_total))`，再把 state 里的 tail（≤2 MB）拷到 `dest` 尾部
+4. 不再填 `kv_bytes`
+
+tail 必须由 `fill` 写，因为 `page_count` 把 tail 也算进页数里；这是接线时唯一容易错的地方。
+
+**当前状态**：接口齐全、行为不变（`fill` 为空，走原路径），已随全量重编验证编译与门禁。启用开关留作 `NINFER_LMCACHE_STREAM`，接线完成后再默认打开。
+
 ## 5. 环境与入口
 
 | 项 | 值 |

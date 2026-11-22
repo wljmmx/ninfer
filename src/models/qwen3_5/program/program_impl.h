@@ -249,6 +249,10 @@ struct CheckpointExport {
     std::size_t page_bytes   = 0;
     std::vector<std::uint32_t> epochs;
     std::vector<std::byte> kv_bytes;
+    // Payload written on demand by an external producer (a cache restore). When set, the importer
+    // hands it the destination extent and never reads kv_bytes, so a 2.5 GB prefix is written once.
+    // The export direction -- capture for a store -- leaves it empty.
+    std::function<bool(std::span<std::byte> destination, std::string* error)> fill;
 };
 
 struct CheckpointSlot {
