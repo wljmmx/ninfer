@@ -238,6 +238,11 @@ public:
             // Q70/13.4: the first half of the hit-rate shutdown. A lookup that reached the bridge
             // and came back empty is a miss; an early return above is not counted, because it never
             // asked.
+            if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+                std::fprintf(stderr, "[lmcache] restore miss at %zu token(s): %s\n",
+                             prompt_tokens.size(), bridge_->error().c_str());
+                std::fflush(stderr);
+            }
             ++misses_;
             return std::nullopt;
         }
@@ -390,11 +395,15 @@ public:
             bool written    = true;
             std::size_t part = 0;
             std::size_t parts_sent = 0;
+            // One id for every part of this store; see publish_job for why.
+            const std::string store_request_id =
+                "put-" + std::to_string(instance_tag_) + "-" + std::to_string(++sequence_);
             for (std::size_t begin = first_chunk; begin < total_chunks;
                  begin += part_bytes, ++part) {
                 const std::size_t end  = std::min(total_chunks, begin + part_bytes);
                 const bool last        = end == total_chunks;
-                if (!publish_job(prompt_tokens, checkpoint, begin, end, last, part)) {
+                if (!publish_job(prompt_tokens, checkpoint, begin, end, last, part,
+                                 store_request_id)) {
                     written = false;
                     break;
                 }
@@ -558,7 +567,8 @@ public:
     bool publish_job(std::span<const TokenId> prompt_tokens,
                      const ninfer::CachedCheckpoint& checkpoint, std::size_t first_chunk = 0,
                      std::size_t chunk_end = std::numeric_limits<std::size_t>::max(),
-                     bool with_state = true, std::size_t part = 0) {
+                     bool with_state = true, std::size_t part = 0,
+                     const std::string& store_request_id = std::string()) {
         // Every early return below drops a checkpoint silently, and a dropped store is invisible from
         // the engine side: the request already answered and the next lookup simply misses. The probe
         // names which guard fired, because "the cache never has it" has been three different bugs.
@@ -623,13 +633,15 @@ public:
 
         ninfer::core::lmcache::BridgeKey key;
         key.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
-        // One request id per part. The server keys its session - and its prefetch job - by request_id,
-        // so sharing one across parts is what made a concurrent split fail (measured: the second and
-        // later parts never saw a prepare reply). The token stream is identical, so all parts name
-        // the same cache entry.
-        key.request_id = "put-" + std::to_string(instance_tag_) + "-" +
-                         std::to_string(++sequence_) +
-                         (part == 0 ? std::string() : "-p" + std::to_string(part));
+        // All parts of one store share a request id. The server builds chunk hashes on a per-request
+        // chain (measured earlier: the rolling hash is not reset when the token buffer is replaced),
+        // so parts written under different ids could name different objects for the same tokens - the
+        // data lands in L1 and every later lookup still misses. Store parts are sent in sequence, so
+        // sharing the id does not contend the way parallel retrieves did.
+        key.request_id = store_request_id.empty()
+                             ? "put-" + std::to_string(instance_tag_) + "-" +
+                                   std::to_string(++sequence_)
+                             : store_request_id;
 
         std::string state;
         std::vector<std::byte> payload;
