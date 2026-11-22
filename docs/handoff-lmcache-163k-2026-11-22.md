@@ -185,6 +185,28 @@ ninfer-serve.exe   404512256 B   ← 正确命名（构建产物就叫 ninfer-se
 2. 复制后必须比对 SHA256（`Copy-Item` 在本机曾出现“返回成功但内容未变”）。
 3. `generation_service.cpp` 启动时无条件打印一行 `[lmcache] BUILD TAG ...`，包含 store part 字节数；**任何测量之前先看这一行**，它回答“跑的是不是这个构建”。
 
+## 4.6 `--kv-capacity auto` 的两个前提（2026-11-22 晚）
+
+引擎支持 `--kv-capacity auto`（`KvCapacityPolicy::Automatic`）：按“权重加载后剩余的 device 预算 − `--kv-sizing-headroom-mib`”反算页数，实测在本机给出 **4000 pages = 256,000 token**（正好覆盖 256k 上下文），日志里 `kv_capacity auto [argv]`、`[kv-plan] ... mode=auto`。
+
+但 auto 只解决容量，另外两件事必须显式：
+
+1. **`--kv-residency-slack-mib 1536` 不能交给 auto。** auto 的默认是 `device/12`（本机约 381 MiB），KV 会把 device 吃满，restore 之后的 decode kernel 直接 `cudaErrorMemoryAllocation`：
+   ```
+   [host-context] pinned 2398 MiB extent refused (cudaMallocHost failed ... 2398 MiB requested)
+   scalar.cu:11: CUDA_CHECK(cudaGetLastError()) failed: cudaErrorMemoryAllocation
+   ```
+   原因是 4090 上还有 15.6 GiB 权重和 WDDM 可驱逐预算，余量必须按“权重之后还剩多少”给，而不是按 device 总量除以 12。
+2. **`--kv-sizing-headroom-mib`（默认 1 GiB）决定 auto 留多少不用于 KV**。想让容量更大就调小它，但和上面那条余量叠加，别同时压到 0。
+
+实测（auto + slack 1536）：163k `cache_n 163680`、`restore split=4 total 15.452 s`、端到端 23.0 s。与显式 256000 的 16.7 s 差在服务端状态，不在容量策略。
+
+生产启动脚本：`H:\TeleAgentWorks\.temp\kv\start_prod.cmd`（`--kv-capacity auto --kv-residency-slack-mib 1536`，分片/part/超时全部由客户端推导）。
+
+### 4.6.1 服务端长测后要重启
+
+同一个 6555 进程连续跑了十几轮 163k/32k 的 store+restore 之后，RSS 从 9.1 GB 涨到 **14.3 GB**，lookup 开始出现 30 s 超时（`has 30.005 s`），restore 也随之失败。这不是容量或锁的问题，是服务端进程自身的状态累积。**每次正式测量前重启一次服务端**，否则数字不可比。
+
 ## 5. 环境与入口
 
 | 项 | 值 |
