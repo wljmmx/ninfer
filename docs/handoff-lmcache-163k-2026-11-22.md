@@ -199,7 +199,7 @@ ninfer-serve.exe   404512256 B   ← 正确命名（构建产物就叫 ninfer-se
    原因是 4090 上还有 15.6 GiB 权重和 WDDM 可驱逐预算，余量必须按“权重之后还剩多少”给，而不是按 device 总量除以 12。
 2. **`--kv-sizing-headroom-mib`（默认 1 GiB）决定 auto 留多少不用于 KV**。想让容量更大就调小它，但和上面那条余量叠加，别同时压到 0。
 
-实测（auto + slack 1536）：163k `cache_n 163680`、`restore split=4 total 15.452 s`、端到端 23.0 s。与显式 256000 的 16.7 s 差在服务端状态，不在容量策略。
+实测（auto + slack 1536）：163k `cache_n 163680`、`restore split=4 total 15.452 s`、端到端 23.0 s。与显式 256000 的 16.7 s 差在服务端状态，不在容量策略。服务端重启后的干净状态下复测 32k：4 片各 1.50–1.60 s、`restore split=4 total 3.287 s`、`cache_n 32751`，与显式配置的 3.081 s 一致。
 
 生产启动脚本：`H:\TeleAgentWorks\.temp\kv\start_prod.cmd`（`--kv-capacity auto --kv-residency-slack-mib 1536`，分片/part/超时全部由客户端推导）。
 
