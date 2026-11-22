@@ -185,23 +185,28 @@ ninfer-serve.exe   404512256 B   ← 正确命名（构建产物就叫 ninfer-se
 2. 复制后必须比对 SHA256（`Copy-Item` 在本机曾出现“返回成功但内容未变”）。
 3. `generation_service.cpp` 启动时无条件打印一行 `[lmcache] BUILD TAG ...`，包含 store part 字节数；**任何测量之前先看这一行**，它回答“跑的是不是这个构建”。
 
-## 4.6 `--kv-capacity auto` 的两个前提（2026-11-22 晚）
+## 4.6 三个容量相关参数都已经是 auto（2026-11-22 晚，修正前一版）
 
-引擎支持 `--kv-capacity auto`（`KvCapacityPolicy::Automatic`）：按“权重加载后剩余的 device 预算 − `--kv-sizing-headroom-mib`”反算页数，实测在本机给出 **4000 pages = 256,000 token**（正好覆盖 256k 上下文），日志里 `kv_capacity auto [argv]`、`[kv-plan] ... mode=auto`。
+前一版这里写着“slack 必须显式 1536”，那是错的：**默认不写就是 auto，而且 auto 更合理**。
 
-但 auto 只解决容量，另外两件事必须显式：
+| 参数 | 不写时的行为 | 依据 |
+|---|---|---|
+| `--kv-capacity auto` | 按“权重之后剩余 device 预算 − `--kv-sizing-headroom-mib`（默认 1 GiB）”反算，本机给 **4000 pages = 256,000 token** | `KvCapacityPolicy::Automatic` |
+| `--kv-residency-slack-mib` | **auto = device/12**，24 GB 卡即 **2 GiB**（floor 512 MiB，ceiling 4 GiB） | `model_instance.cpp` `kv_residency_slack_bytes()`，注释里有 173k 臂的 knee 实测：512 MiB → 4025 pages 但 876 tok/s；1 GiB → 3511 pages;2 GiB → 904 pages 但 2888 tok/s。knee 在 1–2 GiB，所以 auto 取 device/12 |
+| `--kv-evict` | **auto**（`eviction_contract("")` → `EvictionContract::Auto`），由引擎按是否需要决定 | `options.cpp:423`、`model_instance.cpp:2346` |
 
-1. **`--kv-residency-slack-mib 1536` 不能交给 auto。** auto 的默认是 `device/12`（本机约 381 MiB），KV 会把 device 吃满，restore 之后的 decode kernel 直接 `cudaErrorMemoryAllocation`：
-   ```
-   [host-context] pinned 2398 MiB extent refused (cudaMallocHost failed ... 2398 MiB requested)
-   scalar.cu:11: CUDA_CHECK(cudaGetLastError()) failed: cudaErrorMemoryAllocation
-   ```
-   原因是 4090 上还有 15.6 GiB 权重和 WDDM 可驱逐预算，余量必须按“权重之后还剩多少”给，而不是按 device 总量除以 12。
-2. **`--kv-sizing-headroom-mib`（默认 1 GiB）决定 auto 留多少不用于 KV**。想让容量更大就调小它，但和上面那条余量叠加，别同时压到 0。
+全 auto（三个都不写）实测：
 
-实测（auto + slack 1536）：163k `cache_n 163680`、`restore split=4 total 15.452 s`、端到端 23.0 s。与显式 256000 的 16.7 s 差在服务端状态，不在容量策略。服务端重启后的干净状态下复测 32k：4 片各 1.50–1.60 s、`restore split=4 total 3.287 s`、`cache_n 32751`，与显式配置的 3.081 s 一致。
+| 场景 | 结果 |
+|---|---|
+| 32k | `cache_n 32751`，restore 5.164 s，端到端 6.2 s |
+| 163k | `cache_n 163680`，`restore split=4 total 12.951 s`，端到端 **20.5 s** |
 
-生产启动脚本：`H:\TeleAgentWorks\.temp\kv\start_prod.cmd`（`--kv-capacity auto --kv-residency-slack-mib 1536`，分片/part/超时全部由客户端推导）。
+163k 那次的 restore 是历次最快的（12.951 s，显式 1536 是 15.452 s），全程没有 `cudaMallocHost` 失败。
+
+**关于那次 `cudaMallocHost 2398 MiB failed`**：它是状态性偶发（当时服务端 RSS 已涨到 14.3 GB、系统内存紧张），不是 slack 太小。当时把 slack 改成 1536 后“成功”，时间上是巧合。结论应以本节的全 auto 复测为准。
+
+生产启动脚本：`H:\TeleAgentWorks\.temp\kv\start_prod.cmd` —— 除 `--kv-capacity auto` 外不写任何调优参数，只保留 `--max-context`（%1，默认 256000）。
 
 ### 4.6.1 服务端长测后要重启
 
