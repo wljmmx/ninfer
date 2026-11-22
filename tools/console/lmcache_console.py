@@ -1015,6 +1015,12 @@ class Launcher:
                 env["NINFER_LMCACHE_RESTORE"] = "1"
                 env["NINFER_LMCACHE_ENDPOINT"] = self.lmcache_endpoint
                 env["NINFER_LMCACHE_CHUNK_TOKENS"] = "128"
+                # Handing the write to the writer thread is what keeps the store out of the request
+                # path: measured on a cold 163k prompt (RTX 4090, 256K) the prefill's boundary phase
+                # was 40.1 s synchronous vs 6.8 s asynchronous, and the whole request 142.9 s vs
+                # 109.3 s. The price is one extra copy of the prefix in host memory (2.5 GB at 163k),
+                # which is why this is a launch-time decision and not an engine default.
+                env["NINFER_LMCACHE_ASYNC_WRITE"] = "1"
 
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             handle = open(self.log_path, "wb", buffering=0)   # one run, one log
