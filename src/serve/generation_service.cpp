@@ -276,13 +276,12 @@ public:
         // Streaming first: the header carries the state image and one chunk (156 MB), never the run.
         // The import path then hands its reserved extent back through `fill`, so the 2.5 GB never
         // exists twice. NINFER_LMCACHE_STREAM=0 keeps the whole-payload restore for A/B.
-        // Streaming is opt-in until the export type is unified: the header succeeds and the import
-        // then rejects the record because `fill` does not survive the trip from CachedCheckpoint into
-        // the importer's CheckpointExport (measured: cached fill=1, export fill=1, import fill=0), so
-        // enabling it by default would turn every hit into a miss. NINFER_LMCACHE_STREAM=1 turns it on
-        // for whoever finishes that unification.
+        // Streaming by default: the header carries the state image and one chunk (156 MB) and the
+        // importer streams the run into the extent it reserved, so a 2.5 GB prefix is never held
+        // twice. NINFER_LMCACHE_STREAM=0 keeps the whole-payload restore for A/B; a header failure
+        // falls back to it, so a miss costs one extra lookup rather than a lost feature.
         const char* stream_flag = std::getenv("NINFER_LMCACHE_STREAM");
-        const bool want_stream  = stream_flag != nullptr && std::atoi(stream_flag) != 0;
+        const bool want_stream  = !(stream_flag != nullptr && std::atoi(stream_flag) == 0);
         bool streamed           = false;
         if (want_stream && bridge_->restore_header(key, &state)) {
             streamed = true;

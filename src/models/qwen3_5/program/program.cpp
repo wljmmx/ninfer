@@ -269,15 +269,11 @@ std::optional<CheckpointHandle> Program::import_checkpoint_current_layout(
     const CheckpointExport& kv, const std::vector<std::string>& state_shards,
     std::shared_ptr<const detail::PreparedCaptureBacking> identity, const PrefixShortlistKey* key,
     std::string* error) {
-    // The public and the internal CheckpointExport are two types; export_checkpoint copies field by
-    // field for the same reason, so do the same rather than passing one as the other.
-    detail::CheckpointExport raw;
-    raw.frontier   = kv.frontier;
-    raw.page_count = kv.page_count;
-    raw.page_bytes = kv.page_bytes;
-    raw.epochs     = kv.epochs;
-    raw.kv_bytes   = kv.kv_bytes;
-    return impl_->import_checkpoint_current_layout(raw, state_shards, std::move(identity), key,
+    // One type now, so it passes straight through. This used to rebuild a detail::CheckpointExport
+    // field by field because the two were separate types -- and that hand-written list is exactly
+    // what dropped `fill`: a streamed record arrived at the importer with its payload source empty,
+    // so the engine rejected a record the cache had already downloaded.
+    return impl_->import_checkpoint_current_layout(kv, state_shards, std::move(identity), key,
                                                    error);
 }
 

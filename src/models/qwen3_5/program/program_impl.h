@@ -241,19 +241,14 @@ struct CheckpointState {
 };
 
 // What a checkpoint export hands back: the Host bytes of its KV prefix, page by page, with the
-// per-page content epoch so a caller can tell whether a page changed under it. State images are not
-// included yet -- they live behind a different store and the import side does not exist.
-struct CheckpointExport {
-    std::uint32_t frontier   = 0;
-    std::uint32_t page_count = 0;
-    std::size_t page_bytes   = 0;
-    std::vector<std::uint32_t> epochs;
-    std::vector<std::byte> kv_bytes;
-    // Payload written on demand by an external producer (a cache restore). When set, the importer
-    // hands it the destination extent and never reads kv_bytes, so a 2.5 GB prefix is written once.
-    // The export direction -- capture for a store -- leaves it empty.
-    std::function<bool(std::span<std::byte> destination, std::string* error)> fill;
-};
+// per-page content epoch so a caller can tell whether a page changed under it.
+//
+// ONE definition, and it is the public one. There used to be a second struct with these same fields
+// here in `detail`, and the two were bridged by a per-field copy at the import call: a member added
+// to the public type simply did not arrive, which is exactly how a streamed payload was handed over
+// with `fill` set at the caller and empty at the importer. Two copies of a struct that must agree are
+// a guarantee that they will eventually disagree; the name now points at the single type.
+using CheckpointExport = ninfer::models::qwen3_5::CheckpointExport;
 
 struct CheckpointSlot {
     std::optional<CheckpointState> value;

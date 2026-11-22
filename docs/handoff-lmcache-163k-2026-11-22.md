@@ -292,18 +292,29 @@ else         { std::memcpy(view.data(), kv.kv_bytes.data(), expected); }
 | `resource_manager.h` | `page_count` 可由来源提供；`fill` 透传；不再要求 `kv_bytes` 非空 |
 | `lmcache_bridge.h` | `split_parts()` 统一分片规则；`restore_split_into(span)` 成为唯一实现，`restore_split(vector)` 只是它的分配包装；新增 `restore_header()`（只取 state 和图页数）与 `restore_into(span)`（写进调用方缓冲） |
 
-### 4.8.4 还差最后一处接线（尚未启用）
+### 4.8.4 接线完成（2026-11-22 深夜）
 
-`generation_service.cpp` 的 `restore_prefix()` 仍是"`restore()` 一次拿全部"。要启用流式，它要变成：
+流式已成为默认路径。实测 163k：
 
-1. `restore_header()` 取 state（156 MB）→ `decode_state_object` 得 `valid_tokens`
-2. 用 `plan_restore` 算 `page_count`，写进 `CachedCheckpoint::page_count`
-3. 设 `fill`：`restore_into(dest.first(kv_bytes_total))`，再把 state 里的 tail（≤2 MB）拷到 `dest` 尾部
-4. 不再填 `kv_bytes`
+```
+[lmcache] header: state 155920388 B in 1.240 s
+[lmcache] header: 1278 chunk(s) + 1966080 tail B -> 2558 page(s), streamed
+[lmcache] fill enter: dest 2514616320 B, kv 2512650240 B, tail 1966080 B
+163k: 16.3 s | cache_n 163680
+```
 
-tail 必须由 `fill` 写，因为 `page_count` 把 tail 也算进页数里；这是接线时唯一容易错的地方。
+32k 同样：`header: 255 chunk(s) + tail -> 512 page(s)`，`fill enter: dest 503316480 B`，`cache_n 32751`，端到端 7.4 s。
 
-**当前状态**：接口齐全、行为不变（`fill` 为空，走原路径），已随全量重编验证编译与门禁。启用开关留作 `NINFER_LMCACHE_STREAM`，接线完成后再默认打开。
+**接线时唯一的坑**：`Program` 是 pimpl 包装类，`program.cpp` 里为了跨"公开 CheckpointExport / detail CheckpointExport"两个类型，逐字段手抄了 5 个成员：
+
+```cpp
+detail::CheckpointExport raw;
+raw.frontier = kv.frontier;  // …5 个字段…
+```
+
+新加的 `fill` 不在这个清单里，于是"调用方 fill=1、importer fill=0"。修法是把两个类型合并成一个（`program_impl.h` 里 `using CheckpointExport = qwen3_5::CheckpointExport;`）并让转发直接透传。**这类重复定义+手工字段拷贝，是任何新增字段都会踩的坑**，所以合并而不是补一行。
+
+`NINFER_LMCACHE_STREAM=0` 可回退到整份载荷路径；header 失败也会自动回退。
 
 ## 5. 环境与入口
 
