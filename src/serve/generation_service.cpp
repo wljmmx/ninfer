@@ -381,9 +381,11 @@ public:
             out.page_count = static_cast<std::uint32_t>((kv_total + tail.size()) / page_bytes_);
             out.fill       = [this, key, kv_total, tail](std::span<std::byte> dest,
                                                    std::string* error) {
-                std::fprintf(stderr, "[lmcache] fill enter: dest %zu B, kv %zu B, tail %zu B\n",
-                             dest.size(), kv_total, tail.size());
-                std::fflush(stderr);
+                if (std::getenv("NINFER_LMCACHE_PROBE") != nullptr) {
+                    std::fprintf(stderr, "[lmcache] fill enter: dest %zu B, kv %zu B, tail %zu B\n",
+                                 dest.size(), kv_total, tail.size());
+                    std::fflush(stderr);
+                }
                 std::lock_guard<std::mutex> fill_guard(bridge_mutex_);
                 if (kv_total + tail.size() > dest.size()) {
                     if (error != nullptr) { *error = "destination is smaller than the record"; }

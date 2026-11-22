@@ -537,8 +537,11 @@ private:
         const std::size_t part_chunk_bytes = chunk_bytes();
 
         // How many parts may hold a payload at once. Bandwidth scales with this, peak memory with it
-        // too: 4 x 600 MB in flight was enough to fail the allocation above.
-        std::size_t inflight = 2;
+        // too: 4 x 600 MB in flight was enough to fail the allocation above. Measured with the
+        // streaming path at 163k: four parts together restore in 8.45 s against 11.9 s for two at a
+        // time, so the default is four -- the part count is already capped at four by the read-lock
+        // reservation, which means this is the whole payload and no more.
+        std::size_t inflight = 4;
         if (const char* text = std::getenv("NINFER_RESTORE_INFLIGHT")) {
             const int parsed = std::atoi(text);
             if (parsed > 0) { inflight = static_cast<std::size_t>(parsed); }
@@ -678,9 +681,12 @@ private:
         const bool sized = (dest.empty() || dest.size() == want_kv) &&
                            (state == nullptr || state->size() == want_state);
         std::fprintf(stderr,
-                     "[lmcache] restore split=%d total %.3f s | kv %zu/%zu B, state %zu/%zu B%s\n",
+                     "[lmcache] restore split=%d total %.3f s | kv %zu/%zu B, state %s%s\n",
                      parts, total, dest.size(), want_kv,
-                     state != nullptr ? state->size() : 0, want_state, sized ? "" : "  SIZE MISMATCH");
+                     state != nullptr ? (std::to_string(state->size()) + "/" +
+                                         std::to_string(want_state) + " B").c_str()
+                                      : "n/a (streamed)",
+                     sized ? "" : "  SIZE MISMATCH");
         std::fflush(stderr);
         if (!sized) {
             error_ = "restore split reassembled the wrong size";
