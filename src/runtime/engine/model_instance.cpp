@@ -2131,9 +2131,18 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         // the same invariant the pool-capacity read below already relies on. Reading through the
         // pointer unconditionally is what turned "NINFER_EXPERT_CACHE_MB set on a dense model"
         // into a null dereference (V10-68, measured with the 27B and any non-zero value).
+        // A dense artifact has no routed bank, so it has no pool and no layer-level host fetch:
+        // the whole-step graph is legal there, and `every_layer` has to say so. Requiring a pool
+        // skipped the capture for EVERY dense model with a message about a pool it does not have --
+        // measured 2026-11-22 on this 27B dense artifact: `[graph] skipped: layer needs host fetch`,
+        // graph off, and the prefill paid ~350 ms per chunk in per-kernel submission (submit 28.3 s
+        // over ~80 chunks).
         const bool every_layer =
-            instance->expert_cache != nullptr && instance->expert_cache->can_hold_every_layer();
-        if (every_layer) { instance->expert_cache->preload_all(); }
+            instance->expert_cache == nullptr ||
+            instance->expert_cache->can_hold_every_layer();
+        if (every_layer && instance->expert_cache != nullptr) {
+            instance->expert_cache->preload_all();
+        }
         // P6/step 4 + the default-on rule: the construction decision asks the controller's rule
         // (PolicyController::want_graph) instead of hard-coding a capacity or profit threshold.
         // Before the first layer has run nothing is measured, and the rule now answers "on" there:
