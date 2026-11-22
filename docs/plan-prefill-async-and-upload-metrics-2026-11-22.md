@@ -138,10 +138,13 @@ req#1 done | submit 27.1s devwait 1m13.0s boundary 3.2s | 120.4 s | 1611 tok/s
    都是 0.0 ms，不是嫌疑。
 2. **prefill 不做图捕获**（`text.cpp:3038` 注释 "A chunk is never graph captured"），所以整步图
    修复只对 decode 生效——这解释了为什么图开了 `submit` 仍 27 s。
-3. **相位计量重复计入**：`prefill_impl` 尾部已经 `ctx_.synchronize()`，`advance_prefill` 末尾
-   又 `timing.begin_wait()` 记 devwait 73 s；`submit + devwait + boundary ≈ engine-wall`，
-   两个相位在分摊同一段 GPU 时间。**先修计量再看优化比例**，判据：
-   `submit + devwait + boundary ≈ engine-wall ±5%` 且不超 100%。
+3. **相位计量没有重复计入（已核对并更正）**：`submit 27.1 + devwait 73.0 + boundary 3.2 = 103.3 s`
+   对 `engine-wall 101.6 s`，差 1.7%（≈1.7%），属 prepare/记账误差。`prefill_impl` 尾部的
+   `ctx_.synchronize()` 归入 chunk 自己的 devwait，`advance_prefill` 末尾那次 `begin_wait` 几乎
+   不耗时，两者相加等于真实 GPU 时间。**不要**按"重复计入"去改计量代码。
+   真正的缺口是 chunk 之外的约 150 ms（`submit 340 ms/chunk - chunk 内 host 190 ms`），
+   位置在 `advance_prefill` 循环里 chunk 调用之后到下一轮开始之间（`work_.reset()`、staged 推进、
+   capture 判定），需单独打点。
 4. 之后再做 **prefill 层栈按形状捕获**（key = `(len, bank)`，参照 `ffn.cpp:814-926` 的
    `LayerGraphs`），目标把那 190 ms/chunk 压下去；验收 `submit < 8 s`、`prefill ≥ 1.9k tok/s`。
 
