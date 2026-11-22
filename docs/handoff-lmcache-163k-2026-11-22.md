@@ -101,10 +101,10 @@ Failed to read prefetched object ObjectKey(... object_group_id=1 ...) from L1 st
 | 项 | 状态 |
 |---|---|
 | 16k 恢复 | ✅ `cache_n` 100%，restore 1.72 s |
-| 32k 恢复 | ✅ `cache_n 32751`（99.98%），split=4 恢复 3.49 s，端到端 9.4 s |
+| 32k 恢复 | `cache_n 32751`（99.98%），split=4 恢复 **3.081 s**（每片 1.4 s），端到端 **5.1 s** |
 | 163k 写入 | ✅ 38 片，每片 0.42–1.24 s |
 | 163k 服务端读取 | ✅ 2.81 s / 2.67 GB 编码完成 |
-| 163k 客户端分片读取 | ✅ 4 片全部成功，`restore split=4 total 15.875 s`，`cache_n 163680`，端到端 24.1 s |
+| 163k 客户端分片读取 | ✅ 4 片各 6.0–6.3 s，`restore split=4 total 13.115 s`，`cache_n 163680`，端到端 **16.7 s** |
 
 第 4.1 节里的三个障碍最终是这样解掉的：**state 读锁**在 `243f95a` 上不成立（4 片都读到）；**内存**不是靠 `wsl --shutdown`，而是停掉已无用的 dev243 服务端（6556，占 13.1 GB）——生产 L1 数据因此没有被清空；**单条 2.67 GB 消息**用分片绕开，未再深究。
 
@@ -161,13 +161,29 @@ Failed to read prefetched object ObjectKey(... object_group_id=1 ...) from L1 st
 
 配套规则（都是实测出来的）：
 
-- **分片数** ≈ `ceil(KV 字节 / 250 MB)`，上限 4。上限来自 state 的读锁：一次 prefetch 预留给 4 个读者，第 5 片会 `KEY_NOT_READABLE`。
+- **分片数** ≈ `ceil(KV 字节 / 128 MB)`，上限 4。128 MB 是实测出来的：503 MB 分两片要 8.96 s，分四片 3.081 s（state 每片重传 156 MB，片太大就把时间花在 socket 上）；2.51 GB 分四片 13.1 s。上限来自 state 的读锁——一次 prefetch 预留给 4 个读者，第 5 片会 `KEY_NOT_READABLE`。
 - **单片上限 ~600 MB**：657 MB 走单条消息要 5.07–5.9 s，2 片并行约 2.5 s，4 片 3.49 s。
 - **store 分片 64 MB**：512 MB 一片时服务端要 10 s/片（无 key 缓存时）/ 2.5 GB 单条要 64.7 s；64 MB 每片 0.42–1.24 s。
 - **L1 ≥ KV + 1 GB 余量**：4 GB L1 装 163k 的 2.55 GB 会挤出，1244/1278 个 chunk 读不到；6 GB 正常。
 - **客户端接收超时 ≥ 30 s**：32k 的 657 MB 单消息就要 5.2–5.9 s，5 s 的旧默认必然失败。
 
 物理内存估算：`capacity x 15360 + 1536 MiB slack + 15.6 GiB 权重`。163k 约 20 GB，256k 约 21.5 GB。
+
+## 4.5 部署坑：R 盘上名字差一个 `n` 的两个 exe（2026-11-22 晚）
+
+`R:\infer-release-20261119\` 里同时存在：
+
+```
+infer-serve.exe    404512256 B   ← 缺 n，启动脚本一直指向它
+ninfer-serve.exe   404512256 B   ← 正确命名（构建产物就叫 ninfer-serve.exe）
+```
+
+重新编译后把产物复制到“当时正在用的那个名字”，而脚本指向另一个，结果就是：**代码改了、obj 重编了、哈希也校验一致，运行时行为仍是旧的**。今晚在这个坑上丢了两小时，表现为“新增的探针一条都不打印、默认值仍是 512 MB”。
+
+现在规定：
+1. 构建产物是 `build-win\apps\ninfer-serve.exe`，部署目标**只能是** `R:\infer-release-20261119\ninfer-serve.exe`。
+2. 复制后必须比对 SHA256（`Copy-Item` 在本机曾出现“返回成功但内容未变”）。
+3. `generation_service.cpp` 启动时无条件打印一行 `[lmcache] BUILD TAG ...`，包含 store part 字节数；**任何测量之前先看这一行**，它回答“跑的是不是这个构建”。
 
 ## 5. 环境与入口
 

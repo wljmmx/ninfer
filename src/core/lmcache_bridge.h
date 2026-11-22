@@ -277,10 +277,11 @@ public:
         //
         // Sizing follows the payload, not the machine, because the two costs pull opposite ways: an
         // extra part costs a connection and re-sends the state image (156 MB, fixed), while leaving a
-        // large run on one socket serialises it. Measured against 243f95a: 657 MB as one message
-        // 5.2-5.9 s, 503 MB over four parts 3.49 s, 2.51 GB over four parts 15.9 s. One part per
-        // ~250 MB, capped at four -- the prefetch reservation that serves the shared state object
-        // carries four read locks (four parts all read it; the fifth would lose the race).
+        // large run on one socket serialises it. Measured against 243f95a: 503 MB over two parts
+        // 8.96 s, over four parts 3.49 s (the state image is re-sent per part, so a part that is too
+        // big loses more to the socket than it saves in copies); 2.51 GB over four parts 15.9 s.
+        // One part per ~128 MB of KV, capped at four -- the prefetch reservation that serves the
+        // shared state object carries four read locks (four parts all read it; a fifth would lose).
         int parts = 1;
         const char* split_text = std::getenv("NINFER_RESTORE_SPLIT");
         const int from_env = split_text != nullptr ? std::atoi(split_text) : 0;
@@ -292,7 +293,7 @@ public:
             const std::size_t chunk = static_cast<std::size_t>(config_.chunk_tokens());
             if (chunk != 0 && chunk_bytes() != 0) {
                 const std::size_t bytes = (key.tokens.size() / chunk) * chunk_bytes();
-                constexpr std::size_t kPartTarget = 250ULL * 1024 * 1024;
+                constexpr std::size_t kPartTarget = 128ULL * 1024 * 1024;
                 const std::size_t wanted = (bytes + kPartTarget - 1) / kPartTarget;
                 parts = static_cast<int>(std::min<std::size_t>(4, std::max<std::size_t>(1, wanted)));
             }
