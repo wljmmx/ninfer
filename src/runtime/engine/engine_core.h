@@ -2354,7 +2354,27 @@ private:
         const auto cancellation =
             owner ? CancellationFlagView{&owner->cancelled} : CancellationFlagView{};
         auto progress = instance_.program->poll_context(cancellation);
-        if (!progress.complete) { return progress.advanced; }
+        if (!progress.complete) {
+            // Watchdog: nothing else will ever time a stuck materialization out, and the lane stays
+            // occupied meanwhile (`running 0 | materializing 1` is what it looks like from outside).
+            constexpr std::uint64_t kMaterializeTimeoutMs = 120000;
+            if (materializing_ && materializing_since_ms_ != 0 &&
+                monotonic_ms() - materializing_since_ms_ > kMaterializeTimeoutMs) {
+                const auto request = materializing_->request;
+                materializing_.reset();
+                materializing_since_ms_ = 0;
+                complete_error(
+                    request,
+                    std::make_exception_ptr(RequestError(
+                        RequestErrorKind::Unavailable,
+                        "context materialization stalled for " +
+                            std::to_string(kMaterializeTimeoutMs / 1000) +
+                            " s (no progress from the binding path)")));
+                request_admission_check();
+                return true;
+            }
+            return progress.advanced;
+        }
         record_context_work(progress, owner);
         if (owner && progress.request_timings) {
             owner->generation_timings = *progress.request_timings;
@@ -2956,6 +2976,7 @@ private:
                 if (admit_probe) { ++admit_probe_ok_; }
                 materializing_.emplace(
                     MaterializingRequest{request, LaneId{*lane}, begin, restoring, choice});
+                materializing_since_ms_ = monotonic_ms();
                 admission_decision_.reset();
                 if (!restoring) {
                     finish_source_wait(request, binding_started);
@@ -3990,6 +4011,11 @@ private:
     std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<MaterializingRequest> materializing_;
+    // When the current materialization started. A materialization that neither completes nor
+    // advances is a hang: measured 2026-11-23, `materializing 1` with 0% host for minutes after a
+    // cold 163k request. The lane is held for the whole time and nothing times it out, so a
+    // watchdog here is the only exit.
+    std::uint64_t materializing_since_ms_ = 0;
     std::optional<AdmissionDecision> admission_decision_;
     std::uint64_t admission_generation_ = 1;
     std::array<std::optional<CaptureDecision>, kMaximumConcurrency> capture_decisions_;
