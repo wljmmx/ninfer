@@ -176,12 +176,21 @@ req#1 done | submit 27.1s devwait 1m13.0s boundary 3.2s | 120.4 s | 1611 tok/s
 submit 28.0 s（关闭时 28.3 s）| 总 108.2 s（关闭时 109.7 s）| 1580 vs 1560 tok/s
 ```
 
-**没有收益，且不是噪声能解释的差异**，说明 key 从未命中：prefill 的 workspace 每 chunk 轮换
-缓冲区（`LayerGraphs` 的注释也记录了同样的现象："three distinct pointer sets cycling"），
-地址做 key 就等于每次重新捕获。方案已回滚。
+**没有收益，且不是噪声能解释的差异**。但**原因不是我先前写的"地址轮换"**——加了指针探针后实测
+同一长度的连续 chunk 地址完全稳定：
 
-要继续这条路，必须先把"按地址"换成"按形状"（len + 层配置），并且保证捕获区间里的缓冲区地址
-**固定**（专属 prefill workspace，不复用 arena 轮换）——这是前提，不是优化。
+```
+[pfkey] cursor=0     len=2048 x=...4000 pos=...2000 ids=...0000
+[pfkey] cursor=2048  len=2048 x=...4000 pos=...2000 ids=...0000
+[pfkey] cursor=4096  len=2048 x=...4000 pos=...2000 ids=...0000
+```
+
+所以 key 本应命中；没有收益说明**捕获本身没有生效**（大概率 `cudaStreamEndCapture` 失败后回落到
+"捕获 + 执行"）。QSA 里那两处 `cudaStreamSynchronize`（`prepare_launch.cu:186/238`）只存在于
+`NINFER_QSA_E8_TRACE` / `NINFER_QSA_V_SRC_TRACE` 诊断开关下，默认不执行，不是原因。
+
+下一步要先给捕获加失败打印（`cudaStreamEndCapture` 的返回值 + `cudaGraphInstantiate` 的结果），
+确认是"不可捕获"还是"捕获了但没命中"。
 
 ## 已知的其它结论（不要重复踩）
 
