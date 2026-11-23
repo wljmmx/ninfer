@@ -3933,14 +3933,41 @@ private:
                             std::lock_guard lock(queue_mutex_);
                             waiting = pending_.size() + (materializing_.has_value() ? 1U : 0U);
                         }
+                        // Bound lanes that have not begun their prompt: they are exactly the rows a
+                        // held pass would carry, and they are invisible to `prefill_remaining`
+                        // until they are staged, which is why the fit never sees them.
+                        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                            const auto& resident = slots_[lane];
+                            if (resident == nullptr || resident->is_prefilling()) { continue; }
+                            if (resident->model_state == EngineRequestState::DecodeReady ||
+                                resident->model_state == EngineRequestState::ModelFinished) {
+                                continue;
+                            }
+                            ++waiting;
+                        }
                         control.observe_prefill_waiting(static_cast<std::uint32_t>(waiting));
+                        prefill_merge_waiting_ = waiting;
                         control.observe_prefill_fit(static_cast<std::uint32_t>(queued),
                                                     fit.merged_ms, fit.separate_ms);
+                        // The flip is applied here: this thread owns the criterion, the executor and
+                        // the dispatch, so it does not need the parameter bus (whose tick only the
+                        // expert-stream path advances). The actuator records for the panel.
+                        const bool want = control.want_prefill_merge();
+                        if (want != prefill_merge_active()) {
+                            if (++prefill_merge_agree_ >= 2U) {
+                                prefill_merge_agree_ = 0;
+                                if (!prefill_merge_pinned_) {
+                                    (void)apply_prefill_merge(want ? 1.0 : 0.0);
+                                    control.note_prefill_merge(
+                                        want, want ? "fit: one pass cheaper" : "fit: rows apart cheaper");
+                                }
+                            }
+                        } else {
+                            prefill_merge_agree_ = 0;
+                        }
                         // The decision is driven HERE, not from PolicyController::step(): that runs
                         // on the expert-stream path, which a dense model never enters, so a dense
-                        // engine would observe the fit and never act on it. This thread is also the
-                        // one that attached the bus applier, so the write lands on the right bus.
-                        control.drive_prefill_merge(!prefill_merge_pinned_);
+                        // engine would observe the fit and never act on it.
                     }
                 }
                 if (prefill_batch_report_) {
@@ -3952,15 +3979,21 @@ private:
                         prefill_batch_reports_ % 32 == 0) {
                         std::fprintf(stderr,
                                      "[prefill-batch] queued=%zu pick=%d lanes=%zu "
-                                     "merged=%.0fms separate=%.0fms | engine_prefill=%zu "
-                                     "capture_held=%zu bound_ready=%zu | admit calls=%llu "
-                                     "tx_busy=%llu no_lane=%llu ok=%llu\n",
+                                     "merged=%.0fms separate=%.0fms | merge=%d waiting=%u |",
                                      queued, fit.width, fit.lanes, fit.merged_ms,
-                                     fit.separate_ms, engine_state, capture_held, bound_ready,
-                                     static_cast<unsigned long long>(admit_probe_calls_),
-                                     static_cast<unsigned long long>(admit_probe_tx_busy_),
-                                     static_cast<unsigned long long>(admit_probe_no_lane_),
-                                     static_cast<unsigned long long>(admit_probe_ok_));
+                                     fit.separate_ms, prefill_merge_active() ? 1 : 0,
+                                     static_cast<unsigned>(prefill_merge_waiting_));
+                        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                            const auto& resident = slots_[lane];
+                            std::fprintf(stderr, " l%u[%d/%d/rem%u/%d]", lane,
+                                         resident != nullptr ? 1 : 0,
+                                         resident != nullptr && resident->is_prefilling() ? 1 : 0,
+                                         instance_.program->prefill_remaining(lane),
+                                         resident != nullptr
+                                             ? static_cast<int>(resident->model_state)
+                                             : -1);
+                        }
+                        std::fprintf(stderr, "\n");
                         std::fflush(stderr);
                     }
                     if (prefill_batch_verbose_) {
@@ -4180,6 +4213,12 @@ private:
     bool prefill_merge_pinned_        = prefill_merge_from_env_ || prefill_admit_from_env_;
     std::atomic<bool> prefill_merge_enabled_{false};
     std::atomic<bool> prefill_admit_first_{false};
+    // Last count of requests with prefill work that no row of a pass has picked up yet; printed by
+    // the prefill report, which is how the merge bootstrap is observed.
+    std::size_t prefill_merge_waiting_ = 0;
+    // Consecutive passes that asked for the same flip; two is enough because the state it reacts to
+    // lasts only a few passes per request burst.
+    std::uint32_t prefill_merge_agree_ = 0;
     // v8 13.4 item 4, second half: opt-in joiner pacing. NINFER_PREFILL_ADMIT_FIRST holds the
     // prefill until every queued joiner is bound; this knob holds a *new* joiner when the
     // merge-window column budget has no room for it, so it does not bind into a pass it cannot

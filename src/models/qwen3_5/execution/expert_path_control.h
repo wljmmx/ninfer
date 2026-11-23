@@ -374,6 +374,18 @@ public:
         return false; // concurrent in force, healthy: keep it
     }
 
+    // 13.5: the engine applies the decision on the thread that owns both the criterion and the
+    // dispatch, so the actuator records rather than publishes. The parameter bus stays the record
+    // for the knobs that outlive a pass (pool size, KV edge, the serial gate); this one is
+    // recomputed every pass from arithmetic the engine already holds, and routing it through the
+    // bus would make it depend on a tick that only the expert-stream path advances.
+    void note_prefill_merge(bool enabled, const char* reason) {
+        prefill_merge.enabled = enabled;
+        prefill_merge.reason  = reason;
+        prefill_merge.wired   = true;
+        prefill_merge.agree   = 0;
+    }
+
     // 13.5: merge when a rectangle exists and one pass prices cheaper than the rows apart. A 5%
     // margin keeps a wash from flapping; with no measurement yet the current state is held, so a
     // freshly started engine does not merge before it has a fit to merge on.
@@ -400,9 +412,10 @@ public:
             actuator.agree = 0;
             return;
         }
-        // Eight agreeing dispatches rather than 32 layers: this decision is recomputed on every
-        // scheduling pass, not once per layer.
-        if (++actuator.agree < 8U) { return; }
+        // Two agreeing dispatches, not 32 layers: this decision is recomputed on every scheduling
+        // pass, and the bootstrap state (two requests, one row) lasts only a few passes per burst -
+        // a longer run would let the burst end before the switch ever moved.
+        if (++actuator.agree < 2U) { return; }
         const bool was   = actuator.enabled;
         actuator.enabled = want;
         actuator.agree   = 0;
