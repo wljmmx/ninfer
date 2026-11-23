@@ -376,6 +376,7 @@ public:
         checkpoint_release_resources(std::span<const CheckpointHandle>,
                                      runtime::ContextResourceUsage) const;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
+    void reclaim_retired() noexcept;
     void refresh_history_requirements(const std::shared_ptr<KVHistory>&, bool trim_unused = false);
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;

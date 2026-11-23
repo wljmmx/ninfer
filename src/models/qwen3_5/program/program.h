@@ -568,6 +568,10 @@ public:
                              std::span<const CheckpointHandle> surviving) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle checkpoint) noexcept;
+    // docs/design-kv-address-lifecycle.md step 3: give back every KV address that was retired and
+    // whose last reference is gone. Cheap when nothing retired, safe at any time, so the engine
+    // calls it once per scheduling pass instead of waiting for an idle window.
+    void reclaim_retired() noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState& paused) noexcept;
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.

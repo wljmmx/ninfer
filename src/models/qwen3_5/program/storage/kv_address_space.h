@@ -273,6 +273,10 @@ public:
             return std::nullopt;
         }
         address.occupied = true;
+        // Steps 1-3: allocation is the only transition into Reserved, and it hands out the one
+        // reference every owner holds until it retires or releases the address.
+        address.state    = Address::State::Reserved;
+        address.refs     = 1;
         return KVAddressSpaceHandle(this, index, address.generation);
     }
 
@@ -290,8 +294,10 @@ public:
                                    std::span<const LogicalKVPageHandle> pages) {
         if (!valid(handle) || pages.empty()) { return false; }
         Address& address = require(handle);
-        if (address.active || address.row || address.reservation.valid() ||
-            address.page_count != 0) {
+        // Steps 1-3: only a fresh, unbound address may be given membership. Retired is final until
+        // the slot is reclaimed; Free never belongs to a live handle.
+        if (address.state != Address::State::Reserved || address.active || address.row ||
+            address.reservation.valid() || address.page_count != 0) {
             return false;  // only a brand-new address may be given membership
         }
         if (pages.size() > page_capacity_) { return false; }
@@ -338,6 +344,11 @@ public:
                        std::int32_t execution_row,
                        std::optional<std::uint32_t> activation_frontier = std::nullopt) {
         Address& address = require(handle);
+        if (address.state == Address::State::Retired || address.state == Address::State::Free) {
+            // Steps 1-3: retirement is final for binds. The existing exception type is kept so the
+            // caller's error handling does not change; the message names the lifecycle fact.
+            throw std::logic_error("KV address space is retired or unallocated");
+        }
         if (address.active || address.row || address.reservation.valid() ||
             growth_pages > page_capacity_ ||
             (activation_frontier && *activation_frontier > address.committed_frontier)) {
@@ -382,6 +393,9 @@ public:
             throw std::logic_error("KV activation reservation address is stale");
         }
         Address& address = require(activation.address_);
+        if (address.state == Address::State::Retired || address.state == Address::State::Free) {
+            throw std::logic_error("KV address space is retired or unallocated");
+        }
         if (address.active || address.row || address.reservation.valid() ||
             activation.growth_pages_ > page_capacity_ - address.page_count ||
             (activation.activation_frontier_ &&
@@ -411,6 +425,7 @@ public:
         // appendix GC (FZ layer 0): a new sequence starts with nothing retired.
         address.eviction_frontier = 0;
         address.active    = true;
+        address.state     = Address::State::Active;
         activation.owner_ = nullptr;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
@@ -436,6 +451,9 @@ public:
         address.row.reset();
         address.reservation.release();
         address.active = false;
+        // Steps 1-3: unbinding returns the address to Reserved, not to Retired. It still belongs to
+        // its history and may be bound again; only retire() ends that.
+        address.state  = Address::State::Reserved;
     }
 
     [[nodiscard]] KVPrefixForkReservation
@@ -444,6 +462,10 @@ public:
                         std::int32_t execution_row) {
         Address& source      = require(source_handle);
         Address& destination = require(destination_handle);
+        if (source.state != Address::State::Reserved ||
+            destination.state != Address::State::Reserved) {
+            throw std::logic_error("KV retained-prefix endpoint is not bindable");
+        }
         if (source.active || source.row || source.reservation.valid()) {
             throw std::logic_error("KV retained-prefix source is still active");
         }
@@ -529,7 +551,8 @@ public:
         Address& destination               = require(fork.destination_);
         const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
         const std::uint32_t growth         = fork.growth_pages_;
-        if (!fork.row_ || destination.active || destination.row ||
+        if (destination.state != Address::State::Reserved ||
+            !fork.row_ || destination.active || destination.row ||
             destination.reservation.valid() || destination.page_count != 0 ||
             fork.page_reservation_.pages() != growth) {
             throw std::logic_error("KV prefix-fork destination changed before publication");
@@ -575,6 +598,7 @@ public:
         destination.row.emplace(std::move(*fork.row_));
         fork.row_.reset();
         destination.active = true;
+        destination.state  = Address::State::Active;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             pages_->retain_active_reference(membership(destination, page));
         }
@@ -663,7 +687,8 @@ public:
                                KVAddressSpaceHandle destination_handle, std::uint32_t frontier) {
         const Address& source      = require_active(source_handle);
         const Address& destination = require(destination_handle);
-        if (destination.active || destination.row || destination.reservation.valid() ||
+        if (destination.state != Address::State::Reserved ||
+            destination.active || destination.row || destination.reservation.valid() ||
             destination.page_count != 0 || destination.committed_frontier != 0 || frontier == 0 ||
             frontier > source.checkpoint_frontier || frontier > source.committed_frontier) {
             throw std::logic_error("active KV prefix-view endpoints are invalid");
@@ -720,7 +745,8 @@ public:
         require_active_prefix_view(view);
         const Address& source = require_active(view.source_);
         Address& destination  = require(view.destination_);
-        if (destination.active || destination.row || destination.reservation.valid() ||
+        if (destination.state != Address::State::Reserved ||
+            destination.active || destination.row || destination.reservation.valid() ||
             destination.page_count != 0 || destination.committed_frontier != 0 ||
             source.committed_frontier < view.frontier_ || view.tail_reservation_.pages() != 0) {
             throw std::logic_error("active KV prefix-view endpoints changed before publication");
@@ -1153,8 +1179,18 @@ public:
         return valid(handle) && addresses_[handle.index_].active;
     }
 
+    // Retired: the address has ended for every bind, but its pages may still be pinned by a live Host
+    // extent or another holder. reclaim_retired() finishes the hand-back once those are gone.
+    [[nodiscard]] bool retired(KVAddressSpaceHandle handle) const noexcept {
+        return valid(handle) && addresses_[handle.index_].state == Address::State::Retired;
+    }
+
     [[nodiscard]] const KVExecutionRowLease& execution_row(KVAddressSpaceHandle handle) const {
         const Address& address = require(handle);
+        // Steps 1-3: a retired address is not a source for execution, whatever its stale row says.
+        if (address.state == Address::State::Retired) {
+            throw std::logic_error("KV address space is retired");
+        }
         if (!address.active || !address.row) {
             throw std::logic_error("KV address space has no execution row");
         }
@@ -1195,16 +1231,24 @@ public:
     [[nodiscard]] bool can_release(KVAddressSpaceHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Address& address = addresses_[handle.index_];
-        if (address.active || address.row || address.reservation.valid()) { return false; }
-        for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
+        // Steps 1-3: only an allocated address that is not bound to a row may go straight back to
+        // the pool, and only while this owner is its last holder. A Retired address is reclaimed
+        // through reclaim_retired(), a Free one has no live handle.
+        if (address.state != Address::State::Reserved && address.state != Address::State::Active) {
+            return false;
         }
-        return true;
+        if (address.active || address.row || address.reservation.valid() || address.refs > 1) {
+            return false;
+        }
+        return can_release_pages(address);
     }
 
     [[nodiscard]] bool can_release_after_deactivate(KVAddressSpaceHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Address& address = addresses_[handle.index_];
+        if (address.state == Address::State::Retired) {
+            return address.refs == 0 && can_release_pages(address);
+        }
         if (!address.active) { return can_release(handle); }
         if (!address.row) { return false; }
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
@@ -1216,27 +1260,100 @@ public:
     }
 
     [[nodiscard]] bool release_after_deactivate(KVAddressSpaceHandle handle) noexcept {
+        if (!valid(handle)) { return false; }
+        if (addresses_[handle.index_].state == Address::State::Retired) {
+            // Steps 1-3: the owner that retired this address is the last one to let go (retire()
+            // only succeeds when no other holder and no checkpoint requirement is left). Finish
+            // the hand-back here so the pages do not wait for a scheduling pass.
+            const std::uint32_t index = handle.index_;
+            if (addresses_[index].refs != 0) {
+                // Another holder still has the address. This caller owes nothing more, but the slot
+                // is NOT free: false says so, and the caller must treat it as "already deferred"
+                // (never as fatal). reclaim_retired() finishes it when the last holder drops.
+                return false;
+            }
+            if (!can_release_pages(addresses_[index])) { return false; }
+            if (!release_address(index)) { return false; }
+            rebuild_checkpoint_protection();
+            return true;
+        }
         if (!can_release_after_deactivate(handle)) { return false; }
         try {
             if (addresses_[handle.index_].active) { deactivate(handle); }
-        } catch (...) { std::terminate(); }
-        if (!release(handle)) { std::terminate(); }
-        return true;
+        } catch (...) { return false; }
+        return release(handle);
     }
 
     [[nodiscard]] bool release(KVAddressSpaceHandle handle) noexcept {
+        // Steps 1-3: the precondition check is the whole safety argument. It runs first, so a
+        // refusal leaves the address untouched instead of half released, and nothing here can
+        // reach std::terminate any more.
         if (!can_release(handle)) { return false; }
-        Address& address = addresses_[handle.index_];
-        for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            if (!pages_->release_reference(membership(address, page), false)) { std::terminate(); }
-        }
-        const std::uint32_t index      = handle.index_;
-        const std::uint32_t generation = next_generation(address.generation);
-        address                        = Address{};
-        address.generation             = generation;
-        free_[free_count_++]           = index;
+        if (!release_address(handle.index_)) { return false; }
         rebuild_checkpoint_protection();
         return true;
+    }
+
+    // ---- KV address lifecycle (docs/design-kv-address-lifecycle.md steps 1-3) -------------------
+    // A lease is an out-of-band reader (a cache write or an export) that must keep the bytes alive
+    // while the owner is already gone. refs is plain because every transition is on the scheduling
+    // thread; acquire/drop are symmetric and neither may terminate.
+
+    void acquire_reference(KVAddressSpaceHandle handle) noexcept {
+        if (!valid(handle)) { return; }
+        ++addresses_[handle.index_].refs;
+    }
+
+    // Returns true when this drop was the one that made the address unreferenced.
+    [[nodiscard]] bool drop_reference(KVAddressSpaceHandle handle) noexcept {
+        if (!valid(handle)) { return false; }
+        Address& address = addresses_[handle.index_];
+        if (address.refs == 0) { return false; }
+        --address.refs;
+        return address.refs == 0;
+    }
+
+    // Ends this address's life for binds: no activation, no fork source, no execution row from
+    // here on. The owner's own reference is the one being given up, so an address that still has
+    // another holder (a checkpoint of the same history, a paused snapshot, a live sequence, an
+    // export lease) or whose checkpoint requirement is still registered is left exactly as it was:
+    // the call returns false and the address keeps working for its remaining owners.
+    [[nodiscard]] bool retire(KVAddressSpaceHandle handle) noexcept {
+        if (!valid(handle)) { return false; }
+        Address& address = addresses_[handle.index_];
+        if (address.state != Address::State::Reserved && address.state != Address::State::Active) {
+            return false;
+        }
+        if (address.active || address.row || address.reservation.valid() ||
+            address.checkpoint_frontier != 0 || address.refs > 1) {
+            return false;
+        }
+        address.refs  = 0;
+        address.state = Address::State::Retired;
+        ++retired_count_;
+        return true;
+    }
+
+    // Gives back every Retired address whose last reference is gone. Per address the page
+    // conditions are checked before any page is released, so a refusal keeps the address Retired
+    // whole instead of half freed. Returns how many addresses went back to Free.
+    [[nodiscard]] std::size_t reclaim_retired() noexcept {
+        // The common case is "nothing has ever retired": one counter compare per scheduling pass,
+        // not a walk over every address slot.
+        if (retired_count_ == 0) { return 0; }
+        std::size_t reclaimed = 0;
+        for (std::uint32_t index = 0; index < addresses_.size(); ++index) {
+            const Address& address = addresses_[index];
+            if (!address.occupied || address.state != Address::State::Retired ||
+                address.refs != 0) {
+                continue;
+            }
+            if (!can_release_pages(address)) { continue; }
+            if (!release_address(index)) { continue; }
+            ++reclaimed;
+        }
+        if (reclaimed != 0) { rebuild_checkpoint_protection(); }
+        return reclaimed;
     }
 
 private:
@@ -1255,6 +1372,17 @@ private:
     using Directory = std::shared_ptr<DirectoryNode>;
 
     struct Address {
+        // docs/design-kv-address-lifecycle.md steps 1-3: an address is a state machine, not a bag of
+        // booleans. `occupied`/`active` stay as the physical facts they always were; `state` is the
+        // lifecycle fact a bind, a release and a reclaim each read, so the three cannot disagree.
+        //   Free -> Reserved (allocate/create_inactive) -> Active (commit_activation)
+        //        -> Reserved (deactivate) -> Retired (retire) -> Free (release / reclaim_retired)
+        enum class State : std::uint8_t { Free, Reserved, Active, Retired };
+        State state = State::Free;
+        // Holders of this address: the allocating owner counts once (set by create_inactive). A
+        // cache write or an export that must finish before the pages go back takes one more. Plain
+        // integer, not atomic: every transition happens on the scheduling thread.
+        std::uint32_t refs                = 0;
         Directory directory;
         std::uint32_t generation          = 1;
         std::uint32_t page_count          = 0;
@@ -1278,6 +1406,34 @@ private:
     [[nodiscard]] static std::uint32_t next_generation(std::uint32_t generation) noexcept {
         ++generation;
         return generation == 0 ? 1 : generation;
+    }
+
+    // Every page of the address must be releasable right now. Kept separate from can_release() so
+    // can_release() and reclaim_retired() share the exact same per-page predicate.
+    [[nodiscard]] bool can_release_pages(const Address& address) const noexcept {
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
+        }
+        return true;
+    }
+
+    // The one place that gives the pages back, resets the header and returns the slot to the free
+    // list with a new generation (so every old handle stays stale). Returns false - leaving the
+    // header intact - if a page refuses a release that can_release_pages() had already allowed;
+    // that can only mean the page set changed under a read-only precheck, never a designed path.
+    [[nodiscard]] bool release_address(std::uint32_t index) noexcept {
+        Address& address = addresses_[index];
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (!pages_->release_reference(membership(address, page), false)) { return false; }
+        }
+        // Leaving the Retired set is part of giving the slot back, wherever the release came from
+        // (release(), release_after_deactivate() or reclaim_retired()).
+        if (address.state == Address::State::Retired && retired_count_ != 0) { --retired_count_; }
+        const std::uint32_t generation = next_generation(address.generation);
+        address                        = Address{};
+        address.generation             = generation;
+        free_[free_count_++]           = index;
+        return true;
     }
 
     void rebuild_checkpoint_protection() noexcept {
@@ -1439,6 +1595,9 @@ private:
     std::vector<LogicalKVPageHandle> materialization_scratch_;
     std::vector<DeviceKVPageHandle> publish_scratch_;
     std::uint32_t free_count_ = 0;
+    // Number of addresses in the Retired state. Kept exact by retire() and release_address(), so a
+    // scheduling pass with nothing retired costs one comparison.
+    std::uint32_t retired_count_ = 0;
 };
 
 inline KVPrefixForkReservation::~KVPrefixForkReservation() {

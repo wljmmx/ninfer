@@ -1510,6 +1510,118 @@ void test_kv_spill_last_copy(ninfer::DeviceContext& device) {
            "last-copy: the fetched bytes match what the reader saw before the spill");
 }
 
+// The address lifecycle (docs/design-kv-address-lifecycle.md): Free -> Reserved -> Active ->
+// Reserved -> Retired -> Free, plus the two properties the design rests on -- a Retired address
+// refuses binds, and reclaim_retired() hands back nothing while a page is still pinned. The pinned
+// case is the one that used to abort the process from KVHistory's destructor.
+void test_kv_lifecycle(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostContextArena host_backing(host_layout.page_stride * 8, host_layout.page_stride);
+    ninfer::HostKVArena host_arena(host_backing, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    // 1. A fresh address that is never bound goes straight back.
+    auto spare = addresses.create_inactive();
+    expect(spare.has_value() && addresses.occupied() == 1 && !addresses.active(*spare) &&
+               !addresses.retired(*spare) && addresses.can_release(*spare),
+           "lifecycle: a fresh address is Reserved, unbound and releasable");
+    expect(addresses.release(*spare) && !addresses.valid(*spare) && addresses.occupied() == 0,
+           "lifecycle: releasing a never-bound address returns the slot");
+
+    // 2. Retired refuses binds, and reclaim gives the slot back.
+    auto ended = addresses.create_active(3, 0, device.stream);
+    expect(ended.has_value(), "lifecycle: active address");
+    addresses.ensure_mapped_to_tokens(*ended, 65, device.stream);
+    device.synchronize();
+    addresses.commit_frontier(*ended, 65);
+    addresses.deactivate(*ended);
+    expect(addresses.retire(*ended) && addresses.retired(*ended) && addresses.valid(*ended),
+           "lifecycle: a deactivated owner can retire its address");
+    expect(!addresses.can_release(*ended),
+           "lifecycle: a Retired address is not releasable by its owner any more");
+    bool bind_rejected = false;
+    try {
+        addresses.activate(*ended, 1, 1, device.stream);
+    } catch (const std::logic_error&) { bind_rejected = true; }
+    expect(bind_rejected, "lifecycle: a Retired address refuses a bind");
+    expect(addresses.reclaim_retired() == 1 && !addresses.valid(*ended) &&
+               addresses.occupied() == 0 && pages.occupied() == 0,
+           "lifecycle: reclaim_retired returns a Retired address with no other holder");
+
+    // 3. A registered checkpoint requirement keeps the address alive.
+    auto guarded = addresses.create_active(3, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*guarded, 65, device.stream);
+    device.synchronize();
+    addresses.commit_frontier(*guarded, 65);
+    addresses.set_checkpoint_requirement(*guarded, 65);
+    addresses.deactivate(*guarded);
+    expect(!addresses.retire(*guarded) && addresses.valid(*guarded) && !addresses.retired(*guarded),
+           "lifecycle: a checkpoint requirement refuses retirement");
+    expect(addresses.reclaim_retired() == 0,
+           "lifecycle: nothing to reclaim while the address is still Reserved");
+    addresses.set_checkpoint_requirement(*guarded, 0);
+    expect(addresses.retire(*guarded) && addresses.reclaim_retired() == 1,
+           "lifecycle: dropping the requirement lets the address retire and be reclaimed");
+
+    // 4. Pinned pages: retire succeeds, reclaim defers, and the next pass finishes it. This is the
+    //    path that used to be std::terminate() inside ~KVHistory when a live Host extent held pins.
+    auto pinned = addresses.create_active(3, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*pinned, 65, device.stream);
+    device.synchronize();
+    addresses.commit_frontier(*pinned, 65);
+    addresses.deactivate(*pinned);
+    const std::array pinned_pages{addresses.logical_page(*pinned, 0),
+                                  addresses.logical_page(*pinned, 1)};
+    auto extent = extents.prepare(pages, pinned_pages);
+    expect(extent.has_value() && pages.source_pins(pinned_pages[0]) == 1,
+           "lifecycle: a Host extent pins the pages it is about to copy");
+    expect(addresses.retire(*pinned), "lifecycle: retirement is allowed while pages are pinned");
+    expect(addresses.reclaim_retired() == 0 && addresses.retired(*pinned),
+           "lifecycle: a pinned Retired address is deferred, not force-freed");
+    extents.abort(*extent);
+    expect(pages.source_pins(pinned_pages[0]) == 0 && addresses.reclaim_retired() == 1 &&
+               !addresses.valid(*pinned),
+           "lifecycle: the deferred reclaim finishes once the pin is gone");
+
+    // 5. A second holder blocks retirement until it drops.
+    auto held = addresses.create_active(3, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*held, 65, device.stream);
+    device.synchronize();
+    addresses.commit_frontier(*held, 65);
+    addresses.deactivate(*held);
+    addresses.acquire_reference(*held);
+    expect(!addresses.retire(*held),
+           "lifecycle: retire refuses while another holder has a reference");
+    expect(!addresses.drop_reference(*held),
+           "lifecycle: the first drop leaves the owner's own reference");
+    expect(addresses.retire(*held) && addresses.reclaim_retired() == 1,
+           "lifecycle: the last holder retires and reclaims");
+    expect(addresses.occupied() == 0 && pages.occupied() == 0,
+           "lifecycle: every slot and page is back at the end");
+}
+
 } // namespace
 
 int main() {
@@ -1525,6 +1637,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_kv_lifecycle(device);
         test_kv_spill_round_trip(device);
         test_kv_spill_reclaim(device);
         test_kv_spill_last_copy(device);

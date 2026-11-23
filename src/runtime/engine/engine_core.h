@@ -3938,6 +3938,13 @@ private:
                     update_recovery(request);
                     executed = true;
                 }
+                // docs/design-kv-address-lifecycle.md step 3: one reclaim per scheduling pass, on
+                // the thread that owns the addresses. It runs before the gauges are published so
+                // the reported occupancy already includes what this pass gave back. An address only
+                // becomes Retired when its owner ends, so with nothing retired this is one counter
+                // compare -- and a Retired address whose pages are still pinned stays Retired for
+                // the next pass instead of aborting the engine.
+                if (instance_.program != nullptr) { instance_.program->reclaim_retired(); }
                 publish_runtime_stats();
             } catch (...) {
                 auto error = std::current_exception();

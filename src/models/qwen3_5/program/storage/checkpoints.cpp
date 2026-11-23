@@ -3,6 +3,8 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <unordered_map>
@@ -38,10 +40,34 @@ bool page_evictable(const LogicalKVPageStore& pages, LogicalKVPageHandle page) {
 
 KVHistory::~KVHistory() {
     if (!owner) { return; }
-    if (backend && !owner->backend_kv_addresses->release_after_deactivate(*backend)) {
-        std::terminate();
-    }
-    if (!owner->text_kv_addresses->release_after_deactivate(text)) { std::terminate(); }
+    // Steps 1-5: ending a history MARKS its addresses Retired; it never kills the process. The old
+    // body called release_after_deactivate() and std::terminate() when that refused, which is the
+    // ucrtbase 0xc0000409: one pinned page (a live Host extent, an in-flight transfer) made the
+    // destructor abort. A refusal now means "not now" -- the address keeps no bindable owner and
+    // the engine's per-pass reclaim_retired() returns the pages once the pin is gone.
+    const auto end_address = [](auto& addresses, const auto& address) {
+        if (!addresses.valid(address)) { return; }
+        if (addresses.release_after_deactivate(address)) { return; }
+        if (addresses.active(address)) {
+            try {
+                addresses.deactivate(address);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[kv] history end: deactivate refused (%s)\n", error.what());
+                return;
+            }
+        }
+        if (!addresses.retire(address)) {
+            // Reported once: a history that ends with a surviving holder is a planning miss, not a
+            // per-request event, and printing it every request would bury the line that matters.
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                std::fprintf(stderr, "[kv] history end: address still held, reclaim deferred\n");
+            }
+        }
+    };
+    if (backend) { end_address(*owner->backend_kv_addresses, *backend); }
+    end_address(*owner->text_kv_addresses, text);
     if (owner->host_kv_extents) { (void)owner->host_kv_extents->release_unreferenced(); }
 }
 
@@ -118,7 +144,13 @@ std::uint32_t ProgramImpl::release_stale_checkpoints(std::uint32_t keep) noexcep
 }
 
 bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
-    if (!checkpoint_releasable(*this, handle)) { return false; }
+    // Steps 1-5: dropping a checkpoint asks only whether the checkpoint itself can go. Whether its
+    // KV address can be given back *right now* is no longer this function's question: the last
+    // holder retires the address, and reclaim_retired() returns the pages when the pins are gone.
+    // Keeping the strict "releasable now" predicate here is what made a pinned page refuse a drop,
+    // and every caller of a refusal terminates -- the same crash through another door.
+    if (!valid_checkpoint(handle) || checkpoints[handle.index].pins) { return false; }
+    if (!state_store->can_release_checkpoint_owner(checkpoint(handle).state)) { return false; }
     auto& slot   = checkpoints[handle.index];
     auto& record = *slot.value;
     try {
@@ -130,12 +162,22 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
         if (++slot.generation == 0) { ++slot.generation; }
         if (!state_store->release_checkpoint_owner(state)) { std::terminate(); }
         refresh_history_requirements(kv, true);
+        // The address is not released here. `slot.value` is gone, so if this local `kv` is the last
+        // holder its destructor retires the address on the way out; any other checkpoint, paused
+        // snapshot or live sequence of the same history keeps it untouched.
         return true;
     } catch (...) { std::terminate(); }
 }
 
 bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept {
     return checkpoint_releasable(*this, handle);
+}
+
+void ProgramImpl::reclaim_retired() noexcept {
+    // docs/design-kv-address-lifecycle.md step 3: the two KV halves retire independently, and each
+    // reclaim is an all-or-nothing walk over its own Retired slots. Nothing here waits for idle.
+    if (text_kv_addresses) { (void)text_kv_addresses->reclaim_retired(); }
+    if (backend_kv_addresses) { (void)backend_kv_addresses->reclaim_retired(); }
 }
 
 ResumeStateImpl::~ResumeStateImpl() {

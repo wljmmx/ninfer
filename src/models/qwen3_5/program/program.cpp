@@ -311,6 +311,8 @@ bool Program::release_checkpoint(CheckpointHandle h) noexcept {
     return impl_->release_checkpoint(h);
 }
 
+void Program::reclaim_retired() noexcept { impl_->reclaim_retired(); }
+
 bool Program::revoke_snapshot(ResumeState& paused) noexcept {
     return impl_->revoke_snapshot(paused);
 }
