@@ -172,6 +172,11 @@ struct RequestRecord {
     const OutputConsumerMode consumer_mode;
     const GenerationObservationOptions observation;
     Clock::time_point deadline;
+    // How many times the engine has moved `deadline` because the lanes ahead were still busy. The
+    // deadline arrives derived from this request's own length, which cannot know what is in front of
+    // it; see extend_pending_deadlines() in engine_core.h. Counted so the extension itself is
+    // bounded and observable.
+    std::uint32_t queue_extensions = 0;
     Clock::time_point submitted;
     std::optional<Clock::time_point> admitted_at;
     std::optional<Clock::time_point> first_token;

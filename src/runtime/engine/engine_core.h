@@ -1337,6 +1337,63 @@ private:
         }
     }
 
+    // A queued request's deadline comes from its own length, which cannot know what stands in front
+    // of it: at submit the engine already stretches the pending timeout by the prompt (measured
+    // `[queue] deadline extended 29975 ms -> 163846 ms (prompt 163687, budget 8)` for the long
+    // request itself), but a 67-token probe has no length to stretch, so it keeps the launch's
+    // pending timeout - 30 s here - and expires while the lane ahead still has a minute and a half
+    // of work. What it cannot see, the engine can: the Program already reports how many prompt tokens
+    // a lane still has to prefill (Q67/S1), which is a measurement rather than an estimate of queue
+    // depth. The extension is bounded twice: at most kMaxQueueExtensions per request, and never past
+    // the 15-minute ceiling the service itself uses.
+    static constexpr std::uint32_t kMaxQueueExtensions = 4;
+
+    void extend_pending_deadlines_locked(Clock::time_point now) {
+        if (pending_.empty()) { return; }
+        // Off switch for the A/B: the comparison is "the same probe behind the same prefill, one
+        // expires and one is admitted", and it has to be the same binary for that to mean anything.
+        if (const char* flag = std::getenv("NINFER_QUEUE_EXTEND"); flag != nullptr &&
+            (std::strcmp(flag, "0") == 0 || std::strcmp(flag, "off") == 0)) {
+            return;
+        }
+        // 1.4-1.6k tok/s measured on this box for a 163k prefill. A lane that is decoding instead
+        // of prefilling still owns its lane for a whole response, so it is charged a flat few
+        // seconds rather than a fraction of a budget this function cannot price.
+        constexpr double kPrefillTokensPerSecond = 1500.0;
+        constexpr double kDecodingLaneSeconds    = 5.0;
+        double ahead                             = 0.0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& other = slots_[lane];
+            if (!other || !other->sequence) { continue; }
+            const std::uint32_t left = instance_.program->prefill_remaining(lane);
+            ahead += left != 0 ? static_cast<double>(left) / kPrefillTokensPerSecond
+                               : kDecodingLaneSeconds;
+        }
+        if (ahead < 1.0) { return; }
+        const bool probe = std::getenv("NINFER_QUEUE_PROBE") != nullptr;
+        // 1.5x the remaining work, with a 30 s floor: a request that is about to be admitted must
+        // not be expired in the step before its lane frees up.
+        const auto extension = std::chrono::milliseconds(
+            std::max<long long>(30000, static_cast<long long>(ahead * 1500.0)));
+        for (auto& request : pending_) {
+            if (request->queue_extensions >= kMaxQueueExtensions) { continue; }
+            const auto next =
+                std::min(now + extension, request->submitted + std::chrono::minutes(15));
+            if (next <= request->deadline) { continue; }
+            ++request->queue_extensions;
+            request->deadline = next;
+            if (probe) {
+                std::fprintf(stderr,
+                             "[queue] req#%llu deadline extended: %.0f s of work ahead, +%lld ms "
+                             "(extension %u)\n",
+                             static_cast<unsigned long long>(request->id), ahead,
+                             static_cast<long long>(extension.count()),
+                             static_cast<unsigned>(request->queue_extensions));
+                std::fflush(stderr);
+            }
+        }
+    }
+
     [[nodiscard]] bool expire_pending_requests() {
         std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<std::shared_ptr<Request>> expired;
@@ -1344,6 +1401,7 @@ private:
         {
             std::lock_guard lock(queue_mutex_);
             const auto now = Clock::now();
+            extend_pending_deadlines_locked(now);
             for (auto it = pending_.begin(); it != pending_.end();) {
                 if ((*it)->cancelled.load(std::memory_order_acquire)) {
                     cancelled.push_back(*it);
