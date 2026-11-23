@@ -171,6 +171,26 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
     } catch (...) { std::terminate(); }
 }
 
+// Checkpoints on the same KV history, `handle` first. A history's pages can only be given back when
+// every checkpoint covering them is released together: one alone leaves the others' frontier in place,
+// and the quote then reaches only the pages above it (measured on a restored 163k prefix: 1 of 2558).
+std::vector<CheckpointHandle>
+ProgramImpl::checkpoints_sharing_history(CheckpointHandle handle) const {
+    std::vector<CheckpointHandle> out;
+    if (!valid_checkpoint(handle)) { return out; }
+    const auto history = checkpoint(handle).kv;
+    if (!history) { return out; }
+    out.push_back(handle);
+    for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
+        const auto& slot = checkpoints[index];
+        if (!slot.value || slot.value->kv != history) { continue; }
+        const CheckpointHandle other{this, index, slot.generation};
+        if (other == handle) { continue; }
+        out.push_back(other);
+    }
+    return out;
+}
+
 bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept {
     const bool releasable = checkpoint_releasable(*this, handle);
     if (releasable || std::getenv("NINFER_KV_LIFECYCLE_PROBE") == nullptr ||

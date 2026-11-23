@@ -1550,17 +1550,30 @@ private:
         ReclaimCursor cursor;
         const auto retained = retained_prefixes(program);
         cursor.retained     = retained.optional;
-        for (const auto handle : victims()) {
+        std::vector<Handle> offered;
+        const auto offer = [&](Handle handle) {
+            if (!program.valid_checkpoint(handle)) { return; }
             // V10-02: two different promises. A pinned prefix is in flight - a request is holding
             // it or Native has leased it - and is never offered. An optional retained prefix is
             // withheld while the pool can still answer from ordinary victims, and offered again in
             // a relaxed pass when it cannot: withholding it absolutely turned a satisfiable request
             // into "cannot reserve its first legal unit" (measured on prefix_real and dense_real).
-            if (contains(retained.pinned, handle)) { continue; }
-            if (!relax_optional && contains(retained.optional, handle)) { continue; }
+            if (contains(retained.pinned, handle)) { return; }
+            if (!relax_optional && contains(retained.optional, handle)) { return; }
+            if (std::find(offered.begin(), offered.end(), handle) != offered.end()) { return; }
+            offered.push_back(handle);
             const auto frontier = program.checkpoint_metadata(handle).frontier;
             cursor.victims.push_back({handle, priority_for(handle),
                                       demand_priority(program.checkpoint_key(handle, frontier))});
+        };
+        for (const auto handle : victims()) {
+            offer(handle);
+            // A KV history's pages are only reachable when every checkpoint covering them is
+            // offered together: a release quote can only reach the suffix above another
+            // checkpoint's frontier, which on a restored 163k prefix measured 1 page out of 2558
+            // and turned the whole prefix into "nothing can be reclaimed". Siblings obey the same
+            // retention rules, so a pinned or still-withheld sibling keeps the group out.
+            for (const auto sibling : program.checkpoints_sharing_history(handle)) { offer(sibling); }
         }
         for (const auto& owner : owners_) {
             cursor.owners.push_back(

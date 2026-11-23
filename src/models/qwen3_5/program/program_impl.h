@@ -372,6 +372,11 @@ public:
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
                                                          std::span<const CheckpointHandle>) const;
     [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
+    // Every live checkpoint that sits on the same KV history as `checkpoint`, itself included.
+    // Releasing a history's pages needs all of them: one checkpoint alone can only give up the
+    // suffix above another's frontier (measured: 1 of 2558 pages on a restored 163k prefix).
+    [[nodiscard]] std::vector<CheckpointHandle>
+    checkpoints_sharing_history(CheckpointHandle checkpoint) const;
     [[nodiscard]] std::optional<runtime::ContextResourceUsage>
         checkpoint_release_resources(std::span<const CheckpointHandle>,
                                      runtime::ContextResourceUsage) const;

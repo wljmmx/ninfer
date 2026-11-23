@@ -254,6 +254,28 @@ which takes the ownership"），恢复路径却把导入的检查点留在了 ow
 
 验收不变：恢复命中之后立刻发一个缓存外的冷 163k，必须成功而不是 400。
 
+## 第四轮实测：整组候选已接上，卡点落到"第二个地址"
+
+按上面的第二种思路，新增只读接口 `Program::checkpoints_sharing_history()`，`reclaim_order` 用它把
+同一 history 的检查点成组给出（兄弟候选遵守同一套 retention 过滤器）。`checkpoints_sharing_history`
+`[kvt] import refs` 保持 `addr_refs=1`，但严格场景仍 400，而且数字变了：
+
+```
+[rc-probe] reclaim main=31 … victims=1 relaxed=0 frontiers=[163694 ]
+[rc-probe] scan … unique=1 shared=2557 inactive=1 row=-1 committed=163694
+[rc-probe] history refs=1 ckpts=1        ← 这一次历史上只有一个检查点
+```
+
+`refs=1 ckpts=1` 却仍然 `shared=2557`，说明第二份页引用不在检查点账上，而在**另一个地址**上：
+恢复前缀被请求绑定时走的是 active prefix view（`commit_active_prefix_view`），它为目标地址
+`retain_reference()`，而目标地址不在 `KVHistory.text` 里——检查点被释放时只有 `KVHistory` 的地址
+会退引用，这个视图地址就留了下来。
+
+所以下一处要查的是 prefix-view 的目标地址在请求结束时的去向（`detach_checkpoint` 把
+`state.kv->text` 设成哪个地址、另一个地址由谁释放）。它比前面的修复更靠所有权核心，需要先把
+"哪个地址是 history 的、哪个是视图的"在日志里打印出来，再决定释放点。
+
+
 
 
 

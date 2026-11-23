@@ -288,6 +288,11 @@ CheckpointMetadata Program::checkpoint_metadata(CheckpointHandle h) const {
     return impl_->checkpoint_metadata(h);
 }
 
+std::vector<CheckpointHandle>
+Program::checkpoints_sharing_history(CheckpointHandle h) const {
+    return impl_->checkpoints_sharing_history(h);
+}
+
 bool Program::checkpoint_matches(CheckpointHandle h, const RequestBasePlan& b) const {
     return impl_->checkpoint_matches(h, b);
 }

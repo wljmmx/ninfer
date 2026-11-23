@@ -559,6 +559,11 @@ public:
         const PrefixShortlistKey* key = nullptr, std::string* error = nullptr,
         bool pin_pages = true);
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
+    // Every live checkpoint on the same KV history, `checkpoint` included. A release quote can only
+    // reach the suffix above another checkpoint's frontier, so a caller that wants a history's pages
+    // back has to offer all of them at once.
+    [[nodiscard]] std::vector<CheckpointHandle>
+    checkpoints_sharing_history(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle retained,
