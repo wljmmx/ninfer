@@ -389,6 +389,15 @@ public:
     // 13.5: merge when a rectangle exists and one pass prices cheaper than the rows apart. A 5%
     // margin keeps a wash from flapping; with no measurement yet the current state is held, so a
     // freshly started engine does not merge before it has a fit to merge on.
+    //
+    // Scope, decided 2026-11-24: the merge is a QUEUED-BATCH optimisation, not a scheduling goal.
+    // It applies to rows that are already staged when a pass runs - requests that arrived together
+    // and were admitted together. It is deliberately NOT forced for requests that are already
+    // executing: manufacturing that state needs admission to run ahead of the first dispatch, and
+    // measured, the second request's binding only settles once a prefill dispatch happens, so
+    // holding the dispatch to wait for it deadlocks (35 of 40 admission attempts came back
+    // `tx_busy`). The engine keeps the switch and the fit and merges when the batch is there; a lone
+    // request, or one whose neighbour is already running, is served exactly as before.
     [[nodiscard]] bool want_prefill_merge() const {
         // Bootstrap first: two or more requests with prefill work in the engine (one already
         // contributing a row, one waiting for a lane) is the state a merged pass exists for, and it
