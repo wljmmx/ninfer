@@ -275,6 +275,31 @@ which takes the ownership"），恢复路径却把导入的检查点留在了 ow
 `state.kv->text` 设成哪个地址、另一个地址由谁释放）。它比前面的修复更靠所有权核心，需要先把
 "哪个地址是 history 的、哪个是视图的"在日志里打印出来，再决定释放点。
 
+## 第五轮实测：两个地址，一个没人释放
+
+`debug_page_holders()`（只读）在拒绝现场打出了答案：
+
+```
+[addr-probe] scan slot=0 pages=2558 committed=163680 checkpoint=0      active=0 state=1 refs=1
+[addr-probe] scan slot=1 pages=2558 committed=163694 checkpoint=163694 active=0 state=1 refs=1
+[addr-probe] scan holders=2
+```
+
+两个**已占用的地址槽**持有同一批 2558 个逻辑页：
+
+- slot 1 是 history 的地址（`committed=163694`，带 checkpoint 保护），正常；
+- slot 0 是恢复导入出来的那个地址（`committed=163680`，保护已被清成 0），请求结束后**仍然是
+  Reserved、仍然持有 1 份页引用**，没有任何检查点再指向它。
+
+所以第二份页引用不在检查点账上，而在一个"谁也放不掉"的地址上。`~KVHistory` 也不够：它只释放
+`history->text`，而这个地址已经不在任何 history 的 `text` 里了。
+
+下一处要读的是绑定事务里前缀视图的归属：`binding.cpp` 的 `borrow_text` 分支让
+`binding_history` 直接借用检查点的 history（其 `text` 是 slot 0），而视图的 destination（slot 1）
+记在 `reserved_kv` 上；两条记录谁在结束时释放谁，就是那次要读清楚的一段。释放点选定后，验收仍是
+同一条：恢复命中后立刻发一个缓存外的冷 163k 必须成功。
+
+
 
 
 

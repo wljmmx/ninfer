@@ -546,6 +546,10 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
                                                std::to_string(owner_record.references) + " ckpts=" +
                                                std::to_string(owner_record.checkpoints.size()) + "\n";
                     std::fprintf(stderr, "%s", counts.c_str());
+                    if (history.page_count != 0) {
+                        pool.addresses->debug_page_holders(
+                            pool.addresses->logical_page(history.address, 0), "scan");
+                    }
                     std::fflush(stderr);
                 }
             }

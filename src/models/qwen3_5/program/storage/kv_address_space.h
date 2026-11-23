@@ -1185,6 +1185,31 @@ public:
         return valid(handle) && addresses_[handle.index_].state == Address::State::Retired;
     }
 
+    // Diagnostics only: every occupied address slot whose directory holds `page`, one line each.
+    // A page with two holders cannot be given back by releasing one of them, and when the second
+    // holder is not a checkpoint the usual accounts do not name it.
+    void debug_page_holders(LogicalKVPageHandle page, const char* tag) const {
+        std::uint32_t holders = 0;
+        for (std::uint32_t index = 0; index < addresses_.size(); ++index) {
+            const Address& address = addresses_[index];
+            if (!address.occupied) { continue; }
+            bool found = false;
+            for (std::uint32_t position = 0; position < address.page_count; ++position) {
+                if (membership(address, position) == page) { found = true; break; }
+            }
+            if (!found) { continue; }
+            ++holders;
+            std::fprintf(stderr,
+                         "[addr-probe] %s slot=%u pages=%u committed=%u checkpoint=%u active=%d "
+                         "state=%d refs=%u\n",
+                         tag, index, address.page_count, address.committed_frontier,
+                         address.checkpoint_frontier, address.active ? 1 : 0,
+                         static_cast<int>(address.state), address.refs);
+        }
+        std::fprintf(stderr, "[addr-probe] %s holders=%u\n", tag, holders);
+        std::fflush(stderr);
+    }
+
     [[nodiscard]] const KVExecutionRowLease& execution_row(KVAddressSpaceHandle handle) const {
         const Address& address = require(handle);
         // Steps 1-3: a retired address is not a source for execution, whatever its stale row says.
