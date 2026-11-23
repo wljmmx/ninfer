@@ -131,3 +131,38 @@ Free ──allocate──► Reserved ──bind──► Active ──unbind─
 2. `retire`/`reclaim` 在确认该行已无活序列后调用 `release_live_host_extents(row)`；
 3. 用 `trim-probe` 复测同一 163k 冷请求间隔内 `ninfer_device_kv_used_pages` 的回落。
 
+## 实测（2026-11-23，新构建 074fa75d）
+
+环境：`--max-context 256000 --kv-capacity 256000`（4000 页）、`--spec none`、
+`--prefill-chunk 2048`、LMCache 已 attached（WSL 内 `--host 0.0.0.0`，L1 4 GB，chunk 128）。
+
+| 步骤 | 结果 |
+|---|---|
+| 基线 | `ninfer_device_kv_used_pages 0` |
+| 请求 1：p163_1，prompt 163,687 | **缓存命中 100%**（`cache_n 163680`，restore 10.3 s），总 15.7 s，页占用 **2559** |
+| 请求 1 之后引擎日志 | **没有** `[kv] history end` 行；`[host-kv] extents=3 pinned=2609 MiB` 仍在 |
+| 请求 2：p163_2，另一个 163k | LMCache miss → 真实 prefill；`--kv-evict off` 时 **105 s** 后、`auto` 时 **212 s** 后 HTTP **400** |
+
+400 的内部原文（日志）：`KV residency cannot grow this lane beside the lanes already resident:
+growth_pages_needed≈2558 capacity_pages=4000 live_pages=…`，对外被归一为
+`context length exceeded`。**没有挂起、没有崩溃、Windows 事件日志无新的 APPCRASH。**
+
+三条结论：
+
+1. `bdf73451` 的守卫是有效的：过去"prefill 停在半路、6 分钟零进展"的场景，现在是有界的 400。
+2. 状态机解决的是"崩溃/静默丢失"，**不解决"保留前缀占着设备页不放"**：请求结束后历史仍被持有
+   （续写/缓存所有者），于是根本不 retire，回收链路一次都没触发。即使触发了，
+   `live_host_extents_` 仍会钉住这些页——`pinned=2609 MiB` 在请求结束后依旧存在。
+3. `--kv-evict auto` **不会释放保留检查点**：淘汰只作用于活动窗口与 Host 空间；
+   `release_stale_checkpoints()` 目前只在 Host 预留失败时被调用（`sequence.cpp:1450`），
+   设备侧的准入路径没有对应动作。
+
+因此验收 3 仍未闭环，且修复点已经明确（不是再猜）：
+
+1. `LiveHostExtent` 记录它钉住的是**哪个地址**（index + generation），新增"按地址释放"入口；
+2. `retire()` 交出地址时，由 ProgramImpl 释放该地址的 extent —— 不再按行去猜（行会被复用）；
+3. 准入失败前先尝试 `release_stale_checkpoints(0)` 并重算 `kv_residency_fits`，成功则继续；
+   仍不成功时给出真正的容量说明，而不是归一成 `context length exceeded`；
+4. 验收：同一会话里 req1 之后 req2（不同前缀）应直接成功，页占用在 prefill 期间由回收让出。
+
+
