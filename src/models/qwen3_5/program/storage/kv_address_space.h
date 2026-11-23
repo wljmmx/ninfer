@@ -1363,6 +1363,16 @@ public:
     // conditions are checked before any page is released, so a refusal keeps the address Retired
     // whole instead of half freed. Returns how many addresses went back to Free.
     [[nodiscard]] std::size_t reclaim_retired() noexcept {
+        return reclaim_retired([](KVAddressSpaceHandle) { return true; });
+    }
+
+    // The same pass with a veto. `keep(handle)` answers "may this Retired slot be freed?"; the
+    // Program uses it to withhold any address a lane, a checkpoint record or a binding in flight
+    // still names. Freeing one of those bumps its generation, and the handle the owner holds becomes
+    // stale - which throws "KV address-space handle is stale" from require() and kills the serving
+    // worker (measured: one stale handle turned every later request into 503).
+    template <typename Keep>
+    [[nodiscard]] std::size_t reclaim_retired(Keep&& keep) noexcept {
         // The common case is "nothing has ever retired": one counter compare per scheduling pass,
         // not a walk over every address slot.
         if (retired_count_ == 0) { return 0; }
@@ -1373,6 +1383,7 @@ public:
                 address.refs != 0) {
                 continue;
             }
+            if (!keep(KVAddressSpaceHandle(this, index, address.generation))) { continue; }
             if (!can_release_pages(address)) { continue; }
             if (!release_address(index)) { continue; }
             ++reclaimed;

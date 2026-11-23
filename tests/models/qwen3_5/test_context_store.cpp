@@ -1618,6 +1618,22 @@ void test_kv_lifecycle(ninfer::DeviceContext& device) {
            "lifecycle: the first drop leaves the owner's own reference");
     expect(addresses.retire(*held) && addresses.reclaim_retired() == 1,
            "lifecycle: the last holder retires and reclaims");
+    // 6. Reclaim is the only step that invalidates handles, so it has to be vetoable. A Retired slot
+    //    that some owner still names must survive the pass; the same slot is reclaimed once nothing
+    //    vetoes it. This is the guard that keeps a lane's address from being freed under it (freed
+    //    slots bump their generation, and the owner's next use throws "handle is stale").
+    auto vetoed = addresses.create_active(3, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*vetoed, 65, device.stream);
+    device.synchronize();
+    addresses.commit_frontier(*vetoed, 65);
+    addresses.deactivate(*vetoed);
+    expect(addresses.retire(*vetoed), "lifecycle: veto case retires its address");
+    expect(addresses.reclaim_retired([](auto) { return false; }) == 0 &&
+               addresses.retired(*vetoed) && addresses.valid(*vetoed),
+           "lifecycle: a vetoed Retired address survives the reclaim pass");
+    expect(addresses.reclaim_retired() == 1 && !addresses.valid(*vetoed),
+           "lifecycle: the same address is reclaimed once nothing vetoes it");
+
     expect(addresses.occupied() == 0 && pages.occupied() == 0,
            "lifecycle: every slot and page is back at the end");
 }

@@ -329,11 +329,44 @@ bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept
     return releasable;
 }
 
+bool ProgramImpl::kv_address_named(const KVAddressSpaceHandle& handle) const noexcept {
+    if (!handle.valid()) { return false; }
+    const auto names = [&handle](const std::shared_ptr<KVHistory>& history) {
+        if (!history) { return false; }
+        if (history->text == handle) { return true; }
+        return history->backend.has_value() && *history->backend == handle;
+    };
+    for (const auto& sequence : sequences) {
+        if (names(sequence.kv)) { return true; }
+    }
+    for (const auto& slot : checkpoints) {
+        if (slot.value && names(slot.value->kv)) { return true; }
+    }
+    const auto in_transaction = [&names, &handle](const ContextTransaction& tx) {
+        if (tx.reserved_kv) {
+            if (tx.reserved_kv->text == handle) { return true; }
+            if (tx.reserved_kv->backend && *tx.reserved_kv->backend == handle) { return true; }
+        }
+        if (tx.tier && tx.tier->text && *tx.tier->text == handle) { return true; }
+        if (tx.tier && tx.tier->backend && *tx.tier->backend == handle) { return true; }
+        // The binding's own two names: the history being bound and the one it came from.
+        if (names(tx.binding_history) || names(tx.source_history)) { return true; }
+        return false;
+    };
+    if (context_transaction_ && in_transaction(*context_transaction_)) { return true; }
+    return false;
+}
+
 void ProgramImpl::reclaim_retired() noexcept {
     // docs/design-kv-address-lifecycle.md step 3: the two KV halves retire independently, and each
-    // reclaim is an all-or-nothing walk over its own Retired slots. Nothing here waits for idle.
-    if (text_kv_addresses) { (void)text_kv_addresses->reclaim_retired(); }
-    if (backend_kv_addresses) { (void)backend_kv_addresses->reclaim_retired(); }
+    // reclaim is an all-or-nothing walk over its own Retired slots - but only over slots nothing
+    // names any more. "Retire" is a mark; "reclaim" is the only step that invalidates handles, so it
+    // is the one that must ask whether anyone still holds the name.
+    const auto keep = [this](const KVAddressSpaceHandle& handle) {
+        return !kv_address_named(handle);
+    };
+    if (text_kv_addresses) { (void)text_kv_addresses->reclaim_retired(keep); }
+    if (backend_kv_addresses) { (void)backend_kv_addresses->reclaim_retired(keep); }
 }
 
 ResumeStateImpl::~ResumeStateImpl() {

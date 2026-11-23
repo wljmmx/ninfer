@@ -379,6 +379,10 @@ public:
     // afterwards. A pinned checkpoint is refused by release_checkpoint itself.
     [[nodiscard]] std::uint32_t
     retire_checkpoint_group(std::span<const CheckpointHandle> handles);
+    // True when any owner inside the Program still names this address: a lane's KV history, a
+    // checkpoint record, or a binding/reservation in flight. Reclaim must never free one of those -
+    // the handle goes stale, require() throws, and the serving worker dies.
+    [[nodiscard]] bool kv_address_named(const KVAddressSpaceHandle& handle) const noexcept;
     // Diagnostics only: one line per live checkpoint slot, with the address it owns. Answers "which
     // checkpoint still holds this address" without guessing from the page accounts.
     void debug_checkpoint_table(const char* tag) const;
