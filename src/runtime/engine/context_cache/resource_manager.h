@@ -1105,6 +1105,13 @@ public:
         // that a relaxed pass could still satisfy. Offer the optional retained prefixes now; a
         // pinned one stays withheld by `reclaim_order`. One retry per cursor, so a pool that is all
         // pinned still reports Blocked instead of looping.
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 4) {
+                ++printed;
+                program.debug_checkpoint_table("reclaim");
+            }
+        }
         if (prefix_retention_ && !cursor.relaxed && cursor.victims.empty()) {
             auto relaxed = begin_reclaim(program, cursor.admission, cursor.rights,
                                          /*relax_retention=*/true);
@@ -1116,19 +1123,14 @@ public:
         }
         std::vector<Handle> allowed;
         for (const auto& victim : cursor.victims) {
+            // A candidate must still be one this manager holds: dropping the catalog check let a group
+            // partner through that the commit-time re-validation then rejected with "quoted cache
+            // release changed before commit" (HTTP 500 - worse than the 400 it replaced). The partner
+            // case needs the owner bookkeeping fixed first, not this filter loosened.
             if (references(victim.handle) && program.valid_checkpoint(victim.handle) &&
                 !contains(excluded, victim.handle)) {
                 allowed.push_back(victim.handle);
             }
-        }
-        if (shortage.host_bytes) {
-            Evaluation evaluation;
-            const auto victims =
-                host_victims_in_order(program, shortage.host_bytes, std::nullopt, {}, excluded,
-                                      cursor.admission, cursor, evaluation, true);
-            if (!victims) { return ReclaimProgress::Blocked; }
-            commit_release(program, *victims, cursor);
-            return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
         }
         auto plans = program.plan_reclaim(allowed, excluded, shortage);
         Evaluation evaluation{.native = &plans};
@@ -1686,6 +1688,11 @@ private:
             // and turned the whole prefix into "nothing can be reclaimed". Siblings obey the same
             // retention rules, so a pinned or still-withheld sibling keeps the group out.
             for (const auto sibling : program.checkpoints_sharing_history(handle)) { offer(sibling); }
+            // Same pages, different history: a fork copies the directory, so the source checkpoint and
+            // the fork's own checkpoint hold every page twice. Releasing one of them returns nothing
+            // and leaves the other's references in place, which also keeps movable() false forever -
+            // every later reuse then copies the whole prefix again. Group them too.
+            for (const auto sibling : program.checkpoints_sharing_pages(handle)) { offer(sibling); }
         }
         for (const auto& owner : owners_) {
             cursor.owners.push_back(

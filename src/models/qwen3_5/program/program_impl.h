@@ -372,11 +372,20 @@ public:
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
                                                          std::span<const CheckpointHandle>) const;
     [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
+    // Diagnostics only: one line per live checkpoint slot, with the address it owns. Answers "which
+    // checkpoint still holds this address" without guessing from the page accounts.
+    void debug_checkpoint_table(const char* tag) const;
     // Every live checkpoint that sits on the same KV history as `checkpoint`, itself included.
     // Releasing a history's pages needs all of them: one checkpoint alone can only give up the
     // suffix above another's frontier (measured: 1 of 2558 pages on a restored 163k prefix).
     [[nodiscard]] std::vector<CheckpointHandle>
     checkpoints_sharing_history(CheckpointHandle checkpoint) const;
+    // Every live checkpoint whose address shares physical pages with this one, itself included. A
+    // fork copies the directory, so two checkpoints on different histories can still hold the same
+    // pages - and releasing one of them returns nothing. Grouping by history alone missed exactly that
+    // case (measured: two slots, 2558 pages each, one victim offered).
+    [[nodiscard]] std::vector<CheckpointHandle>
+    checkpoints_sharing_pages(CheckpointHandle checkpoint) const;
     [[nodiscard]] std::optional<runtime::ContextResourceUsage>
         checkpoint_release_resources(std::span<const CheckpointHandle>,
                                      runtime::ContextResourceUsage) const;

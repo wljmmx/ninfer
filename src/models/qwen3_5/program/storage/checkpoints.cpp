@@ -205,6 +205,50 @@ ProgramImpl::checkpoints_sharing_history(CheckpointHandle handle) const {
     return out;
 }
 
+std::vector<CheckpointHandle>
+ProgramImpl::checkpoints_sharing_pages(CheckpointHandle handle) const {
+    std::vector<CheckpointHandle> out;
+    if (!valid_checkpoint(handle)) { return out; }
+    const auto& base = checkpoint(handle).kv;
+    if (!base || !text_kv_pages || !text_kv_addresses) { return out; }
+    if (!text_kv_addresses->valid(base->text) || text_kv_addresses->page_count(base->text) == 0) {
+        return out;
+    }
+    const auto needle = text_kv_addresses->logical_page(base->text, 0);
+    out.push_back(handle);
+    for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
+        const auto& slot = checkpoints[index];
+        if (!slot.value || slot.value->kv == base) { continue; }  // same history: the other helper
+        const auto& other = slot.value->kv;
+        if (!other || !text_kv_addresses->valid(other->text) ||
+            text_kv_addresses->page_count(other->text) == 0) {
+            continue;
+        }
+        // A fork copies the directory verbatim, so comparing the first page identifies the run. Both
+        // sides are already inactive by the time reclaim asks.
+        if (text_kv_addresses->logical_page(other->text, 0) != needle) { continue; }
+        out.push_back(CheckpointHandle{this, index, slot.generation});
+    }
+    return out;
+}
+
+void ProgramImpl::debug_checkpoint_table(const char* tag) const {
+    for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
+        const auto& slot = checkpoints[index];
+        if (!slot.value) { continue; }
+        const auto& record = *slot.value;
+        const bool has_text = text_kv_addresses && text_kv_addresses->valid(record.kv->text);
+        std::fprintf(stderr,
+                     "[ckpt-table] %s slot=%u frontier=%u use=%ld pins=%u pages=%u active=%d "
+                     "releasable=%d\n",
+                     tag, index, record.frontier, static_cast<long>(record.kv.use_count()),
+                     slot.pins, has_text ? text_kv_addresses->page_count(record.kv->text) : 0U,
+                     has_text && text_kv_addresses->active(record.kv->text) ? 1 : 0,
+                     has_text && text_kv_addresses->can_release(record.kv->text) ? 1 : 0);
+    }
+    std::fflush(stderr);
+}
+
 bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept {
     const bool releasable = checkpoint_releasable(*this, handle);
     if (releasable || std::getenv("NINFER_KV_LIFECYCLE_PROBE") == nullptr ||

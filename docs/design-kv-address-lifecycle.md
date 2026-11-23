@@ -362,6 +362,37 @@ p163_1（同一前缀再发）: HTTP 400, resident=3998 of 4000
 修复的唯一入口仍然是那个孤儿地址（slot 0）。现在它有两个明确判据可用于验收：修复后
 `[addr-probe] holders` 应回到 1，且 `movable()` 恢复为真、复用不再需要第二份页。
 
+## 第九轮：不是同一个 history，而是同一批物理页
+
+`debug_checkpoint_table()` 打出了台账本身，纠正了上一轮的判断：
+
+```
+[ckpt-table] slot=0 frontier=163680 use=1 pins=0 pages=2558 active=0 releasable=1
+[ckpt-table] slot=1 frontier=163694 use=1 pins=0 pages=2558 active=0 releasable=1
+```
+
+两个检查点**各有自己的地址**（`use=1`，即不同的 `KVHistory`），却因为 fork 复制了目录而共享
+同一批逻辑页。所以"按 history 分组"永远只能找到 1 个候选——改成按**共享物理页**分组后：
+
+```
+[rc-probe] reclaim victims=2 … plan allowed=1 … releases=0
+```
+
+候选变成 2 个，但 `allowed` 仍是 1：`allowed` 那一步要求 manager 侧"仍有引用"，而这个伙伴只被
+Program 记账、不在 manager 的目录里。把它放宽（只要求 valid + 未排除）确实让报价出现了
+（`allowed=2 owners=3 releases=3`），但提交时被一致性校验拒绝：
+
+```
+HTTP 500  "quoted cache release changed before commit"
+```
+
+比原来的 400 更糟，因此**该放宽已撤回**，状态码回到 400。
+
+结论：伙伴检查点缺少 manager 侧的记账，是比"分组"更靠上层的问题——它必须先在 owner/catalog 里
+被正确登记（或由 `abandon` 真正释放），否则一切按组释放都会在提交校验处被拒。下一轮从
+`replace_points` / `adopt` 的登记行为入手，而不是继续改回收侧的过滤条件。
+
+
 
 
 

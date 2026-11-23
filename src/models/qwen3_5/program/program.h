@@ -564,6 +564,13 @@ public:
     // back has to offer all of them at once.
     [[nodiscard]] std::vector<CheckpointHandle>
     checkpoints_sharing_history(CheckpointHandle checkpoint) const;
+    // Every live checkpoint whose address shares physical pages with this one, itself included. Two
+    // checkpoints on different histories can hold the same pages after a fork; releasing one of them
+    // gives nothing back.
+    [[nodiscard]] std::vector<CheckpointHandle>
+    checkpoints_sharing_pages(CheckpointHandle checkpoint) const;
+    // Diagnostics only (see ProgramImpl::debug_checkpoint_table): one line per live checkpoint.
+    void debug_checkpoint_table(const char* tag) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle retained,

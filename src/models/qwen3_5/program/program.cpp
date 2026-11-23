@@ -293,6 +293,15 @@ Program::checkpoints_sharing_history(CheckpointHandle h) const {
     return impl_->checkpoints_sharing_history(h);
 }
 
+void Program::debug_checkpoint_table(const char* tag) const {
+    impl_->debug_checkpoint_table(tag);
+}
+
+std::vector<CheckpointHandle>
+Program::checkpoints_sharing_pages(CheckpointHandle h) const {
+    return impl_->checkpoints_sharing_pages(h);
+}
+
 bool Program::checkpoint_matches(CheckpointHandle h, const RequestBasePlan& b) const {
     return impl_->checkpoint_matches(h, b);
 }
