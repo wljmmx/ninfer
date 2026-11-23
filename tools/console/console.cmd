@@ -33,9 +33,11 @@ set "EHOST=127.0.0.1"
 if not "%LAN%"=="0" set "HOST=0.0.0.0"
 if not "%LAN%"=="0" set "EHOST=0.0.0.0"
 
-rem LMCache endpoint handed to an engine the page starts. The mirror-network address is the fast one
-rem on this box; 127.0.0.1 also works but every byte goes through the user-mode relay, which is what
-rem a 2.5 GB prefix restore notices. Set it before this script to use another server.
+rem LMCache endpoint handed to an engine the page starts. The server runs inside WSL, so Windows
+rem reaches it on the WSL address, not on 127.0.0.1 -- and that only works when the server binds
+rem every interface (`l3_lmcache.sh` does; a plain `lmcache server` binds localhost and answers
+rem "could not attach (receive failed)" from the engine). Set NINFER_LMCACHE_ENDPOINT before this
+rem script to point somewhere else.
 if not defined NINFER_LMCACHE_ENDPOINT set "NINFER_LMCACHE_ENDPOINT=tcp://10.222.222.1:6555"
 
 echo console : http://%HOST%:%PORT%/   (engine on %EHOST%)
