@@ -15,10 +15,17 @@
 #     server refuses a chunk index it was not told about (measured: "chunk index out of range").
 # Both are overridable here, but changing either means changing the engine side with it.
 #
-# L1 defaults to 4 GB, not the 10 the design notes used: the arena is host RAM inside WSL, and on a
-# 64 GB box a 10 GB cache plus the engine's own pinned host context exhausted cudaMallocHost - the
-# engine then fell back to pageable memory and died at module init (measured 2026-11-20, both the
-# release and a fresh build). Raise L3_L1_GB only on a machine with the RAM to spare.
+# L1 defaults to 12 GB (2026-11-23). One 163k checkpoint is 2687 MiB, so a 4 GB tier held a single
+# entry at 66% and a second 163k prefix collided with it: measured, the second store died at the
+# transport (`receive failed: Resource temporarily unavailable` after 30 s at 84 MiB/s) with the
+# first entry still resident. The engine sizes its own per-entry limit from half of this number
+# (NINFER_LMCACHE_L1_MB, default 12288 now), so the two move together - change one, change both.
+#
+# The earlier 4 GB default existed for a different reason, kept here so it is not lost: on 2026-11-20
+# a 10 GB tier plus the engine's own pinned host context exhausted cudaMallocHost, and the engine fell
+# back to pageable memory and died at module init (both the release and a fresh build). 12 GB is ABOVE
+# that figure, so it is the value to watch: if an engine start fails in cudaMallocHost, drop L3_L1_GB
+# one step (8, then 6) rather than removing the cache - and re-record this comment with the reading.
 set -u
 
 ROOT="${L3_ROOT:-$HOME}"
@@ -27,7 +34,7 @@ PORT="${L3_PORT:-6555}"
 HTTP_PORT="${L3_HTTP_PORT:-18080}"
 CHUNK="${L3_CHUNK:-128}"
 WORKERS="${L3_WORKERS:-4}"
-L1_GB="${L3_L1_GB:-4}"
+L1_GB="${L3_L1_GB:-12}"
 LOG="${L3_LOG:-$ROOT/l3-lmcache.log}"
 PATTERN="lmcache server --transport zmq --port $PORT"
 # Bind every interface, not loopback. Measured 2026-11-21 with WSL's `networkingMode=Mirrored`: a

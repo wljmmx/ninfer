@@ -802,9 +802,11 @@ public:
     // NINFER_PUBLISH_PART_MB overrides it.
     // Largest checkpoint this client will hand to the server, as half of the server's L1. The client
     // does not query the server for its size, so the operator states it once; the default matches the
-    // production launch (--l1-size-gb 6).
+    // production launch (--l1-size-gb 12, tools/console/l3_lmcache.sh). It was 6144 while that launch
+    // was 6 GB: the client's idea of the tier has to move with the tier, or a 163k checkpoint (2687
+    // MiB) is either refused up front or - worse - admitted against a tier too small to keep it.
     [[nodiscard]] static std::size_t store_entry_limit_bytes() {
-        std::size_t l1_mib = 6144;
+        std::size_t l1_mib = 12288;
         if (const char* value = std::getenv("NINFER_LMCACHE_L1_MB");
             value != nullptr && *value != '\0') {
             const long parsed = std::strtol(value, nullptr, 10);
