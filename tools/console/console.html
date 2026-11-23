@@ -1470,8 +1470,21 @@ function renderFleetLive(){
   $('f-disk-bar').innerHTML = LC.ok && LC.ratio != null
     ? '<i style="width:' + Math.min(100, LC.ratio * 100).toFixed(0) + '%;background:var(--accent2)"></i>' : '';
   $('f-disk-sub').textContent = LC.ok ? 'LMCache L1 使用率 ' + (LC.ratio * 100).toFixed(1) + '%（独立源）' : 'LMCache 未接入';
-  $('f-up').innerHTML = '—<small>GB/s</small>';
-  $('f-up-sub').textContent = '引擎未发布上传带宽';
+  // 上传带宽 = NVML 的 PCIe rx（host→device）。这是硬件真实读数，覆盖 KV 页恢复、权重上传、
+  // 专家流式等全部 H2D 流量；引擎本身不发布任何"上传"量（旧面板的 upload 系列只是 demo 模型）。
+  const pcie = GPU.ok ? GPU.pcie : null;
+  if (pcie && pcie.rx_kb != null) {
+    const gbs = pcie.rx_kb * 1024 / 1e9;          // kB/s → GB/s
+    $('f-up').innerHTML = gbs.toFixed(2) + '<small>GB/s</small>';
+    $('f-up-sub').textContent = 'PCIe H2D（NVML）· 下发 ' +
+      (pcie.tx_kb != null ? (pcie.tx_kb * 1024 / 1e9).toFixed(2) + ' GB/s' : '—');
+    if (pcie.at) { GPU.upHist = (GPU.upHist || []).concat([gbs]).slice(-60); }
+    spark($('sp-fup'), GPU.upHist || [], '#f778ba');
+  } else {
+    $('f-up').innerHTML = '—<small>GB/s</small>';
+    $('f-up-sub').textContent = 'PCIe 读数不可用（需 NVML）';
+    spark($('sp-fup'), [], '#f778ba');
+  }
 
   spark($('sp-fdec'), sumSeries('decode', 60), '#4c9aff');
   spark($('sp-fpre'), sumSeries('prefill', 60), '#3fb950');

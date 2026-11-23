@@ -148,6 +148,25 @@ req#1 done | submit 27.1s devwait 1m13.0s boundary 3.2s | 120.4 s | 1611 tok/s
 4. 之后再做 **prefill 层栈按形状捕获**（key = `(len, bank)`，参照 `ffn.cpp:814-926` 的
    `LayerGraphs`），目标把那 190 ms/chunk 压下去；验收 `submit < 8 s`、`prefill ≥ 1.9k tok/s`。
 
+## 已完成（2026-11-23）
+
+- **异步回写**：引擎默认（`NINFER_LMCACHE_ASYNC_WRITE=0` 才退回同步）。boundary 40.1 s → 6.8 s，
+  总时长 142.9 s → 109.3 s，prefill 1181 → 1560 tok/s。
+- **稠密模型整步图**：`5a32c297`，`every_layer` 改为"没有池 || 池装得下全部层"。
+- **缓存释放**：`33e4f3c3`，在 `release_checkpoint` 内、槽位清空后按 `can_release` 判断整体释放。
+  池占用 2558 → 32 页；同前缀第二次请求 `cache 163,680 (100.0%) | TTFT 98.7 ms | total 2.1 s`。
+- **materializing 看门狗**：`bc274023`，120 s 无推进即 `Unavailable`，不再无限占 lane。
+- **上传带宽**：面板改用 NVML `nvmlDeviceGetPcieThroughput` 的 rx（host→device），见下。
+
+## 上传带宽的最终口径
+
+面板「上传带宽」= **PCIe rx（host→device）字节/秒**，由控制台的 NVML 采集提供
+（`/api/gpu.json` 的 `pcie.rx_kb`，每 ~5 s 更新）。这是硬件真实上传带宽，覆盖 KV 页恢复、
+权重上传、专家流式等所有 H2D 流量，**不需要引擎新增指标**。
+
+已放弃的口径：`upload` 系列原来是"专家权重 MB/层"的 demo 模型，对稠密工件没有意义，
+且引擎从不发布。
+
 ## 已知的其它结论（不要重复踩）
 
 - 容量方案不成立：`--kv-capacity 327680`（=5120 页，2×2558）被拒
