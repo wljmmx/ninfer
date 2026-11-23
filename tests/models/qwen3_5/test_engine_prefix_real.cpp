@@ -2030,6 +2030,16 @@ int exercise_merged_prefill_tail(const char* artifact) {
 // the comparison reports instead of hiding: the first generated token (the prefill's own sampled
 // Begin) is asserted separately from the full generated sequence.
 int exercise_merged_prefill_production(const char* artifact) {
+    // Four lanes need four Device state images, and the tier does not come from
+    // `context_cache.device_state_slots` here: the engine sizes it from the Device budget it can
+    // reserve (measured `state_images=307908608` = 2 images with the option set to 4) and refuses
+    // construction with "StateImages are tiered (2 Device image(s) + 0 Host image(s)) but 4 lanes may
+    // exist". The switch it names is the only door on this box, so the scenario opens it for itself
+    // (and clears it at the end) instead of being unconstructible.
+    _putenv_s("NINFER_STATE_IMAGE_DEVICE_SLOTS", "4");
+    struct ClearDeviceSlots {
+        ~ClearDeviceSlots() { _putenv_s("NINFER_STATE_IMAGE_DEVICE_SLOTS", ""); }
+    } clear_device_slots;
     auto wide_options = [&](std::int32_t context) {
         ninfer::EngineOptions options;
         options.artifact_path                     = artifact;
@@ -2072,8 +2082,12 @@ int exercise_merged_prefill_production(const char* artifact) {
 
         std::vector<std::vector<ninfer::TokenId>> expected;
         {
-            ninfer::Engine reference(wide_options(load.context));
+            // Admission is held in BOTH arms: the merge is the only difference the comparison may
+            // have. The switch used to be set after the reference engine was constructed, so the
+            // per-lane arm admitted freely while the merged arm barriered - a difference in the
+            // thing under test, not a difference caused by it.
             _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "1");
+            ninfer::Engine reference(wide_options(load.context));
             std::vector<ninfer::GenerationHandle> handles;
             const auto reference_started = std::chrono::steady_clock::now();
             for (const auto& prompt : prompts) {
