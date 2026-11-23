@@ -621,11 +621,34 @@ public:
                 ++dropped_writes_;
                 return;
             }
+            // And bounded by BYTES, not only by count. A queued write already owns its payload
+            // (2545 MiB for one 163k checkpoint), so eight of them is 20 GiB of host memory that
+            // nothing else can reclaim. Measured: two such payloads in flight, while the next
+            // request restored the same prefix and exported its own copy, ended in `bad allocation`
+            // on the serving lane (req failed, HTTP 500). One large payload at a time is the shape
+            // that fits: the second store of a request is the finish-time record of a prefix the
+            // first store already carries at chunk granularity.
+            if (pending_write_bytes_ + store_bytes > write_queue_bytes()) {
+                ++dropped_writes_;
+                ++dropped_writes_bytes_;
+                if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+                    std::fprintf(stderr,
+                                 "[lmcache] store queued refused: %.1f MiB would exceed the %.1f MiB "
+                                 "ceiling (%.1f MiB already resident); this store is skipped\n",
+                                 static_cast<double>(store_bytes) / 1048576.0,
+                                 static_cast<double>(write_queue_bytes()) / 1048576.0,
+                                 static_cast<double>(pending_write_bytes_) / 1048576.0);
+                    std::fflush(stderr);
+                }
+                return;
+            }
+            pending_write_bytes_ += store_bytes;
             // 13.4: the record is written before the job becomes queued, so "accepted" and
             // "recoverable" are the same instant. A crash between here and the publish leaves a
             // file that the next start replays.
             writes_.push_back(Job{std::vector<TokenId>(prompt_tokens.begin(), prompt_tokens.end()),
-                                  checkpoint, wal_.append(prompt_tokens, checkpoint), first_chunk});
+                                  checkpoint, wal_.append(prompt_tokens, checkpoint), first_chunk,
+                                  store_bytes});
         }
         write_cv_.notify_one();
     }
@@ -651,6 +674,12 @@ public:
                          static_cast<unsigned long long>(written_),
                          static_cast<unsigned long long>(dropped_writes_),
                          static_cast<unsigned long long>(pending));
+            if (dropped_writes_bytes_ != 0) {
+                std::fprintf(stderr, "[lmcache] writer stopped: %llu of the drops were the host byte "
+                             "ceiling (%.1f MiB)\n",
+                             static_cast<unsigned long long>(dropped_writes_bytes_),
+                             static_cast<double>(write_queue_bytes()) / 1048576.0);
+            }
             std::fprintf(stderr, "[lmcache] lookups fetches=%llu hits=%llu misses=%llu stores=%llu\n",
                          static_cast<unsigned long long>(fetches_.load()),
                          static_cast<unsigned long long>(hits_.load()),
@@ -667,6 +696,7 @@ public:
         ninfer::CachedCheckpoint checkpoint;
         std::filesystem::path wal_path;
         std::size_t first_chunk = 0;
+        std::size_t bytes       = 0; // what this payload costs while it waits / transfers
     };
 
     void write_loop() {
@@ -683,7 +713,7 @@ public:
                 writes_.pop_front();
             }
             const auto started = std::chrono::steady_clock::now();
-            const bool written = publish_job(job.tokens, job.checkpoint);
+            const bool written = publish_parts(job.tokens, job.checkpoint, job.first_chunk);
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             if (const auto state_bytes = [&job] {
@@ -709,7 +739,54 @@ public:
                 std::fflush(stderr);
             }
             if (written) { wal_.complete(job.wal_path); }
+            {
+                // The payload is released here, not when the job is taken from the queue: it stays
+                // alive for the whole transfer, which is what the ceiling has to account for.
+                std::lock_guard<std::mutex> guard(write_mutex_);
+                pending_write_bytes_ -= std::min(pending_write_bytes_, job.bytes);
+            }
         }
+    }
+
+    // What the queued (and in-flight) writes may hold between them. This is a ceiling on resident
+    // payloads, never a read-ahead window: each job already owns its bytes, so the only question is
+    // how many of them the box can afford at once. Default 4 GiB holds one 163k checkpoint (2545 MiB)
+    // and one 256k one (about 4 GiB) on its own, and never two together. NINFER_LMCACHE_QUEUE_MB
+    // overrides it.
+    [[nodiscard]] static std::size_t write_queue_bytes() {
+        constexpr std::size_t kDefault = 4ULL * 1024 * 1024 * 1024;
+        const char* value = std::getenv("NINFER_LMCACHE_QUEUE_MB");
+        if (value == nullptr || *value == '\0') { return kDefault; }
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed <= 0) { return kDefault; }
+        return static_cast<std::size_t>(parsed) * 1024ULL * 1024ULL;
+    }
+
+    // The async path used to hand the whole run to publish_job() in one message, while the
+    // synchronous path split it. The server does not answer a message that carries a whole 163k
+    // checkpoint: measured `publish failed | 1278 chunk(s) | 2512650240 byte(s) | receive failed:
+    // Resource temporarily unavailable` after 35.9 s, with the payload held in host memory for the
+    // whole time. The defect was invisible while publishes of that size were refused upstream, and
+    // it is the reason a queued 2.5 GiB publish must be split exactly like a synchronous one: the
+    // part size is the range the server answers quickly (0.42-1.24 s per 64 MiB part).
+    bool publish_parts(std::span<const TokenId> prompt_tokens,
+                       const ninfer::CachedCheckpoint& checkpoint, std::size_t first_chunk) {
+        const std::size_t total_chunks =
+            chunk_bytes_ == 0 ? 0 : checkpoint.kv_bytes.size() / chunk_bytes_;
+        const std::size_t part_chunks =
+            std::max<std::size_t>(1, chunk_bytes_ == 0 ? 1 : publish_part_bytes() / chunk_bytes_);
+        // One id for every part of this store; see publish_job for why.
+        const std::string store_request_id =
+            "put-" + std::to_string(instance_tag_) + "-" + std::to_string(++sequence_);
+        for (std::size_t begin = first_chunk, part = 0; begin < total_chunks;
+             begin += part_chunks, ++part) {
+            const std::size_t end  = std::min(total_chunks, begin + part_chunks);
+            const bool last        = end == total_chunks;
+            if (!publish_job(prompt_tokens, checkpoint, begin, end, last, part, store_request_id)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // The body that used to be store(): unchanged, so the async path is the same code, on another
@@ -931,6 +1008,11 @@ private:
     bool async_write_  = false;
     std::uint64_t written_        = 0;
     std::uint64_t dropped_writes_ = 0;
+    // Split from dropped_writes_ because the two say different things: one is "the writer is behind
+    // by too many entries", this one is "the box cannot hold another payload right now".
+    std::uint64_t dropped_writes_bytes_ = 0;
+    // Bytes of the payloads the queue is holding: waiting plus the one on the wire.
+    std::size_t pending_write_bytes_ = 0;
     // 13.4: what the cache was asked and what it returned, so "stop writing" is a decision about
     // this process's traffic instead of a timer.
     std::atomic<std::uint64_t> fetches_{0};
