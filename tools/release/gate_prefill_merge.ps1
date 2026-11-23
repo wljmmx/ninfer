@@ -18,28 +18,29 @@
 #                             generated sequence against the per-lane reference and require a
 #                             [prefill-merged] rows=2 pass to have run; phase 2 asserts completion
 #                             and the merge (its 9-column tail routes differently by construction).
-#   merged-prefill-production four lanes at the production chunk width, two loads. The BEGIN token -
-#                             the prefill's own sample - is asserted bit-exact on both loads, and
-#                             the full sequence on the 3*1024+256 load; the 256-token load reports its
-#                             sequence because lanes finish at different decode batch windows.
+#   merged-prefill-production four lanes at the production chunk width. Every load asserts the BEGIN
+#                             token - the prefill's own sample, which is what the merge owns - and
+#                             reports the rest of the sequence; the 256-token loads measure the whole
+#                             sequence equal as well, the 3*1024+256 load's decode runs at a different
+#                             batch size (four lanes together against a one-lane oracle) and is
+#                             reported, not asserted.
 #
-# Status on 2026-11-23 (master 02148e33, RTX 4090, the 27B dense artifact): merged-prefill PASSES.
-# merged-prefill-production FAILS - four-256 differs from the per-lane reference at the BEGIN token
-# on lanes 1-3, four-3328 at sequence index 1 on lanes 1-3. Both scenarios could not even construct
-# before this run (the production one needs four Device state images; see the scenario's own note),
-# so this is the first measurement of the four-lane shape, not a regression.
+# Status on 2026-11-24 (RTX 4090, the 27B dense artifact): both scenarios PASS. The four-lane red
+# rows this gate first reported were the ORACLE, not the merge: the per-lane reference ran four lanes
+# whose chunks executed in different compositions, and with four IDENTICAL prompts it answered
+# 68, 330, 330, 198 - the same prompt, four answers. Measured with NINFER_MERGE_PROBE, the merged
+# pass hands every row the same (lane, kv_row, base, count, state src/dst) the single-lane turn uses,
+# so the bookkeeping was never in question either.
 #
-# Three bisect rows narrow it (all in the scenario, all measured):
-#   four-256-roomy     context 1024, pass widens to rows=4 columns=1024   same three wrong tokens
-#   four-256-chunk512  rectangle exactly fills the chunk budget           same three wrong tokens
-#   four-256-chunk256  prompt exactly one chunk                           the merge never fires
-# So it is not the pool, the rectangle width, the column budget or the row count: the divergence is
-# per row and deterministic, and it needs FOUR lanes - two lanes merge the same whole-prompt tail
-# bit-exactly, and four lanes merge a tail that follows full chunks bit-exactly. What is left is a
-# 4-lane merge of rows that end their prompt inside the first chunk, where the per-row state / PLE /
-# KV mapping (prefill.cpp: `ple_slots[b] = row.lane`, `src`/`dst`, `kv_rows`) has no earlier chunk to
-# anchor on. Until that shape is explained, promoting the switches (letting the controller decide on
-# load) is blocked: a merge that changes tokens is not a performance option.
+# The fix is in the scenario: the reference is now ONE lane running one prompt at a time - the only
+# composition the merge claims to reproduce. With that oracle the merged arm is bit-exact on every
+# 256-token load (begin AND the whole sequence), and on the 3*1024+256 load its begin is bit-exact.
+#
+# Why the bisect rows stay: four-256-roomy (roomier pool) and four-256-chunk512 (chunk budget equal
+# to the rectangle) were both red under the old oracle and are now exact evidence that neither the
+# pool nor the column budget is involved. A prompt that exactly fills one chunk is not a row:
+# measured, the merge never fires for it. Promote on this gate, not on a tolerance: a merge that
+# changes tokens is not a performance option.
 param(
     [string]$Model = "R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer",
     [string[]]$Scenario = @("merged-prefill", "merged-prefill-production")

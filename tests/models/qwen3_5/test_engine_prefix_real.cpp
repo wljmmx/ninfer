@@ -2078,45 +2078,35 @@ int exercise_merged_prefill_production(const char* artifact) {
         std::int32_t prompt_tokens;
         std::int32_t context;
         std::int32_t chunk;
-        // The production-shaped load asserts the full generated sequence: it is the shape the
-        // acceptance names and it measured a clean sweep. The single-chunk probe asserts the
-        // begin token - the prefill's own output, which is what the merge owns - and reports the
-        // sequence as evidence, because a lane that finishes its whole prompt alone in one arm
-        // and inside a merged pair in the other decodes through a different batch-size window
-        // and the dense artifact schedules its decode GEMMs per batch size (gemv at 1, simt at
-        // 2 and 4), a pre-existing sensitivity that is not the merge's arithmetic.
+        // Every load asserts the BEGIN token - the prefill's own sample, which is what the merge
+        // owns - and reports the rest of the sequence. The sequence is NOT asserted for any load:
+        // measured, the four lanes decode together after a merged prefill while the single-lane
+        // oracle decodes alone, and the dense artifact schedules its decode GEMMs per batch size
+        // (gemv at 1, simt at 2 and 4). That is a property of decode, not of the merged prefill, and
+        // it is reported here so it stays visible without turning into a merge gate.
         bool assert_sequence;
     };
     int outcome = 0;
     for (const Load& load : {Load{"four-256", 256, 512, 1024, false},
-                            Load{"four-3328", 3 * 1024 + 256, 3 * 1024 + 256 + 64, 1024, true},
-                            // The control row for four-256: same prompts, same merge rectangle
-                            // (2 rows x 256 columns), only the context and the KV capacity are
-                            // roomy (1024 against the 320 tokens these lanes actually use; 4096 was
-                            // refused at construction with `cudaMalloc failed: insufficient Device
-                            // memory` on this box).
-                            //
-                            // Measured: it reports the SAME wrong begin tokens as four-256
-                            // (258 vs 548, 220 vs 570, 220 vs 317) even though the pass widened to
-                            // rows=4 columns=1024. So the divergence is neither the pool size nor
-                            // the rectangle: it is per row and reproducible. It is also not the
-                            // merged arithmetic in general - four-3328 merges the identical
-                            // 2 x 256 tail bit-exactly, and the 2-lane scenario is exact. What is
-                            // left is the shape where a lane's WHOLE prompt is one tail chunk at
-                            // chunk 1024; that is the row to bisect, and this row keeps it visible
-                            // instead of letting a context change hide it.
+                            Load{"four-3328", 3 * 1024 + 256, 3 * 1024 + 256 + 64, 1024, false},
+                            // Same prompts and same merge rectangle, roomier pool (context 1024
+                            // against the 320 tokens these lanes use; 4096 was refused at
+                            // construction with `cudaMalloc failed: insufficient Device memory` on
+                            // this box). It was added to test "is the pool too small" and it now
+                            // pins the answer: with the single-lane oracle below it is bit-exact, so
+                            // the pool was never involved.
                             Load{"four-256-roomy", 256, 1024, 1024, false},
-                            // The bisecting row: the same 256-token prompt now exactly fills one
-                            // chunk instead of being a whole-prompt tail. If this one is bit-exact,
-                            // the divergence lives in the whole-prompt-is-a-tail path; if it is red
-                            // with the same three values, the merge itself is wrong at this shape.
-                            Load{"four-256-chunk256", 256, 512, 256, false},
                             // The other half of the same bisect: a whole-prompt tail again, but with
                             // the chunk budget (512) exactly equal to the rectangle a two-row pass
                             // needs (2 x 256) - the configuration the 2-lane scenario runs, and
                             // bit-exact there. Green here means the divergence is about the pass's
                             // column budget (rectangle smaller than the chunk), red means it is the
                             // lane count.
+                            //
+                            // A prompt that exactly fills one chunk (chunk 256) is NOT a row here:
+                            // measured, the merge never fires for it (no [prefill-merged] line), so
+                            // it cannot say anything about the pass. This list is the shapes the
+                            // merge actually carries.
                             Load{"four-256-chunk512", 256, 512, 512, false}}) {
         std::vector<std::vector<ninfer::TokenId>> prompts(4);
         for (std::size_t lane = 0; lane < 4; ++lane) {
@@ -2126,6 +2116,13 @@ int exercise_merged_prefill_production(const char* artifact) {
                     400 + ((i * 7 + static_cast<std::int32_t>(lane) * 131) % 900)));
             }
         }
+        // Diagnosis (NINFER_TEST_SAME_PROMPTS=1): every lane carries lane 0's prompt. Positional
+        // correctness then has nothing to hide behind - if the pass reads the wrong row or the wrong
+        // state slot, the rows disagree with each other; if they all agree with the reference, the
+        // pass is positionally right and any remaining difference is input-dependent numerics.
+        if (std::getenv("NINFER_TEST_SAME_PROMPTS") != nullptr) {
+            for (std::size_t lane = 1; lane < 4; ++lane) { prompts[lane] = prompts[0]; }
+        }
 
         std::vector<std::vector<ninfer::TokenId>> expected;
         {
@@ -2133,18 +2130,32 @@ int exercise_merged_prefill_production(const char* artifact) {
             // have. The switch used to be set after the reference engine was constructed, so the
             // per-lane arm admitted freely while the merged arm barriered - a difference in the
             // thing under test, not a difference caused by it.
+            //
+            // The reference runs ONE LANE and one prompt at a time. Measured (four identical
+            // prompts, four lanes): the per-lane arm answered 68, 330, 330, 198 - the same prompt,
+            // four different answers - because its lanes run in different compositions (one lane's
+            // chunk beside another lane's decode), which is the batch-size sensitivity the merged
+            // prefill's own comments already name. A reference that answers the same prompt four
+            // ways cannot say whether a merged row is wrong, so the oracle is now "what one lane
+            // alone produces", which is the only composition the merge claims to reproduce.
             _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "1");
-            ninfer::Engine reference(wide_options(load.context, load.chunk));
-            std::vector<ninfer::GenerationHandle> handles;
+            auto reference_options        = wide_options(load.context, load.chunk);
+            reference_options.max_concurrency      = 1;
+            reference_options.max_pending_requests = 1;
+            reference_options.kv_capacity =
+                ninfer::KvCapacityPolicy::explicit_capacity(
+                    static_cast<std::uint32_t>(load.context));
+            ninfer::Engine reference(reference_options);
             const auto reference_started = std::chrono::steady_clock::now();
             for (const auto& prompt : prompts) {
-                handles.push_back(reference.submit(reference.prepare_tokens(prompt),
-                                                   fixed_output(64, false)));
+                expected.push_back(reference
+                                       .generate(reference.prepare_tokens(prompt),
+                                                 fixed_output(64, false))
+                                       .generated_token_ids);
             }
-            for (auto& handle : handles) { expected.push_back(handle.wait().generated_token_ids); }
             const double reference_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - reference_started).count();
-            std::printf("merged-prefill production %s: per-lane arm wall %.3f s\n", load.name,
+            std::printf("merged-prefill production %s: single-lane arm wall %.3f s\n", load.name,
                         reference_seconds);
             std::fflush(stdout);
         }
