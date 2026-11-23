@@ -27,12 +27,19 @@
 # merged-prefill-production FAILS - four-256 differs from the per-lane reference at the BEGIN token
 # on lanes 1-3, four-3328 at sequence index 1 on lanes 1-3. Both scenarios could not even construct
 # before this run (the production one needs four Device state images; see the scenario's own note),
-# so this is the first measurement of the four-lane shape, not a regression. Its third load,
-# four-256-roomy, narrows it: the same wrong tokens come back with a roomier pool and the pass
-# widened to rows=4 columns=1024, so the divergence is per row and reproducible, not a memory or
-# geometry effect - and four-3328 merges the identical 2 x 256 tail bit-exactly. Until that one
-# shape is explained, promoting the switches (letting the controller decide on load) is blocked: a
-# merge that changes tokens is not a performance option.
+# so this is the first measurement of the four-lane shape, not a regression.
+#
+# Three bisect rows narrow it (all in the scenario, all measured):
+#   four-256-roomy     context 1024, pass widens to rows=4 columns=1024   same three wrong tokens
+#   four-256-chunk512  rectangle exactly fills the chunk budget           same three wrong tokens
+#   four-256-chunk256  prompt exactly one chunk                           the merge never fires
+# So it is not the pool, the rectangle width, the column budget or the row count: the divergence is
+# per row and deterministic, and it needs FOUR lanes - two lanes merge the same whole-prompt tail
+# bit-exactly, and four lanes merge a tail that follows full chunks bit-exactly. What is left is a
+# 4-lane merge of rows that end their prompt inside the first chunk, where the per-row state / PLE /
+# KV mapping (prefill.cpp: `ple_slots[b] = row.lane`, `src`/`dst`, `kv_rows`) has no earlier chunk to
+# anchor on. Until that shape is explained, promoting the switches (letting the controller decide on
+# load) is blocked: a merge that changes tokens is not a performance option.
 param(
     [string]$Model = "R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer",
     [string[]]$Scenario = @("merged-prefill", "merged-prefill-production")

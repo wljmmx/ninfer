@@ -2040,13 +2040,13 @@ int exercise_merged_prefill_production(const char* artifact) {
     struct ClearDeviceSlots {
         ~ClearDeviceSlots() { _putenv_s("NINFER_STATE_IMAGE_DEVICE_SLOTS", ""); }
     } clear_device_slots;
-    auto wide_options = [&](std::int32_t context) {
+    auto wide_options = [&](std::int32_t context, std::int32_t chunk) {
         ninfer::EngineOptions options;
         options.artifact_path                     = artifact;
         options.max_context                       = context;
         options.kv_capacity        = ninfer::KvCapacityPolicy::explicit_capacity(
             static_cast<std::uint32_t>(4) * static_cast<std::uint32_t>(context));
-        options.prefill_chunk                     = 1024;
+        options.prefill_chunk                     = chunk;
         options.speculative.backend               = ninfer::SpeculativeBackend::None;
         options.max_concurrency                   = 4;
         options.max_pending_requests              = 4;
@@ -2059,6 +2059,7 @@ int exercise_merged_prefill_production(const char* artifact) {
         const char* name;
         std::int32_t prompt_tokens;
         std::int32_t context;
+        std::int32_t chunk;
         // The production-shaped load asserts the full generated sequence: it is the shape the
         // acceptance names and it measured a clean sweep. The single-chunk probe asserts the
         // begin token - the prefill's own output, which is what the merge owns - and reports the
@@ -2069,8 +2070,8 @@ int exercise_merged_prefill_production(const char* artifact) {
         bool assert_sequence;
     };
     int outcome = 0;
-    for (const Load& load : {Load{"four-256", 256, 512, false},
-                            Load{"four-3328", 3 * 1024 + 256, 3 * 1024 + 256 + 64, true},
+    for (const Load& load : {Load{"four-256", 256, 512, 1024, false},
+                            Load{"four-3328", 3 * 1024 + 256, 3 * 1024 + 256 + 64, 1024, true},
                             // The control row for four-256: same prompts, same merge rectangle
                             // (2 rows x 256 columns), only the context and the KV capacity are
                             // roomy (1024 against the 320 tokens these lanes actually use; 4096 was
@@ -2086,7 +2087,19 @@ int exercise_merged_prefill_production(const char* artifact) {
                             // left is the shape where a lane's WHOLE prompt is one tail chunk at
                             // chunk 1024; that is the row to bisect, and this row keeps it visible
                             // instead of letting a context change hide it.
-                            Load{"four-256-roomy", 256, 1024, false}}) {
+                            Load{"four-256-roomy", 256, 1024, 1024, false},
+                            // The bisecting row: the same 256-token prompt now exactly fills one
+                            // chunk instead of being a whole-prompt tail. If this one is bit-exact,
+                            // the divergence lives in the whole-prompt-is-a-tail path; if it is red
+                            // with the same three values, the merge itself is wrong at this shape.
+                            Load{"four-256-chunk256", 256, 512, 256, false},
+                            // The other half of the same bisect: a whole-prompt tail again, but with
+                            // the chunk budget (512) exactly equal to the rectangle a two-row pass
+                            // needs (2 x 256) - the configuration the 2-lane scenario runs, and
+                            // bit-exact there. Green here means the divergence is about the pass's
+                            // column budget (rectangle smaller than the chunk), red means it is the
+                            // lane count.
+                            Load{"four-256-chunk512", 256, 512, 512, false}}) {
         std::vector<std::vector<ninfer::TokenId>> prompts(4);
         for (std::size_t lane = 0; lane < 4; ++lane) {
             prompts[lane].reserve(static_cast<std::size_t>(load.prompt_tokens));
@@ -2103,7 +2116,7 @@ int exercise_merged_prefill_production(const char* artifact) {
             // per-lane arm admitted freely while the merged arm barriered - a difference in the
             // thing under test, not a difference caused by it.
             _putenv_s("NINFER_PREFILL_ADMIT_FIRST", "1");
-            ninfer::Engine reference(wide_options(load.context));
+            ninfer::Engine reference(wide_options(load.context, load.chunk));
             std::vector<ninfer::GenerationHandle> handles;
             const auto reference_started = std::chrono::steady_clock::now();
             for (const auto& prompt : prompts) {
@@ -2122,7 +2135,7 @@ int exercise_merged_prefill_production(const char* artifact) {
         std::vector<std::vector<ninfer::TokenId>> merged_tokens;
         std::size_t merged_rows = 0;
         {
-            ninfer::Engine merged(wide_options(load.context));
+            ninfer::Engine merged(wide_options(load.context, load.chunk));
             const char* const capture = "prefix-real-merged-prefill-production.log";
             const int saved_stderr    = _dup(2);
             if (saved_stderr < 0 || freopen(capture, "w", stderr) == nullptr) {
