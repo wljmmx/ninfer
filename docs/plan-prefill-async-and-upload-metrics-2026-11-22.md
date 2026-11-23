@@ -167,6 +167,22 @@ req#1 done | submit 27.1s devwait 1m13.0s boundary 3.2s | 120.4 s | 1611 tok/s
 已放弃的口径：`upload` 系列原来是"专家权重 MB/层"的 demo 模型，对稠密工件没有意义，
 且引擎从不发布。
 
+## 尝试并否定的方案：prefill 层栈按地址捕获（2026-11-23）
+
+按 `ffn.cpp:814-926` 的 `LayerGraphs` 机制，在 `text.cpp` 的 `run_layers` 外面加了一层
+「按 (len, 缓冲地址) 捕获并回放」的实现（`NINFER_PREFILL_GRAPH=1` 开启）。实测同一冷 163k：
+
+```
+submit 28.0 s（关闭时 28.3 s）| 总 108.2 s（关闭时 109.7 s）| 1580 vs 1560 tok/s
+```
+
+**没有收益，且不是噪声能解释的差异**，说明 key 从未命中：prefill 的 workspace 每 chunk 轮换
+缓冲区（`LayerGraphs` 的注释也记录了同样的现象："three distinct pointer sets cycling"），
+地址做 key 就等于每次重新捕获。方案已回滚。
+
+要继续这条路，必须先把"按地址"换成"按形状"（len + 层配置），并且保证捕获区间里的缓冲区地址
+**固定**（专属 prefill workspace，不复用 arena 轮换）——这是前提，不是优化。
+
 ## 已知的其它结论（不要重复踩）
 
 - 容量方案不成立：`--kv-capacity 327680`（=5120 页，2×2558）被拒
