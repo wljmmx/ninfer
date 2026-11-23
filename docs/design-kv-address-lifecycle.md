@@ -165,4 +165,36 @@ growth_pages_needed≈2558 capacity_pages=4000 live_pages=…`，对外被归一
    仍不成功时给出真正的容量说明，而不是归一成 `context length exceeded`；
 4. 验收：同一会话里 req1 之后 req2（不同前缀）应直接成功，页占用在 prefill 期间由回收让出。
 
+## 更正并深一层：卡点不在 extent 钉页（2026-11-23 13:00）
+
+上面那段把 `live_host_extents_` 当作卡点是**推断，不是证据**。加了按环境变量开启的取证
+（`NINFER_KV_LIFECYCLE_PROBE`：`[kv-probe]` 打印检查点为何不可释放，`[rc-probe]` 打印回收候选
+与报价）后跑同一场景，事实是另一条链：
+
+- 400 正文（客户端原始返回）：`the KV pool is full and nothing can be reclaimed for this step:
+  needed_main_pages=30 … resident=3998 of 4000 page(s)`。
+- `[rc-probe]`：两次尝试都是 `victims=1`；第一次 `demotions=1 releases=1`（只让出 1 页，
+  shortage 31→30），第二次 `demotions=0 releases=0`。
+- **`[kv-probe]` 一条都没有**——`can_release_checkpoint` 从未对保留前缀返回过 false，
+  也就是说"页被钉住"这一层根本没被问到。
+- 真正的门在 `released_resources`（`reclaim.cpp:487`）：只有
+  `history.references == history.checkpoints.size()` 时才会为这段历史记账，而 `references` 就是
+  `KVHistory` 的 `use_count`（`reclaim.cpp:195`）。保留前缀被一个**仍在的序列**持有时，
+  `use_count` 恒大于该历史的 checkpoint 数 → 这段历史的页永远算不出可释放量 → 报价为空 → Blocked。
+- 空闲回收也没兜住：`idle_reclaim_ms=60000`，但两分钟空闲内 `kv_idle_reclaims_total` 保持 0，
+  页占用仍是 2558 —— 该配置下 `idle_shared()` 没有把这个 owner 当候选，降级路径没被走到。
+- 另有一处独立缺陷：放松保留的重试被 `cursor.victims.empty()` 门控（`resource_manager.h:1020`）。
+  手里只要有一个"给不出页"的候选，可选的保留前缀就永远进不来。
+
+所以是三个可分离的缺陷，**没有一个是状态机能修的**：
+
+1. `released_resources` 的"整段历史"判据把被序列持有的保留前缀排除在可回收之外；
+2. 放松保留的重试触发条件过窄（应为"本轮没有产生任何动作"，而不只是"候选为空"）；
+3. 该配置下 `idle_reclaim` 不生效（候选集为空）。
+
+正确的下一步形态：池满且唯一的大块占用是"空闲但仍在的序列"时，引擎需要一条显式的**让空闲序列
+退场**动作（abort → 地址 retire → 下趟 reclaim 归还页），再把上面 1、2 两处判据改到"允许延后
+回收"的语义。验收仍是同一条：req1 结束后立刻发 req2（不同前缀）必须成功，而不是 400。
+
+
 

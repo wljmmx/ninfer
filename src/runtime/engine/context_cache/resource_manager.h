@@ -1013,6 +1013,23 @@ public:
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> excluded, ReclaimCursor& cursor) {
         if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
+        // Diagnostics for the "a retained prefix and a long request do not both fit" case: how many
+        // victims the order produced and whether they are still valid handles. Read-only.
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 12) {
+                ++printed;
+                std::size_t stale = 0;
+                for (const auto& victim : cursor.victims) {
+                    if (!program.valid_checkpoint(victim.handle)) { ++stale; }
+                }
+                std::fprintf(stderr,
+                             "[rc-probe] reclaim main=%u state=%u victims=%zu stale=%zu relaxed=%d\n",
+                             shortage.main_kv_pages, shortage.state_slots, cursor.victims.size(),
+                             stale, cursor.relaxed ? 1 : 0);
+                std::fflush(stderr);
+            }
+        }
         // Everything this pool could give back is retained: the caller is about to fail a request
         // that a relaxed pass could still satisfy. Offer the optional retained prefixes now; a
         // pinned one stays withheld by `reclaim_order`. One retry per cursor, so a pool that is all

@@ -809,6 +809,18 @@ ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> a
             result.releases.push_back(std::move(*quote));
         }
     }
+    if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+        static int printed = 0;
+        if (printed < 12) {
+            ++printed;
+            std::fprintf(stderr,
+                         "[rc-probe] plan allowed=%zu excluded=%zu owners=%zu demotions=%zu "
+                         "releases=%zu main=%u\n",
+                         allowed.size(), excluded.size(), owners.size(), result.demotions.size(),
+                         result.releases.size(), shortage.main_kv_pages);
+            std::fflush(stderr);
+        }
+    }
     return result;
 }
 

@@ -3,7 +3,9 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -170,7 +172,71 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
 }
 
 bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept {
-    return checkpoint_releasable(*this, handle);
+    const bool releasable = checkpoint_releasable(*this, handle);
+    if (releasable || std::getenv("NINFER_KV_LIFECYCLE_PROBE") == nullptr ||
+        !valid_checkpoint(handle)) {
+        return releasable;
+    }
+    // Diagnostics only: the reclaim planner asks this repeatedly in one attempt, so each checkpoint
+    // slot explains itself once. Everything printed here is read-only.
+    static std::array<bool, 256> reported{};
+    if (handle.index >= reported.size() || reported[handle.index]) { return releasable; }
+    reported[handle.index] = true;
+    const auto& record = checkpoint(handle);
+    struct Half {
+        bool valid = false;
+        std::uint32_t pages = 0;
+        int active = 0;
+        int retired = 0;
+        std::uint32_t no_reference = 0;   // references == 0
+        std::uint32_t active_holds = 0;   // active_references >= references
+        std::uint32_t source_pins = 0;    // pinned while this is the last reference
+        std::uint32_t destination = 0;    // destination pinned
+        bool releasable = false;
+    };
+    const auto inspect = [](const auto& addresses, const auto& pages,
+                            const KVAddressSpaceHandle address) -> Half {
+        Half out;
+        if (!addresses || !pages || !addresses->valid(address)) { return out; }
+        out.valid     = true;
+        out.pages     = addresses->page_count(address);
+        out.active    = addresses->active(address) ? 1 : 0;
+        out.retired   = addresses->retired(address) ? 1 : 0;
+        out.releasable = addresses->can_release(address);
+        for (std::uint32_t index = 0; index < out.pages; ++index) {
+            const std::uint32_t mask =
+                pages->release_block_mask(addresses->logical_page(address, index));
+            if (mask & 1u) { ++out.no_reference; }
+            if (mask & 2u) { ++out.active_holds; }
+            if (mask & 4u) { ++out.source_pins; }
+            if (mask & 8u) { ++out.destination; }
+        }
+        return out;
+    };
+    const Half text    = inspect(text_kv_addresses, text_kv_pages, record.kv->text);
+    const Half backend = record.kv->backend
+                             ? inspect(backend_kv_addresses, backend_kv_pages, *record.kv->backend)
+                             : Half{};
+    const auto print = [](const char* name, const Half& half) {
+        if (!half.valid) {
+            std::fprintf(stderr, " %s{none}", name);
+            return;
+        }
+        std::fprintf(stderr,
+                     " %s{pages=%u active=%d retired=%d rel=%d zero_ref=%u active_hold=%u "
+                     "src_pin=%u dest_pin=%u}",
+                     name, half.pages, half.active, half.retired, half.releasable ? 1 : 0,
+                     half.no_reference, half.active_holds, half.source_pins, half.destination);
+    };
+    std::fprintf(stderr, "[kv-probe] ckpt %u not releasable: pins=%d use_count=%ld state_ok=%d",
+                 handle.index, checkpoints[handle.index].pins,
+                 static_cast<long>(record.kv.use_count()),
+                 state_store->can_release_checkpoint_owner(record.state) ? 1 : 0);
+    print("text", text);
+    print("backend", backend);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+    return releasable;
 }
 
 void ProgramImpl::reclaim_retired() noexcept {

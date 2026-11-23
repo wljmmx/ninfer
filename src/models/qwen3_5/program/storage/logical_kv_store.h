@@ -605,6 +605,21 @@ public:
                !page.destination_pinned && !page.host_replica && page.device_replica.has_value();
     }
 
+    // Why release_reference(handle, false) would refuse, as a bitmask. Diagnostics only:
+    // can_release_reference() remains the single authority for the decision.
+    //   bit0 references == 0            bit2 source_pins != 0 while this is the last reference
+    //   bit1 active_references >= refs  bit3 destination_pinned
+    [[nodiscard]] std::uint32_t release_block_mask(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return 0xFFu; }
+        const Page& page = pages_[handle.index_];
+        std::uint32_t mask = 0;
+        if (page.references == 0) { mask |= 1u << 0; }
+        if (page.active_references >= page.references) { mask |= 1u << 1; }
+        if (page.source_pins != 0 && page.references == 1) { mask |= 1u << 2; }
+        if (page.destination_pinned) { mask |= 1u << 3; }
+        return mask;
+    }
+
     [[nodiscard]] bool can_release_reference(LogicalKVPageHandle handle,
                                              bool writer) const noexcept {
         if (!valid(handle)) { return false; }
