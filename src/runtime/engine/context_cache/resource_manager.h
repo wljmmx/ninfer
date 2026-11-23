@@ -477,7 +477,17 @@ public:
             }
         }
 
+        // Where the capture's wall time goes. The boundary phase of a 163k request measured 1m24.5s
+        // on this box (throughput line: `phases boundary 1m24.5s`), and that phase runs on the lane,
+        // so every queued request behind it waits. Split it before optimising anything.
+        const auto export_started = std::chrono::steady_clock::now();
         auto kv = program.export_checkpoint(handle);
+        const auto export_done = std::chrono::steady_clock::now();
+        if (probe) {
+            std::fprintf(stderr, "[publish] timing: export_checkpoint %.3f s\n",
+                         std::chrono::duration<double>(export_done - export_started).count());
+            std::fflush(stderr);
+        }
         if (!kv || kv->page_count == 0 || kv->page_bytes == 0) {
             if (probe) {
                 std::fprintf(stderr, "[publish] sink: export_checkpoint produced nothing (%d)\n",
@@ -485,7 +495,15 @@ public:
             }
             return;
         }
+        const auto state_started = std::chrono::steady_clock::now();
         auto state = program.export_state(handle);
+        if (probe) {
+            std::fprintf(stderr, "[publish] timing: export_state %.3f s (%zu B)\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - state_started)
+                             .count(),
+                         state ? state->bytes.size() : 0U);
+            std::fflush(stderr);
+        }
         if (!state || state->bytes.empty()) {
             if (probe) { std::fprintf(stderr, "[publish] sink: export_state produced nothing\n"); }
             return;
@@ -538,19 +556,45 @@ public:
         auto payload            = std::make_shared<CachedCheckpoint>(std::move(out));
         std::vector<TokenId> kept(tokens.begin(), tokens.end());
         auto backend = checkpoint_cache_;
-        // The job captures its own COPY of the token ids on purpose. Capturing by move emptied the
-        // local `kept`, and the fallback below then ran with an empty token list: every payload over
-        // the worker's 256 MiB window (measured at 396 MB for a 16k prefix) was refused by enqueue
-        // and silently dropped by the synchronous path, while small prefixes stored fine. A token
-        // list is a few tens of KiB, so copying it costs nothing next to that bug.
-        if (publish_worker_ != nullptr &&
-            publish_worker_->enqueue(
-                [captured_backend = backend, captured_tokens = kept,
-                 captured_payload = payload]() {
-                    captured_backend->store(captured_tokens, *captured_payload);
-                    return true;
-                },
-                bytes, /*due=*/1, /*now=*/0)) {
+        const auto enqueue_started = std::chrono::steady_clock::now();
+        const bool queued = publish_worker_ != nullptr &&
+                            publish_worker_->enqueue(
+                                [captured_backend = backend, captured_tokens = kept,
+                                 captured_payload = payload]() {
+                                    captured_backend->store(captured_tokens, *captured_payload);
+                                    return true;
+                                },
+                                bytes, /*due=*/1, /*now=*/0);
+        if (probe) {
+            std::fprintf(stderr,
+                         "[publish] timing: enqueue %s %.3f s (%.0f MiB), %.0f MiB still on the "
+                         "caller's thread until here\n",
+                         queued ? "accepted" : "REFUSED",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                       enqueue_started)
+                             .count(),
+                         static_cast<double>(bytes) / (1024.0 * 1024.0),
+                         static_cast<double>(bytes) / (1024.0 * 1024.0));
+            std::fflush(stderr);
+        }
+        if (queued) {
+            return;
+        }
+        // A large payload must never be stored on the caller's thread. This is the lane, and the
+        // transport runs at ~5 MiB/s on this box: measured, a 2.5 GiB publish that fell back here
+        // cost `phases boundary 1m24.5s` while every queued request starved behind it (the probes
+        // died with queue-timeout). The payload is already materialised either way, so dropping it
+        // costs one future cache miss - which is far cheaper than a minute of the only lane.
+        // Small payloads still fall through: at a few MiB the synchronous store is milliseconds.
+        constexpr std::size_t kSyncStoreLimitBytes = 64ULL << 20U;
+        if (bytes > kSyncStoreLimitBytes) {
+            if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
+                std::fprintf(stderr,
+                             "[publish] sink: worker refused %.0f MiB, DROPPED (a synchronous store "
+                             "would hold the lane for minutes)\n",
+                             static_cast<double>(bytes) / (1024.0 * 1024.0));
+                std::fflush(stderr);
+            }
             return;
         }
         if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
