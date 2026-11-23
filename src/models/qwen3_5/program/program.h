@@ -556,7 +556,8 @@ public:
     [[nodiscard]] std::optional<CheckpointHandle> import_checkpoint_current_layout(
         const CheckpointExport& kv, const std::vector<std::string>& state_shards,
         std::shared_ptr<const detail::PreparedCaptureBacking> identity = nullptr,
-        const PrefixShortlistKey* key = nullptr, std::string* error = nullptr);
+        const PrefixShortlistKey* key = nullptr, std::string* error = nullptr,
+        bool pin_pages = true);
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;

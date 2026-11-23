@@ -484,7 +484,20 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
     if (host && !result.host_bytes && !facts.host_kv) { return std::nullopt; }
     for (const auto index : histories) {
         const auto& history = facts.histories[index];
-        if (history.references != static_cast<long>(history.checkpoints.size())) { continue; }
+        if (history.references != static_cast<long>(history.checkpoints.size())) {
+            if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+                static int printed = 0;
+                if (printed < 8) {
+                    ++printed;
+                    std::fprintf(stderr,
+                                 "[rc-probe] history skipped: refs=%ld checkpoints=%zu (a live "
+                                 "sequence or an extra holder still owns it)\n",
+                                 history.references, history.checkpoints.size());
+                    std::fflush(stderr);
+                }
+            }
+            continue;
+        }
         std::uint32_t retained_main = 0, retained_backend = 0;
         for (const auto owner : history.checkpoints) {
             if (std::binary_search(removed.begin(), removed.end(), owner)) { continue; }
@@ -512,6 +525,22 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
             const auto& history = pool.histories[suffix.index];
             if (!history.address.valid()) { continue; }
             const auto target = kv_pages_for_frontier(main_pool ? suffix.main : suffix.backend);
+            if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+                static int printed = 0;
+                if (printed < 8) {
+                    ++printed;
+                    const auto first = history.page_count > target ? history.page_count - target : 0;
+                    std::fprintf(stderr,
+                                 "[rc-probe] scan main=%d pages=%u target=%u unique=%u shared=%zu "
+                                 "account_host=%d account_device=%d\n",
+                                 main_pool ? 1 : 0, history.page_count, target,
+                                 first < history.unique_counts.size() ? history.unique_counts[first]
+                                                                      : 0U,
+                                 history.shared.size(), pool.account_host ? 1 : 0,
+                                 pool.account_device ? 1 : 0);
+                    std::fflush(stderr);
+                }
+            }
             if (account && (pool.account_host || pool.account_device)) {
                 const auto count = history.unique_counts[history.page_count - target];
                 if (host) {

@@ -196,5 +196,27 @@ growth_pages_needed≈2558 capacity_pages=4000 live_pages=…`，对外被归一
 退场**动作（abort → 地址 retire → 下趟 reclaim 归还页），再把上面 1、2 两处判据改到"允许延后
 回收"的语义。验收仍是同一条：req1 结束后立刻发 req2（不同前缀）必须成功，而不是 400。
 
+## 第二轮实测：恢复路径的 pin 已修，报价仍只有 1 页
+
+**已修**：`import_checkpoint_current_layout` 的默认 `pin_pages=true` 会让每一次 LMCache 恢复都
+保留创建者引用并给地址打上 checkpoint 保护。恢复调用点（`resource_manager.h` 的 restore）改为
+`pin_pages=false`，理由写在调用处：导入在调度线程同步完成，`choice.source.private_points` 紧接着
+就登记了所有者，`prune()` 不会把它回收；权威字节在缓存服务器上。实测对比：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `[kvt] import refs` | 不打印（只在 pin=false 时打印） | `addr_refs=1 src_pins=0 truncate=1` |
+
+**仍未闭环**：`[rc-probe] scan pages=2558 target=0 unique=1 shared=2557` 没有变化。
+`inspect_suffix` 只在 `facts.references == 1` 时计数（`reclaim.cpp:154`），而这段历史在请求结束后
+仍有**两个检查点**——恢复导入的那个，和 finish 时的捕获。于是报价只能覆盖"另一个检查点 frontier
+之上"的那一段，实测恰好 1 页；`[rc-probe] reclaim … victims=1` 也只提供了一个候选，
+`physical_owner_sets` 的 `permitted()` 因此无法把整组凑齐。
+
+下一步（精确，不再是方向性猜测）：释放时按**物理所有者组**把同一 history 的检查点整组给出，而不是
+只给一个候选；或者在 finish 捕获与恢复导入之间只保留一个检查点（同 frontier 的两次发布已经在
+`publish_to_cache` 里被去重过，但那是缓存侧的，不是检查点侧的）。
+
+
 
 

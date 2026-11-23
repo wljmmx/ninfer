@@ -332,9 +332,16 @@ public:
         // the restore works once (as this candidate) and then the prefix index never returns it
         // again, which reads as "the cache stopped working".
         const auto shortlist = base.prefix_shortlist_key(kv.frontier);
+        // pin_pages=false, deliberately. The default (true) keeps the creator's page reference AND
+        // sets a checkpoint requirement on the address, which makes every restored page look shared:
+        // measured on a 163k restore, 2557 of 2558 pages were counted as unreleasable, so the prefix
+        // could never be given back and a second long request was refused with the pool 3998 of 4000
+        // full. The record does not need that pin here: the import runs on this thread and
+        // `choice.source.private_points` registers the owner immediately below, which is what keeps
+        // prune() from reclaiming it. The authoritative bytes are on the cache server anyway.
         const auto handle = program.import_checkpoint_current_layout(
             kv, cached->state_shards, base.capture_backing(),
-            shortlist ? &*shortlist : nullptr, &error);
+            shortlist ? &*shortlist : nullptr, &error, /*pin_pages=*/false);
         if (!handle) {
             std::fprintf(stderr, "[lmcache] restore failed: %s\n", error.c_str());
             return std::nullopt;
@@ -1020,13 +1027,20 @@ public:
             if (printed < 12) {
                 ++printed;
                 std::size_t stale = 0;
+                std::string frontiers;
                 for (const auto& victim : cursor.victims) {
-                    if (!program.valid_checkpoint(victim.handle)) { ++stale; }
+                    if (!program.valid_checkpoint(victim.handle)) {
+                        ++stale;
+                        continue;
+                    }
+                    frontiers += std::to_string(program.checkpoint_metadata(victim.handle).frontier);
+                    frontiers += ' ';
                 }
                 std::fprintf(stderr,
-                             "[rc-probe] reclaim main=%u state=%u victims=%zu stale=%zu relaxed=%d\n",
+                             "[rc-probe] reclaim main=%u state=%u victims=%zu stale=%zu relaxed=%d "
+                             "frontiers=[%s]\n",
                              shortage.main_kv_pages, shortage.state_slots, cursor.victims.size(),
-                             stale, cursor.relaxed ? 1 : 0);
+                             stale, cursor.relaxed ? 1 : 0, frontiers.c_str());
                 std::fflush(stderr);
             }
         }
