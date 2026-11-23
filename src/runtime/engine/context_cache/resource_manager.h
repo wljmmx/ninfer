@@ -1208,6 +1208,19 @@ public:
             commit_release(program, action.release->sources, cursor, action.rank.loss);
             return ReclaimProgress::Changed;
         }
+        // A strict order can hold victims that yield nothing: measured on 2x163k, one checkpoint of a
+        // restored prefix was offered while the other (the optional retained one) was withheld, so
+        // the release quote could only cover the page above the other's frontier - victims=1,
+        // releases=0, "nothing can be reclaimed" with 2558 pages sitting in that prefix. The
+        // relaxation used to be gated on an EMPTY victim list, which one such victim could satisfy,
+        // keeping the optional set out of reach for good. Offer it whenever the strict order produced
+        // no action at all; `relaxed` on the fresh cursor stops this from looping.
+        if (prefix_retention_ && !cursor.relaxed) {
+            auto relaxed = begin_reclaim(program, cursor.admission, cursor.rights,
+                                         /*relax_retention=*/true);
+            const auto progress = reclaim(program, shortage, excluded, relaxed);
+            if (progress != ReclaimProgress::Blocked) { return progress; }
+        }
         return ReclaimProgress::Blocked;
     }
 

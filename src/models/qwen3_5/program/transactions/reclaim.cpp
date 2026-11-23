@@ -532,12 +532,20 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
                     const auto first = history.page_count > target ? history.page_count - target : 0;
                     std::fprintf(stderr,
                                  "[rc-probe] scan main=%d pages=%u target=%u unique=%u shared=%zu "
-                                 "account_host=%d account_device=%d\n",
+                                 "account_host=%d account_device=%d inactive=%d row=%d "
+                                  "committed=%u\n",
                                  main_pool ? 1 : 0, history.page_count, target,
                                  first < history.unique_counts.size() ? history.unique_counts[first]
                                                                       : 0U,
                                  history.shared.size(), pool.account_host ? 1 : 0,
-                                 pool.account_device ? 1 : 0);
+                                 pool.account_device ? 1 : 0, history.inactive ? 1 : 0,
+                                 pool.addresses ? pool.addresses->bound_row(history.address) : -1,
+                                 history.committed_frontier);
+                    const auto& owner_record = facts.histories[suffix.index];
+                    const std::string counts = "[rc-probe] history refs=" +
+                                               std::to_string(owner_record.references) + " ckpts=" +
+                                               std::to_string(owner_record.checkpoints.size()) + "\n";
+                    std::fprintf(stderr, "%s", counts.c_str());
                     std::fflush(stderr);
                 }
             }

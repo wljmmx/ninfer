@@ -217,6 +217,44 @@ growth_pages_needed≈2558 capacity_pages=4000 live_pages=…`，对外被归一
 只给一个候选；或者在 finish 捕获与恢复导入之间只保留一个检查点（同 frontier 的两次发布已经在
 `publish_to_cache` 里被去重过，但那是缓存侧的，不是检查点侧的）。
 
+## 第三轮实测：两处已改，剩下一处是所有权重复
+
+**已改（提交 a22db520 + 本轮）**：
+
+1. 恢复导入 `pin_pages=false`（见上表）。
+2. 放松保留的重试条件从"候选为空"改为"严格顺序没有产生任何动作"
+   （`resource_manager.h` 的 `reclaim`）。本轮没有观测到它被触发（修复 1 之后候选从 1 个变成 3 个，
+   严格顺序直接给出了报价），保留它作为兜底。
+
+**严格复现仍然失败**（重启清空 → 只恢复一个 163k 前缀 → 发一个缓存外的冷 163k）：
+
+```
+[rc-probe] reclaim main=31 … victims=1 relaxed=0 frontiers=[163694 ]
+[rc-probe] scan main=1 pages=2558 target=0 unique=1 shared=2557 inactive=1 row=-1 committed=163694
+[rc-probe] history refs=2 ckpts=2
+→ HTTP 400, resident=3998 of 4000
+```
+
+`refs=2 ckpts=2` 是关键：同一个 `KVHistory` 上有**两个检查点**——恢复导入的那个，和 finish 时捕获
+的那个。两者指向同一个地址，所以页引用是 2；释放其中任何一个，另一个仍持有全部 2558 页，
+`inspect_suffix` 因此只把最上面 1 页算成可释放。
+
+这不是状态机或记账算术的问题，而是**所有权重复**：`checkpoint_import.cpp` 的注释写明了约定
+（"the caller either adopts this into a record, which takes the reference, or hands it to a request,
+which takes the ownership"），恢复路径却把导入的检查点留在了 owner 里，请求结束时又捕获了一个
+覆盖同一前缀的检查点。
+
+修复需要按这条约定做：请求接管恢复出来的前缀时，源检查点应当被**消费**（或由 owner 释放），而不是
+与 finish 捕获并存。两种可选实现都要动所有权账：
+
+- 让恢复源成为 consuming（`consumable()` / `take_private` 路径），finish 只留下一个检查点；
+- 或者在 `detach_checkpoint` 成功后释放同一 history 上 frontier 不大于新的、且无 owner 引用的
+  重复检查点（需要 Program 暴露"同一 history 的检查点集合"，并确认 manager 里的引用计数不会因此
+  留下失效句柄）。
+
+验收不变：恢复命中之后立刻发一个缓存外的冷 163k，必须成功而不是 400。
+
+
 
 
 
