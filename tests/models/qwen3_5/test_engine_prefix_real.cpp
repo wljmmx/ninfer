@@ -2042,16 +2042,34 @@ int exercise_merged_prefill_production(const char* artifact) {
     } clear_device_slots;
     auto wide_options = [&](std::int32_t context, std::int32_t chunk) {
         ninfer::EngineOptions options;
+        // Diagnosis (NINFER_TEST_LANES=2): the same prompts and the same merged rectangle on an
+        // engine that is only two lanes wide. The pass bookkeeping is identical between arms
+        // (NINFER_MERGE_PROBE), and 2 lanes merge this exact rectangle bit-exactly in the
+        // merged-prefill scenario, so a green run here says the divergence follows the engine
+        // width - i.e. something addressed by lane rather than by row.
+        std::uint32_t lanes = 4;
+        if (const char* requested = std::getenv("NINFER_TEST_LANES"); requested != nullptr) {
+            const int parsed = std::atoi(requested);
+            if (parsed >= 1 && parsed <= 4) { lanes = static_cast<std::uint32_t>(parsed); }
+        }
         options.artifact_path                     = artifact;
         options.max_context                       = context;
         options.kv_capacity        = ninfer::KvCapacityPolicy::explicit_capacity(
-            static_cast<std::uint32_t>(4) * static_cast<std::uint32_t>(context));
+            lanes * static_cast<std::uint32_t>(context));
         options.prefill_chunk                     = chunk;
         options.speculative.backend               = ninfer::SpeculativeBackend::None;
-        options.max_concurrency                   = 4;
-        options.max_pending_requests              = 4;
+        options.max_concurrency                   = lanes;
+        options.max_pending_requests              = lanes;
         options.context_cache.device_state_slots  = 2;
         options.context_cache.host_capacity_bytes = 0;
+        // Diagnosis (NINFER_TEST_STATE_TIER=1): give the state images a Host tier so the engine
+        // keeps two Device images and two Host ones instead of four Device ones. The pass's per-row
+        // mapping is proven identical between arms (NINFER_MERGE_PROBE), so this isolates the
+        // allocation the 4-lane configuration changes: if the divergence disappears here, the
+        // Device state-image layout is what moves the result, not the merge.
+        if (std::getenv("NINFER_TEST_STATE_TIER") != nullptr) {
+            options.context_cache.host_capacity_bytes = 1ULL << 30ULL;
+        }
         return options;
     };
 
@@ -2214,6 +2232,15 @@ int exercise_merged_prefill_production(const char* artifact) {
         }
         std::size_t begin_mismatches = 0;
         std::size_t sequence_mismatches = 0;
+        // Every lane's begin side by side: the question a mismatch raises is whether the merged row
+        // produced another lane's token (a row feeding on the wrong row's KV) or a token that belongs
+        // to no lane at all (a numeric drift crossing the argmax).
+        for (std::size_t lane = 0; lane < 4; ++lane) {
+            std::printf("merged-prefill production %s: lane %zu begin expected %d merged %d\n",
+                        load.name, lane, expected[lane].empty() ? -1 : expected[lane].front(),
+                        merged_tokens[lane].empty() ? -1 : merged_tokens[lane].front());
+        }
+        std::fflush(stdout);
         for (std::size_t lane = 0; lane < 4; ++lane) {
             if (merged_tokens[lane].size() != expected[lane].size()) {
                 std::cerr << "merged-prefill production " << load.name

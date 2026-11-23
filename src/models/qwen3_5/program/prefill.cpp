@@ -23,6 +23,7 @@
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -290,6 +291,30 @@ std::uint32_t ProgramImpl::prefill_remaining(std::uint32_t lane) const {
     return staged.cursor >= staged.prompt_tokens ? 0U : staged.prompt_tokens - staged.cursor;
 }
 
+namespace {
+
+// Diagnosis (NINFER_MERGE_PROBE): a row's tail hidden is the one tensor both arms fill with the same
+// meaning - the chunk's last hidden column, before the head - so hashing it answers "did the merged
+// row compute what the single-lane turn computes" without dumping whole planes. 0 means "not
+// measurable here", which is a different answer from a mismatching hash.
+std::uint64_t tail_hidden_checksum(const Tensor& hidden, cudaStream_t stream) {
+    if (hidden.data == nullptr || hidden.bytes() == 0) { return 0; }
+    std::vector<std::uint8_t> host(static_cast<std::size_t>(hidden.bytes()));
+    if (cudaMemcpyAsync(host.data(), hidden.data, host.size(), cudaMemcpyDeviceToHost, stream) !=
+        cudaSuccess) {
+        return 0;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return 0; }
+    std::uint64_t hash = 1469598103934665603ULL; // FNV-1a, 64 bit
+    for (const std::uint8_t byte : host) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+} // namespace
+
 std::size_t ProgramImpl::prefill_batch_rows(std::span<const std::uint32_t> lanes,
                                             std::span<execution::PrefillRow> out) {
     std::size_t count = 0;
@@ -522,6 +547,21 @@ std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch()
                                   ops::CausalAttentionExecutionEnvelope{visible, visible},
                                   next_tokens, std::span<Tensor* const>(tails.data(), batch));
     device.synchronize();
+
+    if (std::getenv("NINFER_MERGE_PROBE") != nullptr) {
+        std::fprintf(stderr, "[merge-probe] batch=%zu width=%d visible=%u", batch, width, visible);
+        for (std::size_t b = 0; b < batch; ++b) {
+            const execution::PrefillRow& row = rows[selected[b]];
+            std::fprintf(stderr,
+                         " | b=%zu lane=%u kv=%u base=%u count=%u src=%d dst=%d tok=%d hid=%016llx",
+                         b, row.lane, row.kv_row, row.base, row.count, src[b], dst[b],
+                         next_tokens[b],
+                         static_cast<unsigned long long>(
+                             tail_hidden_checksum(*tails[b], device.stream)));
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
 
     Program::MergedPrefillResult result;
     std::array<TokenId, kMaximumConcurrency> finished_tokens{};
@@ -1085,6 +1125,18 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             timing.resume_submit();
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
+            // The other half of NINFER_MERGE_PROBE: the same story the merged pass prints, for the
+            // lane that ran its chunk alone, so the two rows can be compared per lane.
+            if (std::getenv("NINFER_MERGE_PROBE") != nullptr) {
+                std::fprintf(
+                    stderr,
+                    "[merge-probe] single lane=%u base=%u count=%u src=%d dst=%d hid=%016llx\n",
+                    sequence.lane, staged.prompt_tokens - final_chunk_tokens, final_chunk_tokens,
+                    selectors.source, selectors.destination,
+                    static_cast<unsigned long long>(
+                        tail_hidden_checksum(sequence.tail_hidden, device.stream)));
+                std::fflush(stderr);
+            }
         } else {
             mark_workspace_usage(workspace_plan.ordinary_round);
             if (!sequence.tail_hidden_valid) {
