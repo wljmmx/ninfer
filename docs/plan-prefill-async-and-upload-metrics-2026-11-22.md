@@ -192,6 +192,26 @@ submit 28.0 s（关闭时 28.3 s）| 总 108.2 s（关闭时 109.7 s）| 1580 vs
 下一步要先给捕获加失败打印（`cudaStreamEndCapture` 的返回值 + `cudaGraphInstantiate` 的结果），
 确认是"不可捕获"还是"捕获了但没命中"。
 
+## 更正（2026-11-23 晚）：`submit` 28 s 不是 host 开销，prefill 是 GPU 受限
+
+给 prefill 层栈加"首块捕获、同形状回放"（一次性探针，验证后回滚）后，同一冷 163k：
+
+```
+关闭：submit 28.3 s  | devwait 73.0 s  | 总 109.7 s | 1589 tok/s
+开启：submit 0.041 s | devwait 101.3 s | 总 106.3 s | 1589 tok/s
+每块耗时：capture 9.6 ms / replay 0.0 ms
+```
+
+**结论：那 28 s 不是 host 侧提交时间，而是 `run_layers` 内部的一次同步在等 GPU。** 捕获成图之后
+提交变成 41 ms，等待全部并入 devwait，**总时长不变**。因此：
+
+- 之前"prefill host 提交 190 ms/chunk、3 ms/层"的测量是错的（探针跨度包含了别的东西），已撤回；
+- prefill 的墙是 GPU（~101 s / 163k），与 attention 随上下文增长一致；
+- 层栈图回放**合法且生效**（capture 9.6 ms → replay 0.0 ms），但**不带来吞吐收益**，
+  所以没有启用：复杂度和风险换不来速度。
+
+要提速只能动 GPU 侧（attention kernel 的分块/稀疏），不是调度或提交层。
+
 ## 已知的其它结论（不要重复踩）
 
 - 容量方案不成立：`--kv-capacity 327680`（=5120 页，2×2558）被拒
