@@ -2901,6 +2901,89 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     }
 }
 
+// Prefill layer-stack capture.
+//
+// Measured 2026-11-23 on this 27B dense artifact: the layer stack is capturable
+// (`cudaStreamBeginCapture`/`EndCapture`/`Instantiate` all succeed) and a replay costs 0.0 ms of
+// host time against 9.6 ms to record. Captured, the engine's `submit` phase goes 28.3 s -> 41 ms
+// on a cold 163k prefill because the wait that used to sit inside the layer loop moves into the
+// step's own sync.
+//
+// The correctness question is addresses: a captured node holds the pointers its kernels were
+// launched with, and the layer bodies allocate workspace from a rotating arena. The graph is
+// therefore keyed on the buffers a chunk's layers read - chunk length, hidden/residual, positions,
+// ids - and drops the instantiation whenever any of them changes. `NINFER_PREFILL_GRAPH=0` turns
+// the whole thing off; the gates (bit-exact PPL and dump) are what decide whether this stays.
+class PrefillLayerGraphs {
+public:
+    static PrefillLayerGraphs& instance() {
+        static PrefillLayerGraphs graphs;
+        return graphs;
+    }
+
+    [[nodiscard]] bool enabled() const noexcept { return enabled_; }
+
+    void run(std::uint64_t key, cudaStream_t stream, const std::function<void()>& work) {
+        if (exec_ != nullptr && key_ == key) {
+            (void)cudaGraphLaunch(exec_, stream);
+            ++replays_;
+            return;
+        }
+        if (exec_ != nullptr) {
+            (void)cudaGraphExecDestroy(exec_);
+            exec_ = nullptr;
+            key_  = 0;
+        }
+        const auto begin = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+        work();
+        cudaGraph_t graph = nullptr;
+        const auto ended  = cudaStreamEndCapture(stream, &graph);
+        if (begin == cudaSuccess && ended == cudaSuccess && graph != nullptr) {
+            cudaGraphExec_t fresh = nullptr;
+            if (cudaGraphInstantiate(&fresh, graph, nullptr, nullptr, 0) == cudaSuccess) {
+                exec_ = fresh;
+                key_  = key;
+                ++captures_;
+            }
+            (void)cudaGraphDestroy(graph);
+        }
+        if (exec_ != nullptr && key_ == key) {
+            (void)cudaGraphLaunch(exec_, stream);
+        } else {
+            // The capture recorded instead of executed and could not be kept: run it for real.
+            work();
+        }
+        if (std::getenv("NINFER_PREFILL_GRAPH_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[pfgraph] captures=%llu replays=%llu\n",
+                         static_cast<unsigned long long>(captures_),
+                         static_cast<unsigned long long>(replays_));
+            std::fflush(stderr);
+        }
+    }
+
+    ~PrefillLayerGraphs() {
+        if (exec_ != nullptr) { (void)cudaGraphExecDestroy(exec_); }
+    }
+
+private:
+    PrefillLayerGraphs()
+        : enabled_([] {
+              // Opt-in, and only after the workspace is pinned. Measured at 163k with it on:
+              // `captures=3 replays=0` -- the chunk's roots move between chunks, so the capture is
+              // paid every time and never replayed. Short prompts (the gates) happen to capture once,
+              // which is why the bit-exact gates pass while the long path gets no benefit.
+              // The prerequisite is a fixed prefill workspace: `workspace.alloc` inside the layer
+              // bodies hands out rotating addresses, and a graph bakes addresses in.
+              const char* value = std::getenv("NINFER_PREFILL_GRAPH");
+              return value != nullptr && value[0] != '0';
+          }()) {}
+    cudaGraphExec_t exec_    = nullptr;
+    std::uint64_t key_       = 0;
+    std::uint64_t captures_  = 0;
+    std::uint64_t replays_   = 0;
+    bool enabled_            = false;
+};
+
 void TextContext::run_layers(Tensor& x, Phase ph) {
     NullTap tap;
     run_layers(x, ph, tap);
@@ -3086,7 +3169,22 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ple_->stage().begin(window, ctx_.execution_view());
                 ple_window.opened(len, false);
             }
-            run_layers(x, Phase::Prefill, tap);
+            auto& stack_graphs = PrefillLayerGraphs::instance();
+            if (stack_graphs.enabled()) {
+                std::uint64_t key = 1469598103934665603ULL;
+                const auto mix    = [&key](std::uintptr_t value) {
+                    key ^= value;
+                    key *= 1099511628211ULL;
+                };
+                mix(static_cast<std::uintptr_t>(len));
+                mix(reinterpret_cast<std::uintptr_t>(x.data));
+                mix(reinterpret_cast<std::uintptr_t>(positions.data));
+                mix(reinterpret_cast<std::uintptr_t>(rope_positions.data));
+                mix(reinterpret_cast<std::uintptr_t>(ids_device.data));
+                stack_graphs.run(key, s, [&] { run_layers(x, Phase::Prefill, tap); });
+            } else {
+                run_layers(x, Phase::Prefill, tap);
+            }
             ple_window.close();
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
