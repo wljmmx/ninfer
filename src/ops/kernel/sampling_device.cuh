@@ -57,7 +57,7 @@ struct SamplingUintGreater {
     __device__ __forceinline__ bool operator()(unsigned int a, unsigned int b) const {
         return a > b;
     }
-}
+};
 
 // Warp-wide max over the lanes named by `mask`. `__reduce_max_sync` is an sm_80+
 // intrinsic (it compiles to redux.sync); the shfl_down tree is the portable form
