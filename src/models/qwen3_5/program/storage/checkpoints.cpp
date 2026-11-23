@@ -130,32 +130,6 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
         if (++slot.generation == 0) { ++slot.generation; }
         if (!state_store->release_checkpoint_owner(state)) { std::terminate(); }
         refresh_history_requirements(kv, true);
-        // The last checkpoint of a history is the only place where the ADDRESS can be given back,
-        // and it has to happen after the record is gone: `can_release` re-checks that no row, no
-        // reservation and no page reference survives, which is exactly the state the sequence
-        // teardown leaves behind. A truncation in refresh_history_requirements is not enough --
-        // measured at 256K (2026-11-23): `truncated 2558 -> 0 page(s), pool allocated 2559 -> 2558`,
-        // 2558 pages released logically and ONE returned to the pool, because the bound row still
-        // held its own reference.
-        //
-        // Deliberately NOT `release_after_deactivate`: that one releases unconditionally after a
-        // deactivation and terminates when a reference survives, which took the engine down during
-        // startup when it was reached from refresh_history_requirements.
-        if (kv) {
-            bool referenced = false;
-            for (const auto& other : checkpoints) {
-                if (other.value && other.value->kv == kv) {
-                    referenced = true;
-                    break;
-                }
-            }
-            if (!referenced && text_kv_addresses->can_release(kv->text)) {
-                (void)text_kv_addresses->release(kv->text);
-            }
-            if (!referenced && kv->backend && backend_kv_addresses->can_release(*kv->backend)) {
-                (void)backend_kv_addresses->release(*kv->backend);
-            }
-        }
         return true;
     } catch (...) { std::terminate(); }
 }
