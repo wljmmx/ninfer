@@ -568,6 +568,16 @@ public:
         for (const auto point : choice.source.private_points) {
             if (!contains(held, point)) { held.push_back(point); }
         }
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 16) {
+                ++printed;
+                std::fprintf(stderr, "[wait-probe] retain request=%llu held=%zu checkpoint=%d\n",
+                             static_cast<unsigned long long>(request), held.size(),
+                             choice.source.checkpoint ? 1 : 0);
+                std::fflush(stderr);
+            }
+        }
         auto* waiting = find_waiting(request);
         if (!waiting) {
             if (held.empty()) { return; }
@@ -606,6 +616,20 @@ public:
 
     void binding_started(std::uint64_t request, std::span<const Handle> retired,
                          std::optional<Handle> consumed) {
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 16) {
+                ++printed;
+                std::size_t held = 0;
+                if (const auto* waiting = find_waiting(request)) { held = waiting->held.size(); }
+                std::fprintf(stderr,
+                             "[wait-probe] binding_started request=%llu retired=%zu consumed=%d "
+                             "held=%zu\n",
+                             static_cast<unsigned long long>(request), retired.size(),
+                             consumed ? 1 : 0, held);
+                std::fflush(stderr);
+            }
+        }
         if (auto* waiting = find_waiting(request)) { waiting->binding = true; }
         for (const auto handle : retired) { forget(handle); }
         if (consumed) {
@@ -621,6 +645,17 @@ public:
         const auto found = std::find_if(waiting_.begin(), waiting_.end(), [=](const auto& entry) {
             return entry.request == request;
         });
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 16) {
+                ++printed;
+                std::fprintf(stderr, "[wait-probe] release_source request=%llu found=%d held=%zu\n",
+                             static_cast<unsigned long long>(request),
+                             found == waiting_.end() ? 0 : 1,
+                             found == waiting_.end() ? 0U : found->held.size());
+                std::fflush(stderr);
+            }
+        }
         if (found == waiting_.end()) { return; }
         auto held = std::move(found->held);
         waiting_.erase(found);
@@ -683,6 +718,19 @@ public:
         replace_points(program, *owner, carried);
         prune(program);
         balance_reused(program);
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 16) {
+                ++printed;
+                std::fprintf(stderr,
+                             "[own-probe] adopt token=%llu points=%zu carried=%zu take_over=%d "
+                             "source_ckpt=%d\n",
+                             static_cast<unsigned long long>(token), owner->points.size(),
+                             carried.size(), choice.take_over ? 1 : 0,
+                             choice.source.checkpoint ? 1 : 0);
+                std::fflush(stderr);
+            }
+        }
         return token;
     }
 
@@ -785,6 +833,15 @@ public:
         auto* owner = find_owner(token);
         if (!owner) { return; }
         const auto old = points(token);
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 16) {
+                ++printed;
+                std::fprintf(stderr, "[own-probe] abandon token=%llu points=%zu\n",
+                             static_cast<unsigned long long>(token), old.size());
+                std::fflush(stderr);
+            }
+        }
         std::erase_if(owners_, [&](const auto& entry) { return entry.token == token; });
         for (const auto handle : old) { release_unreferenced(program, handle); }
     }
@@ -999,7 +1056,7 @@ public:
         if (program.valid_checkpoint(handle) && !program.release_checkpoint(handle)) {
             return false;
         }
-        forget(handle);
+        forget(handle, "erase");
         prune(program);
         return true;
     }
@@ -1432,7 +1489,20 @@ private:
         return true;
     }
 
-    void forget(Handle handle) {
+    void forget(Handle handle, const char* why = "") {
+        // Diagnostics: forgetting is not releasing. A checkpoint erased here while the Program still
+        // validates the handle is one nothing will ever drop, and its KV address lives on with it.
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            static int printed = 0;
+            if (printed < 16) {
+                ++printed;
+                std::fprintf(stderr,
+                             "[forget-probe] handle %u via=%s owners=%zu waiting=%zu\n",
+                             handle.index, why[0] != '\0' ? why : "?", owner_point_count(handle),
+                             waiting_count(handle));
+                std::fflush(stderr);
+            }
+        }
         index_.erase(handle);
         for (auto& owner : owners_) {
             std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
@@ -1441,6 +1511,21 @@ private:
         for (auto& waiting : waiting_) {
             if (std::erase(waiting.held, handle) && !waiting.binding) { ++waiting.revocations; }
         }
+    }
+
+    [[nodiscard]] std::size_t owner_point_count(Handle handle) const {
+        std::size_t count = 0;
+        for (const auto& owner : owners_) {
+            count += std::count_if(owner.points.begin(), owner.points.end(),
+                                   [&](const auto& point) { return point.handle == handle; });
+        }
+        return count;
+    }
+
+    [[nodiscard]] std::size_t waiting_count(Handle handle) const {
+        std::size_t count = 0;
+        for (const auto& entry : waiting_) { count += contains(entry.held, handle); }
+        return count;
     }
 
     void release_unreferenced(Program& program, Handle handle) {
@@ -1508,7 +1593,7 @@ private:
         for (const auto& waiting : waiting_) {
             for (const auto handle : waiting.held) { inspect(handle); }
         }
-        for (const auto handle : stale) { forget(handle); }
+        for (const auto handle : stale) { forget(handle, "prune"); }
         std::erase_if(owners_,
                       [](const auto& owner) { return !owner.active && owner.points.empty(); });
     }
