@@ -355,7 +355,10 @@ void ProgramImpl::report_prefill_rows(std::span<const std::uint32_t> lanes) {
 }
 
 std::optional<Program::MergedPrefillResult> ProgramImpl::advance_prefill_batch() {
-    if (std::getenv("NINFER_PREFILL_BATCH_EXEC") == nullptr) { return std::nullopt; }
+    // The switch is the engine's now (PolicyController::prefill_merge, with the environment as a
+    // pinned override): the caller only gets here when a merged pass is allowed, so a second gate on
+    // the same variable made the promoted path unreachable - measured: zero [prefill-reject] lines
+    // across a whole burst, because this returned before the first guard could print.
 
     // Diagnosis only: every early return says why it happened, at most 400 lines per process. This is
     // compiled in but silent unless the switch is on, and it is what turns "no [prefill-merged] line"

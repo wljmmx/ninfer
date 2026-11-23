@@ -3063,6 +3063,9 @@ private:
                 }
                 request->model_state = EngineRequestState::Materializing;
                 if (admit_probe) { ++admit_probe_ok_; }
+                // The batching window's clock: a lane admitted now means the rest of the burst may
+                // still be arriving, and the merged pass needs them to start together.
+                prefill_admission_pass_ = scheduling_pass_;
                 materializing_.emplace(
                     MaterializingRequest{request, LaneId{*lane}, begin, restoring, choice});
                 materializing_since_ms_ = monotonic_ms();
@@ -3912,6 +3915,7 @@ private:
                 std::size_t capture_held = 0;
                 std::size_t bound_ready  = 0;
                 models::qwen3_5::execution::PrefillBatchFit fit{};
+                ++scheduling_pass_;
                 if (max_concurrency_ > 1) {
                     std::array<std::uint32_t, kMaximumConcurrency> remaining{};
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -3925,17 +3929,17 @@ private:
                     }
                     fit = models::qwen3_5::execution::prefill_batch_fit(
                         std::span<const std::uint32_t>(remaining.data(), queued));
-                    if (queued != 0) {
+                    {
                         auto& control = models::qwen3_5::execution::policy_controller();
                         // How many requests have prefill work but no row yet: the merge's bootstrap.
+                        // Counted even when no row exists yet - that is exactly the state the
+                        // bootstrap exists for, and gating the observation on `queued != 0` is what
+                        // kept the switch off: a burst that had not started a row never armed it.
                         std::size_t waiting = 0;
                         {
                             std::lock_guard lock(queue_mutex_);
                             waiting = pending_.size() + (materializing_.has_value() ? 1U : 0U);
                         }
-                        // Bound lanes that have not begun their prompt: they are exactly the rows a
-                        // held pass would carry, and they are invisible to `prefill_remaining`
-                        // until they are staged, which is why the fit never sees them.
                         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                             const auto& resident = slots_[lane];
                             if (resident == nullptr || resident->is_prefilling()) { continue; }
@@ -3947,8 +3951,10 @@ private:
                         }
                         control.observe_prefill_waiting(static_cast<std::uint32_t>(waiting));
                         prefill_merge_waiting_ = waiting;
-                        control.observe_prefill_fit(static_cast<std::uint32_t>(queued),
-                                                    fit.merged_ms, fit.separate_ms);
+                        if (queued != 0) {
+                            control.observe_prefill_fit(static_cast<std::uint32_t>(queued),
+                                                        fit.merged_ms, fit.separate_ms);
+                        }
                         // The flip is applied here: this thread owns the criterion, the executor and
                         // the dispatch, so it does not need the parameter bus (whose tick only the
                         // expert-stream path advances). The actuator records for the panel.
@@ -3965,9 +3971,6 @@ private:
                         } else {
                             prefill_merge_agree_ = 0;
                         }
-                        // The decision is driven HERE, not from PolicyController::step(): that runs
-                        // on the expert-stream path, which a dense model never enters, so a dense
-                        // engine would observe the fit and never act on it.
                     }
                 }
                 if (prefill_batch_report_) {
@@ -4027,13 +4030,23 @@ private:
                     hold_prefill = (!pending_.empty() || materializing_.has_value()) &&
                                    !admission_deferred_;
                 }
-                // The merged attempt obeys the same hold as the single-lane turn: admit-first
-                // exists precisely so a queued batch binds before anything prefills, and a merge
-                // that fires with half the lanes bound consumes the first two rows in one pass
-                // and the rest in another - two narrow passes instead of the one the cost model
-                // priced.
-                auto merged = prefill_merge_active() && !hold_prefill &&
-                                      !scheduler_.progress_owner()
+                // 13.5: a batching window after the most recent admission. A merged pass can only
+                // form if the lanes start their chunk together, and in the serve path each request is
+                // admitted into a lane and dispatched the very next pass, so a burst never overlaps.
+                // Holding for a few passes after an admission lets the rest of the burst arrive;
+                // the window expires on its own, so a lone request pays a few passes of deferral and
+                // nothing else - and at expiry the merged attempt runs BEFORE the single-lane turn,
+                // which is what gives it the first shot at the lanes it just waited for.
+                if (!hold_prefill && prefill_merge_active() &&
+                    scheduling_pass_ - prefill_admission_pass_ < kMergeWindowPasses) {
+                    hold_prefill = true;
+                }
+                // The merged attempt is NOT gated by the hold: the hold exists to keep the lanes
+                // staged long enough for a batch to form, and the pass is what consumes it. Gating
+                // the attempt on "not holding" meant the merge was only ever tried in the passes
+                // where the hold had already released the lanes to the single-lane turn - measured:
+                // zero [prefill-reject] lines in a whole burst, i.e. the pass was never attempted.
+                auto merged = prefill_merge_active() && !scheduler_.progress_owner()
                                   ? instance_.program->advance_prefill_batch()
                                   : std::nullopt;
                 if (merged) {
@@ -4219,6 +4232,12 @@ private:
     // Consecutive passes that asked for the same flip; two is enough because the state it reacts to
     // lasts only a few passes per request burst.
     std::uint32_t prefill_merge_agree_ = 0;
+    // Scheduling-pass clock and the last admission's stamp: the batching window that lets a burst
+    // reach a dispatch together. Iterations of the scheduling loop, not milliseconds - the loop's
+    // period varies with the work it does.
+    static constexpr std::uint64_t kMergeWindowPasses = 8;
+    std::uint64_t scheduling_pass_         = 0;
+    std::uint64_t prefill_admission_pass_  = 0;
     // v8 13.4 item 4, second half: opt-in joiner pacing. NINFER_PREFILL_ADMIT_FIRST holds the
     // prefill until every queued joiner is bound; this knob holds a *new* joiner when the
     // merge-window column budget has no room for it, so it does not bind into a pass it cannot
