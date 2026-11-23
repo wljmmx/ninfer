@@ -571,6 +571,10 @@ public:
     checkpoints_sharing_pages(CheckpointHandle checkpoint) const;
     // Diagnostics only (see ProgramImpl::debug_checkpoint_table): one line per live checkpoint.
     void debug_checkpoint_table(const char* tag) const;
+    // Marks these checkpoints released and reclaims what became unreachable; returns the Main KV
+    // pages that actually came back. See ProgramImpl::retire_checkpoint_group.
+    [[nodiscard]] std::uint32_t
+    retire_checkpoint_group(std::span<const CheckpointHandle> handles);
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
                                           const RequestBasePlan& base) const;
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle retained,

@@ -302,6 +302,10 @@ Program::checkpoints_sharing_pages(CheckpointHandle h) const {
     return impl_->checkpoints_sharing_pages(h);
 }
 
+std::uint32_t Program::retire_checkpoint_group(std::span<const CheckpointHandle> handles) {
+    return impl_->retire_checkpoint_group(handles);
+}
+
 bool Program::checkpoint_matches(CheckpointHandle h, const RequestBasePlan& b) const {
     return impl_->checkpoint_matches(h, b);
 }

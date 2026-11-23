@@ -249,6 +249,18 @@ void ProgramImpl::debug_checkpoint_table(const char* tag) const {
     std::fflush(stderr);
 }
 
+std::uint32_t ProgramImpl::retire_checkpoint_group(std::span<const CheckpointHandle> handles) {
+    const auto before = physical_usage().occupied.main_kv_pages;
+    for (const auto handle : handles) {
+        if (valid_checkpoint(handle)) { (void)release_checkpoint(handle); }
+    }
+    // The released slots took their references with them; whatever address is now unreachable is
+    // Retired (or gets retired here) and this pass hands its pages back.
+    reclaim_retired();
+    const auto after = physical_usage().occupied.main_kv_pages;
+    return before > after ? before - after : 0U;
+}
+
 bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept {
     const bool releasable = checkpoint_releasable(*this, handle);
     if (releasable || std::getenv("NINFER_KV_LIFECYCLE_PROBE") == nullptr ||

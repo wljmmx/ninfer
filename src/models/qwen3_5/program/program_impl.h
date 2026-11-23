@@ -372,6 +372,13 @@ public:
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
                                                          std::span<const CheckpointHandle>) const;
     [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
+    // Marks these checkpoints released and then reclaims whatever became unreachable, returning the
+    // Main KV pages that actually came back. This is the lifecycle path of
+    // docs/design-kv-address-lifecycle.md: drop the slot, let the last holder retire the address,
+    // reclaim it, and MEASURE - instead of quoting pages before the fact and re-validating the quote
+    // afterwards. A pinned checkpoint is refused by release_checkpoint itself.
+    [[nodiscard]] std::uint32_t
+    retire_checkpoint_group(std::span<const CheckpointHandle> handles);
     // Diagnostics only: one line per live checkpoint slot, with the address it owns. Answers "which
     // checkpoint still holds this address" without guessing from the page accounts.
     void debug_checkpoint_table(const char* tag) const;

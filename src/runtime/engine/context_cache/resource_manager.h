@@ -1280,6 +1280,34 @@ public:
             const auto progress = reclaim(program, shortage, excluded, relaxed);
             if (progress != ReclaimProgress::Blocked) { return progress; }
         }
+        // Lifecycle fallback (docs/design-kv-address-lifecycle.md): the quote machinery can only reach
+        // pages it can price, and a checkpoint whose pages are shared with another one never prices
+        // well - measured on a restored 163k prefix, two slots of 2558 pages each produced a quote of
+        // one page and "nothing can be reclaimed". So release the group for real: drop the slots, let
+        // the addresses retire, reclaim, and MEASURE what came back. `release_checkpoint` is the only
+        // authority that can refuse (a pinned checkpoint), and it does so on its own.
+        {
+            const auto pinned = retained_prefixes(program).pinned;
+            std::vector<Handle> group;
+            const auto add = [&](Handle handle) {
+                if (!program.valid_checkpoint(handle) || contains(excluded, handle) ||
+                    contains(pinned, handle) || contains(group, handle)) {
+                    return;
+                }
+                group.push_back(handle);
+            };
+            for (const auto& victim : cursor.victims) {
+                add(victim.handle);
+                for (const auto sibling : program.checkpoints_sharing_pages(victim.handle)) {
+                    add(sibling);
+                }
+            }
+            if (!group.empty()) {
+                const auto freed = program.retire_checkpoint_group(group);
+                prune(program);
+                if (freed != 0) { return ReclaimProgress::Changed; }
+            }
+        }
         return ReclaimProgress::Blocked;
     }
 

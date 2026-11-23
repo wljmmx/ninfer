@@ -392,6 +392,40 @@ HTTP 500  "quoted cache release changed before commit"
 被正确登记（或由 `abandon` 真正释放），否则一切按组释放都会在提交校验处被拒。下一轮从
 `replace_points` / `adopt` 的登记行为入手，而不是继续改回收侧的过滤条件。
 
+## 第十轮：按设计把回收接回生命周期（已闭环）
+
+上一轮已经把结论说清楚了：manager 的目录不是"能否丢弃检查点"的权威，Program 的所有权
+（`pins`、state owner）才是。设计文档里回收本来就该是三步——**标记 → 回收 → 度量**，而不是
+"预先报价 → 准入校验 → 提交"。回收路径之前一直走后者，所以一个页被两个地址共享时报价永远只有
+1 页。
+
+实现（`Program::retire_checkpoint_group`，`checkpoints.cpp`）：
+
+```cpp
+const auto before = physical_usage().occupied.main_kv_pages;
+for (const auto handle : handles) { if (valid_checkpoint(handle)) release_checkpoint(handle); }
+reclaim_retired();
+return before > after ? before - after : 0U;
+```
+
+接入点放在 `ResourceManager::reclaim` 的兜底处（严格顺序与放松顺序都没给出动作之后）：把候选与
+**共享物理页**的伙伴合成一组，跳过 pinned 与 excluded，整组交给上面这个操作，然后按"实际归还的
+页数"返回 `Changed`。`release_checkpoint` 自己会拒绝仍在使用的检查点，所以这里不需要第二套授权
+判断——这正是设计里"标记释放永远允许、回收延后"的语义。
+
+实测（`--kv-capacity 256000`，4000 页）：
+
+| 场景 | 改前 | 改后 |
+|---|---|---|
+| 同一 163k 前缀第二次请求 | HTTP 400（43 s），或复制第二份 2558 页 | **3.0 s 命中，页占用保持 2559** |
+| 命中后发一个缓存外的不同 163k | HTTP 400（`resident=3998 of 4000`） | **128 s 跑完，1605 tok/s，无 400** |
+
+日志侧同时出现 `[kv-probe] released ckpt 2: history use_count=2 text_pages=2558`，说明重复的检查点
+确实被释放、地址随后被回收，而不是靠报价"算出"了可释放。
+
+门禁：PPL 7.359779 逐位、dump e95cacb864d8b1ab、regressions 0。
+
+
 
 
 
