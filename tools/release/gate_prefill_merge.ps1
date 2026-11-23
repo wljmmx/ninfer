@@ -27,9 +27,12 @@
 # merged-prefill-production FAILS - four-256 differs from the per-lane reference at the BEGIN token
 # on lanes 1-3, four-3328 at sequence index 1 on lanes 1-3. Both scenarios could not even construct
 # before this run (the production one needs four Device state images; see the scenario's own note),
-# so this is the first measurement of the four-lane shape, not a regression. Until that difference
-# is explained, promoting the switches (letting the controller decide on load) is blocked: a merge
-# that changes tokens is not a performance option.
+# so this is the first measurement of the four-lane shape, not a regression. Its third load,
+# four-256-roomy, narrows it: the same wrong tokens come back with a roomier pool and the pass
+# widened to rows=4 columns=1024, so the divergence is per row and reproducible, not a memory or
+# geometry effect - and four-3328 merges the identical 2 x 256 tail bit-exactly. Until that one
+# shape is explained, promoting the switches (letting the controller decide on load) is blocked: a
+# merge that changes tokens is not a performance option.
 param(
     [string]$Model = "R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer",
     [string[]]$Scenario = @("merged-prefill", "merged-prefill-production")

@@ -2070,7 +2070,23 @@ int exercise_merged_prefill_production(const char* artifact) {
     };
     int outcome = 0;
     for (const Load& load : {Load{"four-256", 256, 512, false},
-                            Load{"four-3328", 3 * 1024 + 256, 3 * 1024 + 256 + 64, true}}) {
+                            Load{"four-3328", 3 * 1024 + 256, 3 * 1024 + 256 + 64, true},
+                            // The control row for four-256: same prompts, same merge rectangle
+                            // (2 rows x 256 columns), only the context and the KV capacity are
+                            // roomy (1024 against the 320 tokens these lanes actually use; 4096 was
+                            // refused at construction with `cudaMalloc failed: insufficient Device
+                            // memory` on this box).
+                            //
+                            // Measured: it reports the SAME wrong begin tokens as four-256
+                            // (258 vs 548, 220 vs 570, 220 vs 317) even though the pass widened to
+                            // rows=4 columns=1024. So the divergence is neither the pool size nor
+                            // the rectangle: it is per row and reproducible. It is also not the
+                            // merged arithmetic in general - four-3328 merges the identical
+                            // 2 x 256 tail bit-exactly, and the 2-lane scenario is exact. What is
+                            // left is the shape where a lane's WHOLE prompt is one tail chunk at
+                            // chunk 1024; that is the row to bisect, and this row keeps it visible
+                            // instead of letting a context change hide it.
+                            Load{"four-256-roomy", 256, 1024, false}}) {
         std::vector<std::vector<ninfer::TokenId>> prompts(4);
         for (std::size_t lane = 0; lane < 4; ++lane) {
             prompts[lane].reserve(static_cast<std::size_t>(load.prompt_tokens));
