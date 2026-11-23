@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/expert_stream.h"
 #include <algorithm>
 #include <cmath>
@@ -199,7 +200,13 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         // the request already takes: the prefix differs by those few tokens, and the pass it saves
         // is the whole point of merging.
         constexpr std::uint32_t kMergeTailFoldTokens = 32;
-        const bool merging = std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr;
+        // Merging is decided at run time by the controller, not by the environment, so the plan has
+        // to read the decision rather than the variable: with the fold gated on the env alone, a
+        // promoted engine planned every conversation request with a near-tail capture and every
+        // merged pass was refused as `mid_capture` (measured 9 of them, 312 more as capture_pending).
+        const bool merging =
+            std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr ||
+            execution::policy_controller().prefill_merge.enabled;
         for (const auto& opportunity : prepared.context_cache.opportunities) {
             if (merging && base->summary.prompt_tokens > opportunity.frontier &&
                 base->summary.prompt_tokens - opportunity.frontier < kMergeTailFoldTokens) {
