@@ -190,13 +190,48 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         const auto& rewrite = prepared.identity.rewrite_checkpoint;
         add(rewrite ? rewrite->recovery_frontier : base->summary.prompt_tokens,
             runtime::CheckpointRole::InputReplay);
+        // A cache opportunity whose frontier sits a handful of tokens before the prompt end costs a
+        // whole extra pass in the single-lane path, and it is exactly what merged prefill cannot
+        // express: the row would have to stop mid-prompt (prefill.cpp rejects it as "mid_capture").
+        // Chat templates place that point at the end of the user message - measured 135 of a
+        // 142-token prompt - so every ordinary conversation carried one and no merged pass ever
+        // formed. With merging enabled, fold that near-tail point into the prompt-frontier capture
+        // the request already takes: the prefix differs by those few tokens, and the pass it saves
+        // is the whole point of merging.
+        constexpr std::uint32_t kMergeTailFoldTokens = 32;
+        const bool merging = std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr;
         for (const auto& opportunity : prepared.context_cache.opportunities) {
+            if (merging && base->summary.prompt_tokens > opportunity.frontier &&
+                base->summary.prompt_tokens - opportunity.frontier < kMergeTailFoldTokens) {
+                continue;
+            }
             add(opportunity.frontier, opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor
                                           ? runtime::CheckpointRole::LongAnchor
                                           : runtime::CheckpointRole::SharedPrefix);
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
+        // Whatever produced it - a cache opportunity, a rewrite recovery frontier, a semantic
+        // boundary - a capture that stops within a handful of tokens of the prompt end costs a whole
+        // pass and blocks every merged pass (prefill.cpp refuses a mid-prompt stop). Fold it into the
+        // prompt-frontier capture the plan already has, but only when merging is enabled: without the
+        // merge the point is an ordinary cache opportunity and dropping it would only cost coverage.
+        if (merging) {
+            const auto before = base->capture_groups.size();
+            std::erase_if(base->capture_groups, [&](const auto& group) {
+                return group.frontier < base->summary.prompt_tokens &&
+                       base->summary.prompt_tokens - group.frontier < kMergeTailFoldTokens;
+            });
+            if (std::getenv("NINFER_PREFILL_BATCH") != nullptr) {
+                std::fprintf(stderr, "[capture-fold] prompt=%u groups %zu -> %zu\n",
+                             base->summary.prompt_tokens, before, base->capture_groups.size());
+                std::fflush(stderr);
+            }
+        } else if (std::getenv("NINFER_PREFILL_BATCH") != nullptr) {
+            std::fprintf(stderr, "[capture-fold] merging OFF for prompt=%u\n",
+                         base->summary.prompt_tokens);
+            std::fflush(stderr);
+        }
     }
     // The model's request boundary: one accepted request is about to generate. This is the event the
     // freeze policy may act on (thaw_on_request, controller-owned); the call carries no decision, so

@@ -97,9 +97,15 @@ static_assert(prefill_class_for(500) == 512);
 // Two measured constants price it: ~1200 ms before a pass is useful (state setup plus expert fill),
 // then ~12 ms per row at small widths (26 tokens = 1232 ms, 74 = 2245, 138 = 2596 on the 4090; the
 // marginal drops to ~2 ms above ~490, which keeps this model conservative exactly where it matters).
+// Measured on this box (RTX 4090, dense 27B v3 artifact, chunk 1024, --spec none), one lane:
+//   4,054-token prompt  2.8 s   (1.4-1.7k tok/s)
+//      67-token prompt  0.5 s   (107-155 tok/s - the fixed sweep dominates)
+// Solving those two points gives roughly 460 ms fixed + 0.58 ms/token. The defaults used to be
+// 1200 ms + 12 ms/token, which priced a 4k prompt at 49 s instead of 2.6 s: every merge looked
+// free, so the decision could not be trusted on either side.
 struct PrefillCostModel {
-    double fixed_ms     = 1200.0;
-    double per_token_ms = 12.0;
+    double fixed_ms     = 460.0;
+    double per_token_ms = 0.58;
 };
 
 struct PrefillBatchFit {
