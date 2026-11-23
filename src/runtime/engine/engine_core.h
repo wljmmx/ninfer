@@ -127,6 +127,12 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
+        // 13.5: the merged prefill starts from the environment's answer when one was given, and off
+        // otherwise - the controller turns it on from the measured fit, never from a default. "Off
+        // unless asked" is what keeps the single-request paths (CLI, perplexity, the tests' per-lane
+        // arm) exactly as they were.
+        prefill_merge_enabled_.store(prefill_merge_from_env_, std::memory_order_relaxed);
+        prefill_admit_first_.store(prefill_admit_from_env_, std::memory_order_relaxed);
         paused_.reserve(max_outstanding_);
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
@@ -1927,6 +1933,31 @@ private:
         }
     }
 
+    // 13.5: the state the dispatch reads. Merging and "hold admission first" are one decision now -
+    // a merged pass needs the lanes bound before it can carry them - with the env switches kept as
+    // explicit overrides for an A/B arm.
+    [[nodiscard]] bool prefill_merge_active() const noexcept {
+        return prefill_merge_enabled_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool prefill_hold_active() const noexcept {
+        return prefill_admit_first_.load(std::memory_order_acquire) || prefill_merge_active();
+    }
+
+    // The bus's accepted executor for "prefill_merge". Refused when the state is pinned by the
+    // environment: a run that says "merge off" is an A/B arm, and the controller must not merge into
+    // it halfway through.
+    bool apply_prefill_merge(double value) {
+        if (prefill_merge_pinned_) { return false; }
+        const bool enabled = value > 0.5;
+        const bool previous = prefill_merge_enabled_.exchange(enabled, std::memory_order_acq_rel);
+        if (previous != enabled) {
+            std::fprintf(stderr, "[ctl] engine prefill merge: %s (controller)\n",
+                         enabled ? "on" : "off");
+            std::fflush(stderr);
+        }
+        return true;
+    }
+
     // v8 9.3: the lane limit in force - the controller may hold it below the configured maximum.
     [[nodiscard]] std::uint32_t effective_concurrency() const noexcept {
         const std::uint32_t active = active_concurrency_.load(std::memory_order_acquire);
@@ -3529,6 +3560,15 @@ private:
             "concurrency", max_concurrency_, 1.0, static_cast<double>(max_concurrency_),
             [this](double value) { return apply_active_concurrency(value); });
         models::qwen3_5::execution::param_bus().note_value("lanes", max_concurrency_);
+        // 13.5: the merged prefill's executor, on the same thread and for the same reason. It is
+        // attached only when the environment has not pinned the state: a pinned arm must not be
+        // merged into by the controller, and without an applier the actuator stays a shadow that
+        // reports what it would do.
+        if (!prefill_merge_pinned_) {
+            models::qwen3_5::execution::param_bus().attach_applier(
+                "prefill_merge", prefill_merge_active() ? 1.0 : 0.0, 0.0, 1.0,
+                [this](double value) { return apply_prefill_merge(value); });
+        }
         // v8 12.5 step 4: the L1 slow dial's executor. Registered on the same thread-local bus,
         // pinned to the pool's real capacity (a model with no expert pool - dense - attaches
         // nothing, and the dial stays honestly no-executor there). The range is v8 12.3's
@@ -3863,12 +3903,17 @@ private:
                 // wrong here it is wrong in the batch too, and this is the cheap place to see it.
                 // NINFER_PREFILL_BATCH turns the report on; the default keeps this branch compiled
                 // out of the hot path entirely.
-                if (prefill_batch_report_) {
+                // 13.5: the fit is arithmetic on the queued lanes' remaining prompt tokens, so the
+                // controller can price a merge on every pass without a measurement window of its
+                // own. Computed whenever more than one lane could contribute - the only case where
+                // there is anything to decide - and the report below reuses the same numbers.
+                std::size_t queued       = 0;
+                std::size_t engine_state = 0;
+                std::size_t capture_held = 0;
+                std::size_t bound_ready  = 0;
+                models::qwen3_5::execution::PrefillBatchFit fit{};
+                if (max_concurrency_ > 1) {
                     std::array<std::uint32_t, kMaximumConcurrency> remaining{};
-                    std::size_t queued      = 0;
-                    std::size_t engine_state = 0;  // engine says prefilling
-                    std::size_t capture_held = 0;  // ...but a capture has not landed yet
-                    std::size_t bound_ready   = 0;  // Program agrees the lane still has a chunk
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         if (!prefill_slots[lane]) { continue; }
                         if (prefill_slots[lane]->is_prefilling()) { ++engine_state; }
@@ -3878,8 +3923,27 @@ private:
                         ++bound_ready;
                         remaining[queued++] = left;
                     }
-                    const auto fit = models::qwen3_5::execution::prefill_batch_fit(
+                    fit = models::qwen3_5::execution::prefill_batch_fit(
                         std::span<const std::uint32_t>(remaining.data(), queued));
+                    if (queued != 0) {
+                        auto& control = models::qwen3_5::execution::policy_controller();
+                        // How many requests have prefill work but no row yet: the merge's bootstrap.
+                        std::size_t waiting = 0;
+                        {
+                            std::lock_guard lock(queue_mutex_);
+                            waiting = pending_.size() + (materializing_.has_value() ? 1U : 0U);
+                        }
+                        control.observe_prefill_waiting(static_cast<std::uint32_t>(waiting));
+                        control.observe_prefill_fit(static_cast<std::uint32_t>(queued),
+                                                    fit.merged_ms, fit.separate_ms);
+                        // The decision is driven HERE, not from PolicyController::step(): that runs
+                        // on the expert-stream path, which a dense model never enters, so a dense
+                        // engine would observe the fit and never act on it. This thread is also the
+                        // one that attached the bus applier, so the write lands on the right bus.
+                        control.drive_prefill_merge(!prefill_merge_pinned_);
+                    }
+                }
+                if (prefill_batch_report_) {
                     ++prefill_batch_reports_;
                     // NINFER_PREFILL_BATCH=all prints every dispatch, not just the first few: a
                     // sampled report hid whether the later dispatches already see two ready lanes,
@@ -3921,7 +3985,7 @@ private:
                 // a queued lane can still be bound is what puts two heads in the same pass; it is
                 // opt-in until it has been measured.
                 bool hold_prefill = false;
-                if (prefill_admit_first_) {
+                if (prefill_hold_active()) {
                     // Hold while anything is still queued - not only while a bind can start right
                     // now. Binding is a context transaction that opens and closes over several loop
                     // passes; holding only when it is free let a head slip in between two binds, and
@@ -3935,7 +3999,7 @@ private:
                 // that fires with half the lanes bound consumes the first two rows in one pass
                 // and the rest in another - two narrow passes instead of the one the cost model
                 // priced.
-                auto merged = prefill_batch_exec_ && !hold_prefill &&
+                auto merged = prefill_merge_active() && !hold_prefill &&
                                       !scheduler_.progress_owner()
                                   ? instance_.program->advance_prefill_batch()
                                   : std::nullopt;
@@ -4106,10 +4170,16 @@ private:
     // Q67/S1: read once, so the report costs a pointer comparison per prefill pass and nothing on
     // the decode path. NINFER_PREFILL_BATCH prints what a merged prefill would be.
     bool prefill_batch_report_ = std::getenv("NINFER_PREFILL_BATCH") != nullptr;
-    // Q67/S1: opt-in "admit before prefilling" hold; see the prefill dispatch.
-    bool prefill_admit_first_ = std::getenv("NINFER_PREFILL_ADMIT_FIRST") != nullptr;
-    // Q67/S1: opt-in merged prefill dispatch (interior chunks only).
-    bool prefill_batch_exec_ = std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr;
+    // 13.5: the merged prefill's state, promoted out of the environment. The controller owns it
+    // (PolicyController::prefill_merge, driven by the measured fit of the queued lanes' token
+    // counts); NINFER_PREFILL_BATCH_EXEC / NINFER_PREFILL_ADMIT_FIRST survive as explicit overrides
+    // so an A/B arm can pin the state, and pinning turns the actuator into a shadow - a run that
+    // says "merge off" must not be merged into by a controller halfway through.
+    bool prefill_merge_from_env_      = std::getenv("NINFER_PREFILL_BATCH_EXEC") != nullptr;
+    bool prefill_admit_from_env_      = std::getenv("NINFER_PREFILL_ADMIT_FIRST") != nullptr;
+    bool prefill_merge_pinned_        = prefill_merge_from_env_ || prefill_admit_from_env_;
+    std::atomic<bool> prefill_merge_enabled_{false};
+    std::atomic<bool> prefill_admit_first_{false};
     // v8 13.4 item 4, second half: opt-in joiner pacing. NINFER_PREFILL_ADMIT_FIRST holds the
     // prefill until every queued joiner is bound; this knob holds a *new* joiner when the
     // merge-window column budget has no room for it, so it does not bind into a pass it cannot

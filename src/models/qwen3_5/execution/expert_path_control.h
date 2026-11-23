@@ -126,6 +126,16 @@ public:
     PolicyActuator freeze_set;
     // v8 9.3: enabled == true means SERIAL admission is in force (the engine fills one lane).
     PolicyActuator concurrency;
+    // 13.5: enabled == true means a prefill pass may carry several lanes' chunks at once. Unlike the
+    // serial rule this one needs no throughput verification: the criterion is arithmetic on the
+    // queued lanes' token counts (prefill_batch_fit), measured before the pass and identical for
+    // every pass of the same shape, so there is nothing for a tps window to disagree with. The
+    // agreement run exists only to keep a wash from flapping the switch.
+    PolicyActuator prefill_merge;
+    std::uint32_t prefill_queued  = 0;
+    std::uint32_t prefill_waiting = 0;
+    double prefill_merged_ms     = -1.0;
+    double prefill_separate_ms   = -1.0;
     ninfer::ControllerMode mode = ninfer::controller_mode();
     double link_gbps    = 0.0;
     std::uint64_t layers = 0;
@@ -180,6 +190,20 @@ public:
 
     // v8 9.3: the engine marks whether the layer about to run is prefill or decode.
     void observe_prefill(bool active) { signals.in_prefill = active; }
+
+    // 13.5: what a merged prefill pass would cost against running the same rows one lane at a time.
+    // The engine feeds this from prefill_batch_fit every scheduling pass, so the controller never
+    // prices a merge itself - it holds the state the arithmetic asks for.
+    void observe_prefill_fit(std::uint32_t queued, double merged_ms, double separate_ms) {
+        prefill_queued      = queued;
+        prefill_merged_ms   = merged_ms;
+        prefill_separate_ms = separate_ms;
+    }
+
+    // Requests with prefill work that are not in a pass yet (waiting for a lane, or mid-bind).
+    // Without this the merge can never bootstrap: with the hold off, a lane starts prefilling the
+    // pass after it binds, so a second row is never waiting when the fit is priced.
+    void observe_prefill_waiting(std::uint32_t waiting) { prefill_waiting = waiting; }
 
     // One 32 MiB host-to-device copy, timed once: the link the Device would read host experts over.
     // Replaced by a per-layer measurement once that path exists.
@@ -350,8 +374,62 @@ public:
         return false; // concurrent in force, healthy: keep it
     }
 
-    // v8 12.4: score = tps - lambda1*p99_latency - lambda2*miss*miss_cost. No per-request p99
-    // collection point exists yet, so the latency term uses the layer-wall EWMA x 40 as the
+    // 13.5: merge when a rectangle exists and one pass prices cheaper than the rows apart. A 5%
+    // margin keeps a wash from flapping; with no measurement yet the current state is held, so a
+    // freshly started engine does not merge before it has a fit to merge on.
+    [[nodiscard]] bool want_prefill_merge() const {
+        // Bootstrap first: two or more requests with prefill work in the engine (one already
+        // contributing a row, one waiting for a lane) is the state a merged pass exists for, and it
+        // is the ONLY state in which holding admission can pay - a single request gains nothing from
+        // waiting for a batch that will never form.
+        if (prefill_queued + prefill_waiting >= 2 && prefill_queued < 2) { return true; }
+        if (prefill_queued < 2 || prefill_merged_ms <= 0.0 || prefill_separate_ms <= 0.0) {
+            return prefill_merge.enabled;
+        }
+        return prefill_merged_ms < prefill_separate_ms * 0.95;
+    }
+
+    void drive_prefill_merge(bool wired) {
+        PolicyActuator& actuator = prefill_merge;
+        if (actuator.settle_layers > 0) {
+            --actuator.settle_layers;
+            return;
+        }
+        const bool want = want_prefill_merge();
+        if (want == actuator.enabled) {
+            actuator.agree = 0;
+            return;
+        }
+        // Eight agreeing dispatches rather than 32 layers: this decision is recomputed on every
+        // scheduling pass, not once per layer.
+        if (++actuator.agree < 8U) { return; }
+        const bool was   = actuator.enabled;
+        actuator.enabled = want;
+        actuator.agree   = 0;
+        actuator.settle_layers = 32;
+        actuator.reason = want ? "fit: one pass cheaper" : "fit: rows apart cheaper";
+        if (!wired) {
+            actuator.enabled = was;
+            actuator.reason  = "shadow";
+            actuator.wired   = false;
+            return;
+        }
+        const ParamReject reject = param_bus().set("prefill_merge", want ? 1.0 : 0.0, true);
+        if (reject != ParamReject::Ok) {
+            actuator.enabled = was;
+            actuator.reason  = param_reject_text(reject);
+            actuator.wired   = false;
+            return;
+        }
+        actuator.wired = true;
+        std::fprintf(stderr,
+                     "[ctl] prefill merge %s->%s (%s, merged %.0fms vs separate %.0fms, queued %u)\n",
+                     was ? "on" : "off", want ? "on" : "off", actuator.reason, prefill_merged_ms,
+                     prefill_separate_ms, prefill_queued);
+        std::fflush(stderr);
+    }
+
+    // v8 12.4: score = tps - lambda1*p99_latency - lambda2*miss*miss_cost. No per-request p99    // collection point exists yet, so the latency term uses the layer-wall EWMA x 40 as the
     // measured proxy (and 1000/tps when even that is absent, i.e. the timing switch is off); the
     // panel prints which proxy is in force. The lambdas are first-phase anchors, printable and
     // mode-scaled rather than tuned: stable quadruples the latency weight, performance nearly
@@ -770,6 +848,7 @@ public:
                   "32 clean layers; keep if static or tps holds");
         }
         drive_concurrency(concurrency_wired);
+        drive_prefill_merge(param_bus().has_applier("prefill_merge"));
         // Bus accounting: publish what the live mechanisms actually hold, and settle the last
         // ledger entry's tps at the next window boundary (v8 12.4 step 6). freeze_on mirrors
         // the armed SWITCH (the parameter); the frozen state is a signal and prints as
@@ -803,7 +882,8 @@ public:
                      "[ctl] fetch=%.0fus upload=%.0fus/exp read=%.0fus/exp miss=%.2f | "
                      "wall=%.3fms gpu=%.3fms ens=%.3fms | cov static=%s no_miss=%s capt=%s "
                      "capt_free=%s capt_ready=%s | "
-                     "path=%s(%s) pf=%s(%s) graph=%s(%s) serial=%s(%s) freeze=%s(%s) | tps=%.1f\n",
+                     "path=%s(%s) pf=%s(%s) graph=%s(%s) serial=%s(%s) merge=%s(%s) freeze=%s(%s) "
+                     "| tps=%.1f\n",
                      signals.fetch_us, signals.upload_us_per_expert, signals.read_us_per_expert,
                      signals.miss_per_layer, signals.wall_ms, signals.gpu_ms, signals.ens_ms, s, n,
                      c, f, r,
@@ -811,6 +891,7 @@ public:
                      on_off(prefetch.enabled), prefetch.wired ? "live" : "shadow",
                      on_off(graph.enabled), graph.wired ? "live" : "shadow",
                      on_off(concurrency.enabled), concurrency.wired ? "live" : "shadow",
+                     on_off(prefill_merge.enabled), prefill_merge.wired ? "live" : "shadow",
                      on_off(freeze_set.enabled), freeze_set.wired ? "live" : "shadow",
                      signals.decode_tps < 0.0 ? 0.0 : signals.decode_tps);
         std::fprintf(stderr,
