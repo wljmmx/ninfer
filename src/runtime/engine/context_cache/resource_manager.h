@@ -93,21 +93,34 @@ public:
 
     // The backend is optional and only consulted when the local pool yields no candidate; an
     // empty one keeps every existing path byte-identical.
-    // The window a publish may occupy in the writer queue.
+    // How many publishes may be in flight, and how many bytes they may hold between them.
     //
-    // This is a byte account, not an allocation: a job already owns its payload, so the window only
-    // decides how many of them may be queued. It used to be a flat 256 MiB, which is smaller than a
-    // single 16k checkpoint (~400 MB), so every large store was refused and fell through to the
-    // synchronous path - 3.1 s of transfer on the thread that just finished the request. The default
-    // now holds one large checkpoint plus room for a small one behind it; NINFER_PUBLISH_WINDOW_MB
-    // overrides it for a machine that can or cannot afford more.
-    [[nodiscard]] static std::size_t publish_window_bytes() {
-        constexpr std::size_t kDefault = 1024ULL * 1024 * 1024;
-        const char* value = std::getenv("NINFER_PUBLISH_WINDOW_MB");
-        if (value == nullptr || *value == '\0') { return kDefault; }
-        const long parsed = std::strtol(value, nullptr, 10);
-        if (parsed <= 0) { return kDefault; }
-        return static_cast<std::size_t>(parsed) * 1024ULL * 1024ULL;
+    // The queue is bounded by ITEM, not by a read-ahead window. A publish arrives with its payload
+    // already exported into memory, so charging a byte window again for it refuses the job for a
+    // memory cost the caller has already paid. That was not hypothetical: one 163k prefix exports
+    // to 2545 MiB, and the old 1024 MiB window refused every such publish
+    // (`[publish] timing: enqueue REFUSED 0.000 s (2545 MiB)`), so the serving lane either stored
+    // it synchronously (84 s of boundary, every queued request starved) or, since 67d4acc2, lost
+    // the checkpoint and with it the prefix that the next request would have matched.
+    //
+    // The two bounds that do matter are kept: at most kPublishQueueItems payloads (one running plus
+    // two waiting), and at most publish_queue_bytes() resident between them. The default ceiling
+    // holds three 163k checkpoints (3 x 2545 MiB = 7.5 GiB); that is the most this queue may ever
+    // hold, not an amount it tries to fill.
+    static constexpr std::size_t kPublishQueueItems = 3;
+
+    [[nodiscard]] static std::size_t publish_queue_bytes() {
+        constexpr std::size_t kDefault = 8ULL * 1024 * 1024 * 1024;
+        // NINFER_PUBLISH_WINDOW_MB keeps working so an existing A/B script still has a knob; it now
+        // means the hard ceiling on resident publishes rather than a per-window allowance.
+        for (const char* name : {"NINFER_PUBLISH_QUEUE_MB", "NINFER_PUBLISH_WINDOW_MB"}) {
+            const char* value = std::getenv(name);
+            if (value == nullptr || *value == '\0') { continue; }
+            const long parsed = std::strtol(value, nullptr, 10);
+            if (parsed <= 0) { continue; }
+            return static_cast<std::size_t>(parsed) * 1024ULL * 1024ULL;
+        }
+        return kDefault;
     }
 
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs,
@@ -119,7 +132,9 @@ public:
         // finished capturing. Exporting stays on the calling thread (it touches Program), the
         // transfer does not.
         if (checkpoint_cache_ != nullptr) {
-            publish_worker_ = std::make_unique<core::Prefetcher>(publish_window_bytes());
+            publish_worker_ = std::make_unique<core::Prefetcher>(
+                /*budget_bytes=*/0, /*min_usefulness=*/0.10, kPublishQueueItems,
+                publish_queue_bytes());
         }
     }
 
@@ -457,13 +472,15 @@ public:
             if (probe) { std::fprintf(stderr, "[publish] sink: no tokens\n"); }
             return;
         }
-        // A request publishes twice by design: the prompt-frontier capture and the finish-time
-        // record. Those are often the same prefix (measured: frontier 1729 from both), and exporting
-        // it a second time costs about 85 ms of the response path plus another whole payload on the
-        // wire for a key the cache already holds. Publishers are monotone per owner - a later
-        // frontier supersedes an earlier one - so an equal-or-shorter frontier is always already
-        // covered. Printed, because a silent skip here would look exactly like the bug this call
-        // was added to fix.
+        // A request offers a checkpoint twice by design: the prompt-frontier capture and the
+        // finish-time record. Those are often the same prefix (measured: frontier 1729 from both),
+        // and exporting it a second time costs about 85 ms of the response path plus another whole
+        // payload on the wire for a key the cache already holds. Publishers are monotone per owner
+        // - a later frontier supersedes an earlier one - so an equal-or-shorter frontier is already
+        // covered. "Covered" now means accepted: claim_frontier() below runs only when the payload
+        // was queued or stored, so a refused publish leaves the owner free and the finish-time
+        // offer becomes the retry that gets the prefix into the cache. Printed, because a silent
+        // skip here would look exactly like the bug this call was added to fix.
         if (owner != 0) {
             const auto seen = published_frontiers_.find(owner);
             if (seen != published_frontiers_.end() && seen->second >= summary.frontier) {
@@ -530,12 +547,16 @@ public:
                          kv->kv_bytes.size());
             std::fflush(stderr);
         }
-        // Claim the frontier only once the export has actually produced something: a failed export
-        // must leave the owner free to publish the same prefix again.
-        if (owner != 0) {
+        // The frontier is claimed only when the payload is actually accepted (queued or stored).
+        // Claiming it here, on export alone, marked a *refused* publish as published: the payload
+        // was dropped, the finish-time offer then matched the claim and was skipped as "already
+        // published", and the prefix never reached the cache. That is how a 2545 MiB checkpoint
+        // disappeared while the log only showed `enqueue REFUSED`.
+        const auto claim_frontier = [&] {
+            if (owner == 0) { return; }
             auto& published = published_frontiers_[owner];
             published       = std::max(published, summary.frontier);
-        }
+        };
 
         CachedCheckpoint out;
         out.frontier   = kv->frontier;
@@ -549,16 +570,17 @@ public:
                                       state->bytes.size());
 
         // Exporting above touches Program and has to stay on this thread. The transfer does not, and
-        // it is the expensive part (~1.5 s for 640 tokens), so it goes to the worker. If the budget
-        // is full the call falls through to a synchronous transfer: losing the checkpoint would be
-        // worse than a slow request.
+        // it is the expensive part (~1.5 s for 640 tokens), so it goes to the worker. The queue is
+        // bounded by item and by a hard ceiling on resident bytes, never by a read-ahead window: the
+        // payload is already materialised, so refusing it would save no memory (see
+        // publish_queue_bytes()).
         const std::size_t bytes = out.kv_bytes.size() + state->bytes.size();
         auto payload            = std::make_shared<CachedCheckpoint>(std::move(out));
         std::vector<TokenId> kept(tokens.begin(), tokens.end());
         auto backend = checkpoint_cache_;
         const auto enqueue_started = std::chrono::steady_clock::now();
         const bool queued = publish_worker_ != nullptr &&
-                            publish_worker_->enqueue(
+                            publish_worker_->enqueue_item(
                                 [captured_backend = backend, captured_tokens = kept,
                                  captured_payload = payload]() {
                                     captured_backend->store(captured_tokens, *captured_payload);
@@ -567,17 +589,21 @@ public:
                                 bytes, /*due=*/1, /*now=*/0);
         if (probe) {
             std::fprintf(stderr,
-                         "[publish] timing: enqueue %s %.3f s (%.0f MiB), %.0f MiB still on the "
-                         "caller's thread until here\n",
+                         "[publish] timing: enqueue %s %.3f s (%.0f MiB); queue %zu item(s), "
+                         "%.0f MiB resident\n",
                          queued ? "accepted" : "REFUSED",
                          std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                        enqueue_started)
                              .count(),
                          static_cast<double>(bytes) / (1024.0 * 1024.0),
-                         static_cast<double>(bytes) / (1024.0 * 1024.0));
+                         publish_worker_ ? publish_worker_->pending() : 0U,
+                         publish_worker_ ? static_cast<double>(publish_worker_->pending_bytes()) /
+                                               (1024.0 * 1024.0)
+                                         : 0.0);
             std::fflush(stderr);
         }
         if (queued) {
+            claim_frontier();
             return;
         }
         // A large payload must never be stored on the caller's thread. This is the lane, and the
@@ -590,8 +616,9 @@ public:
         if (bytes > kSyncStoreLimitBytes) {
             if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
                 std::fprintf(stderr,
-                             "[publish] sink: worker refused %.0f MiB, DROPPED (a synchronous store "
-                             "would hold the lane for minutes)\n",
+                             "[publish] sink: queue refused %.0f MiB, DROPPED (a synchronous store "
+                             "would hold the lane for minutes); frontier left unclaimed so the "
+                             "finish-time publish remains a retry\n",
                              static_cast<double>(bytes) / (1024.0 * 1024.0));
                 std::fflush(stderr);
             }
@@ -599,11 +626,12 @@ public:
         }
         if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
             std::fprintf(stderr,
-                         "[publish] sink: worker refused %zu B, storing synchronously on this thread\n",
+                         "[publish] sink: queue refused %zu B, storing synchronously on this thread\n",
                          bytes);
             std::fflush(stderr);
         }
         backend->store(kept, *payload);
+        claim_frontier();
     }
 
     void retain_source(Program& program, std::uint64_t request, const SourceChoice& choice) {

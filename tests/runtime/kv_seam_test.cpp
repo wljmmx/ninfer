@@ -169,6 +169,79 @@ int main() {
     }
 
     {
+        // Publishes are queued by ITEM, not by a read-ahead window. A KV checkpoint is exported into
+        // memory before it is offered, so a window that refuses a 2.5 GiB payload saves no memory
+        // and only loses the checkpoint (measured: `enqueue REFUSED (2545 MiB)`, after which the
+        // lane either stored it for 84 s or dropped it). The bounds that remain are the item count
+        // and the ceiling on resident bytes, and the ceiling has to track what is resident, not
+        // what was ever offered.
+        ninfer::core::Prefetcher publish(/*budget_bytes=*/0, 0.10, /*max_pending=*/2,
+                                         /*hard_bytes=*/6ULL << 20);
+        std::promise<void> release;
+        const std::shared_future<void> gate = release.get_future().share();
+        std::atomic<int> entered{0};
+        const auto hold = [&] {
+            ++entered;
+            gate.wait();
+            return true;
+        };
+
+        expect(publish.enqueue_item(hold, 4ULL << 20, 10, 0),
+               "a payload over any read-ahead window is accepted by the item queue");
+        for (int i = 0; i < 500 && entered.load() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(entered.load() == 1, "the worker picked the held job up");
+        expect(publish.pending_bytes() == (4ULL << 20), "resident bytes count the running job");
+        expect(!publish.enqueue_item(hold, 4ULL << 20, 10, 0),
+               "a second payload that would exceed the ceiling is refused");
+        expect(publish.stats().dropped_ceiling == 1,
+               "the refusal is counted as a ceiling drop, apart from budget and backlog");
+        expect(publish.stats().dropped_budget == 0,
+               "the read-ahead window plays no part in the item queue");
+        expect(publish.enqueue_item(hold, 2ULL << 20, 10, 0),
+               "a payload inside the remaining ceiling is accepted");
+        release.set_value();
+        for (int i = 0; i < 500 && publish.pending() != 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(publish.pending() == 0, "both jobs finished");
+        expect(publish.pending_bytes() == 0,
+               "bytes are returned on completion, so the ceiling is not a permanent leak");
+    }
+
+    {
+        // One large payload at a time. Two of them are two copies of a whole prefix (2545 MiB each
+        // at 163k) held while the next request is restoring and exporting its own, which is the
+        // shape that measured `bad allocation` on the serving lane. The rule is on the payloads, not
+        // on the window: any number of small ones is fine.
+        ninfer::core::Prefetcher large(/*budget_bytes=*/0, 0.10, /*max_pending=*/4,
+                                       /*hard_bytes=*/16ULL << 30);
+        std::promise<void> release;
+        const std::shared_future<void> gate = release.get_future().share();
+        std::atomic<int> entered{0};
+        const auto hold = [&] {
+            ++entered;
+            gate.wait();
+            return true;
+        };
+        expect(large.enqueue_item(hold, 2545ULL << 20, 10, 0), "one large payload is accepted");
+        for (int i = 0; i < 500 && entered.load() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(!large.enqueue_item(hold, 2545ULL << 20, 10, 0),
+               "a second large payload is refused while the first is resident");
+        expect(large.stats().dropped_ceiling == 1, "and counted as a ceiling drop");
+        expect(large.enqueue_item(hold, 8ULL << 20, 10, 0),
+               "a small payload behind a large one is still accepted");
+        release.set_value();
+        for (int i = 0; i < 500 && large.pending() != 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(large.pending_bytes() == 0, "both payloads leave the ceiling on completion");
+    }
+
+    {
         // Backpressure (D2's second gate). The byte budget bounds what one window may ask for; it
         // says nothing about how far the producer may run ahead of a worker stuck in a slow read.
         // The cap is therefore on running + waiting, and it is proved here rather than by hoping a

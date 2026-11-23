@@ -38,6 +38,11 @@ struct PrefetchStats {
     // waiting). This is the backpressure valve: a byte budget bounds what a window may spend, not
     // how far the producer may run ahead of a slow disk.
     std::uint64_t dropped_backlog  = 0;
+    // Refused by the queue's hard ceiling on resident job bytes (enqueue_item). Separate from
+    // dropped_budget, which belongs to the read-ahead window the queue has to allocate for: a
+    // publish arrives with its payload already materialised, so the only memory bound it needs is
+    // the ceiling on how many such payloads may be resident at once.
+    std::uint64_t dropped_ceiling  = 0;
     // Offered after stop(). A process-scoped owner is stopped before it is destroyed, so this is
     // the count of callers that raced the shutdown rather than a scheduling decision.
     std::uint64_t dropped_stopped  = 0;
@@ -53,6 +58,10 @@ struct PrefetchStats {
 
 class Prefetcher {
 public:
+    // What counts as a large payload for the one-at-a-time rule in enqueue_item(): anything that
+    // copies a whole prefix (one 163k checkpoint is 2545 MiB, one 256k is about 4 GiB).
+    static constexpr std::size_t kLargePayloadBytes = 1ULL << 30;
+
     struct Job {
         std::function<bool()> run;  // returns true when the bytes were actually staged
         std::size_t bytes   = 0;
@@ -60,8 +69,9 @@ public:
     };
 
     Prefetcher(std::size_t budget_bytes, double min_usefulness = 0.10,
-               std::size_t max_pending = 8)
-        : budget_(budget_bytes), min_usefulness_(min_usefulness), max_pending_(max_pending) {
+               std::size_t max_pending = 8, std::size_t hard_bytes = 0)
+        : budget_(budget_bytes), hard_bytes_(hard_bytes), max_pending_(max_pending),
+          min_usefulness_(min_usefulness) {
         worker_ = std::thread([this] { run(); });
     }
 
@@ -115,6 +125,62 @@ public:
             return false;
         }
         window_bytes_ += bytes;
+        pending_bytes_ += bytes;
+        stats_.bytes_requested += bytes;
+        ++stats_.enqueued;
+        jobs_.push_back(Job{std::move(run), bytes, due});
+        wake_.notify_one();
+        return true;
+    }
+
+    // Item-bounded enqueue for a payload the caller has ALREADY materialised: a KV checkpoint that
+    // was exported into memory before it was handed over. The byte window above exists to bound
+    // read-ahead the queue itself would have to allocate, so charging it again for bytes that
+    // already exist refuses the job for a memory cost the caller has already paid. That is not
+    // hypothetical: an exported 2.5 GiB checkpoint (one 163k prefix) measured
+    // `[publish] timing: enqueue REFUSED 0.000 s (2545 MiB)` against the 1024 MiB window, which
+    // either stored it synchronously on the serving lane (84 s of boundary, every queued request
+    // starved) or, after 67d4acc2, dropped it entirely.
+    //
+    // What still bounds memory is the count (running + waiting, the same backpressure valve) and
+    // the hard ceiling on resident job bytes. Both are needed: the count alone lets three 163k
+    // checkpoints queue (7.5 GiB) on a box that cannot hold them, and the ceiling alone lets a
+    // stream of tiny jobs grow without limit. Bytes are returned when the job completes or is
+    // dropped by advance(), so the ceiling tracks what is actually resident, not what was asked for.
+    bool enqueue_item(std::function<bool()> run, std::size_t bytes, std::uint64_t due,
+                      std::uint64_t now) {
+        std::lock_guard lock(mutex_);
+        if (stopping_) {
+            ++stats_.dropped_stopped;
+            return false;
+        }
+        if (due <= now) {
+            ++stats_.dropped_deadline;
+            return false;
+        }
+        if (!enabled_) {
+            ++stats_.dropped_gate;
+            return false;
+        }
+        if (running_ + jobs_.size() >= max_pending_) {
+            ++stats_.dropped_backlog;
+            return false;
+        }
+        // Two large payloads must not be resident at once. Each one is a whole prefix copied into
+        // host memory (2545 MiB at 163k), and the box that produced it is still holding the KV it is
+        // about to restore. Measured on this one: the second 163k export, made while the first
+        // payload was still in the writer, took 3.648 s instead of 1.355 s and then failed the next
+        // request with `bad allocation`. The rule is on the payloads, not on a byte window: one large
+        // one plus any number of small ones is fine, two large ones is the shape that does not fit.
+        if (bytes >= kLargePayloadBytes && pending_bytes_ >= kLargePayloadBytes) {
+            ++stats_.dropped_ceiling;
+            return false;
+        }
+        if (hard_bytes_ != 0 && pending_bytes_ + bytes > hard_bytes_) {
+            ++stats_.dropped_ceiling;
+            return false;
+        }
+        pending_bytes_ += bytes;
         stats_.bytes_requested += bytes;
         ++stats_.enqueued;
         jobs_.push_back(Job{std::move(run), bytes, due});
@@ -135,15 +201,15 @@ public:
     // ends up fighting the policy that is supposed to own it.
     void advance(std::uint64_t now) {
         std::lock_guard lock(mutex_);
-        jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(),
-                                   [&](const Job& job) {
-                                       if (job.due <= now) {
-                                           ++stats_.dropped_deadline;
-                                           return true;
-                                       }
-                                       return false;
-                                   }),
-                    jobs_.end());
+        for (auto it = jobs_.begin(); it != jobs_.end();) {
+            if (it->due <= now) {
+                ++stats_.dropped_deadline;
+                release_bytes_locked(it->bytes);
+                it = jobs_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         window_bytes_ = 0;
     }
 
@@ -162,6 +228,14 @@ public:
     [[nodiscard]] std::size_t max_pending() const {
         std::lock_guard lock(mutex_);
         return max_pending_;
+    }
+
+    // Bytes of the jobs this queue is holding right now (the one being run plus the ones waiting).
+    // This is the number the hard ceiling compares against, so it has to be observable: a ceiling
+    // nobody can read is indistinguishable from a drop caused by the count.
+    [[nodiscard]] std::size_t pending_bytes() const {
+        std::lock_guard lock(mutex_);
+        return pending_bytes_;
     }
 
     // The gate is no longer decided here (2026-11-01). A threshold on usefulness is a number that
@@ -199,7 +273,15 @@ private:
             // inside a fill and let the producer overshoot the cap by the width of that window.
             std::lock_guard lock(mutex_);
             running_ = 0;
+            release_bytes_locked(job.bytes);
         }
+    }
+
+    // Bytes leave the ceiling exactly when the payload leaves the queue: on completion, or when
+    // advance() drops a job that outlived its deadline. The min() guards the accounting against a
+    // double release instead of wrapping a std::size_t into a ceiling that refuses everything.
+    void release_bytes_locked(std::size_t bytes) noexcept {
+        pending_bytes_ -= std::min(pending_bytes_, bytes);
     }
 
     mutable std::mutex mutex_;
@@ -210,7 +292,9 @@ private:
     std::deque<Job> jobs_;
     std::thread worker_;
     std::size_t budget_              = 0;
+    std::size_t hard_bytes_          = 0; // 0 = no ceiling (the window-budgeted read-ahead case)
     std::size_t window_bytes_        = 0;
+    std::size_t pending_bytes_       = 0;
     std::size_t max_pending_         = 8;
     std::size_t running_             = 0; // 0 or 1: the worker's job, if it is carrying one
     double min_usefulness_           = 0.10; // kept for reporting only; nothing acts on it
