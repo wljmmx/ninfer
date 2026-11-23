@@ -164,6 +164,20 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
         if (++slot.generation == 0) { ++slot.generation; }
         if (!state_store->release_checkpoint_owner(state)) { std::terminate(); }
         refresh_history_requirements(kv, true);
+        if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+            // After the slot is gone, use_count()==1 means this local handle is the last owner and the
+            // destructor will run on the way out; anything higher names a live holder that keeps the
+            // address (and its pages) allocated.
+            static int printed = 0;
+            if (printed < 12) {
+                ++printed;
+                std::fprintf(stderr,
+                             "[kv-probe] released ckpt %u: history use_count=%ld text_pages=%u\n",
+                             handle.index, static_cast<long>(kv.use_count()),
+                             text_kv_addresses ? text_kv_addresses->page_count(kv->text) : 0U);
+                std::fflush(stderr);
+            }
+        }
         // The address is not released here. `slot.value` is gone, so if this local `kv` is the last
         // holder its destructor retires the address on the way out; any other checkpoint, paused
         // snapshot or live sequence of the same history keeps it untouched.

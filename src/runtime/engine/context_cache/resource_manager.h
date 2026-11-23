@@ -1445,7 +1445,34 @@ private:
 
     void release_unreferenced(Program& program, Handle handle) {
         if (!catalog_reference_count(handle)) { index_.erase(handle); }
-        if (references(handle)) { return; }
+        if (references(handle)) {
+            // Diagnostics: a handle that never reaches zero references is a checkpoint nobody releases,
+            // and with it the address it owns. Name the three places that can hold it.
+            if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+                static int printed = 0;
+                if (printed < 12) {
+                    ++printed;
+                    std::string owners;
+                    for (const auto& owner : owners_) {
+                        for (const auto& point : owner.points) {
+                            if (point.handle == handle) {
+                                owners += std::to_string(owner.token) + " ";
+                            }
+                        }
+                    }
+                    std::size_t waiting = 0, shared = 0;
+                    for (const auto& entry : waiting_) { waiting += contains(entry.held, handle); }
+                    for (const auto& entry : shared_) { shared += entry.handle == handle; }
+                    std::fprintf(stderr,
+                                 "[ref-probe] handle %u still referenced: owners=[%s] waiting=%zu "
+                                 "shared=%zu valid=%d\n",
+                                 handle.index, owners.c_str(), waiting, shared,
+                                 program.valid_checkpoint(handle) ? 1 : 0);
+                    std::fflush(stderr);
+                }
+            }
+            return;
+        }
         if (program.valid_checkpoint(handle) && !program.release_checkpoint(handle)) {
             throw std::logic_error("Native could not release an unreferenced checkpoint owner");
         }

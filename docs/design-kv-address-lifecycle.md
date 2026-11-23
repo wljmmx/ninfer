@@ -299,6 +299,46 @@ which takes the ownership"），恢复路径却把导入的检查点留在了 ow
 记在 `reserved_kv` 上；两条记录谁在结束时释放谁，就是那次要读清楚的一段。释放点选定后，验收仍是
 同一条：恢复命中后立刻发一个缓存外的冷 163k 必须成功。
 
+## 第六轮实测：`release_checkpoint` 整个运行里一次都没被调用
+
+在 `release_checkpoint` 里加了取证（打印释放后的 `history use_count` 与 `text` 地址页数），然后跑
+严格场景——**一行都没打出来**。结合前一轮的 `holders=2`，结论很明确：
+
+- 这次请求的绑定走的是非借用分支（`prepare_prefix_fork`，源是 slot 0、目标是 slot 1），目标地址
+  因共享同一批逻辑页而 +1 引用；
+- 源检查点本应在自己不再被需要时被释放，从而让它的 history 析构、把 slot 0 交回；
+- 但实际上**没有任何代码路径调用 `release_checkpoint`**，源检查点连同 slot 0 一直活到进程结束。
+
+试过的两条改动都没有命中并已撤回（不留未验证代码在热路径）：在 `commit_binding` 里释放
+`retired_checkpoints`（该场景下这个列表是空的）、以及此前按地址归属释放 Host extent。
+
+下一步要查的是"源检查点的引用计数为什么一直不为零"：`release_unreferenced` 在 `references(handle)`
+非零时直接返回，而 `references` 汇总目录与 `waiting_.held`；需要打印该 handle 在 catalog / owners /
+waiting 三处的命中情况，才能判断是谁把它钉住不放。
+
+## 第七轮实测：连"尝试释放"都没有发生
+
+给 `release_unreferenced` 加了 `[ref-probe]`（打印 owners / waiting / shared 三处命中），再跑严格
+场景：**一条都没有**。也就是说源检查点既没有被直接释放（`released ckpt` 无输出），也没有任何一次
+"因仍有引用而跳过"的尝试——它是直接从 manager 的账上消失的。
+
+到这里可以确定的三件事（都有日志或代码位置支撑）：
+
+1. 恢复出来的前缀在请求结束后留下两个地址槽（slot 0 `committed=163680` 无保护、slot 1
+   `committed=163694` 带保护），二者共享全部 2558 个逻辑页；
+2. 页引用因此是 2，`inspect_suffix` 只把最上面 1 页算成可释放，报价因此是 1 页；
+3. 没有任何一条路径尝试释放 slot 0 的所有者。
+
+剩下要回答的是"谁把源检查点从账上抹掉了"——`forget()` 会 `index_.erase` 而不释放，调用点是
+`binding_started(retired)`、`prune()` 与 `adopt()`。下一步要在 `forget()` 里打印调用来源与该
+handle 是否仍被任何 owner 持有，才能定位到具体的那一次。
+
+本轮所有新增代码都是环境变量开启的只读取证（`[kv-probe]` / `[rc-probe]` / `[addr-probe]` /
+`[ref-probe]`），热路径上没有任何未验证的行为改动；两条试过的定点修改（`commit_binding` 释放
+`retired_checkpoints`、按地址释放 Host extent）都因未命中而撤回。
+
+
+
 
 
 
