@@ -970,7 +970,13 @@ function engineFail(reason){
 }
 function ensureEngineInstance(){
   const id = 'engine-' + (ENGINE.model || 'serve') + '@' + (ENGINE.port || 0);
-  if (ENGINE.instId && INSTANCES[ENGINE.instId]) return INSTANCES[ENGINE.instId];
+  if (ENGINE.instId && INSTANCES[ENGINE.instId]) {
+    const held = INSTANCES[ENGINE.instId];
+    // A page reload can restore 'stopped' from localStorage while the engine answers; once the
+    // monitor poll succeeds, the live engine is the truth.
+    if (ENGINE.ok) { held.state = 'running'; held.live = true; held.demo = false; }
+    return held;
+  }
   // 引擎在线时只保留真实实例：演示档位停用，避免真假数字同屏
   for (const k of Object.keys(INSTANCES)){ INSTANCES[k].state = 'stopped'; INSTANCES[k].demo = true; }
   delete INSTANCES['waiting'];   // 未连接时的占位不该留在列表里
@@ -1562,6 +1568,12 @@ function renderInstanceLive(){
   if (!inst) return;
   const rt = engRuntime(), budget = engBudget(), m = engModel();
   const d = latest(inst, 'decode'), p = latest(inst, 'prefill'), t = latest(inst, 'ttft');
+  // The 1 Hz TTFT is a delta: a first token that lands between two samples leaves that second
+  // empty, and a reload drops the series (counter reset). The SSE events carry the exact
+  // per-request value for 15 s, so fall back to the newest of those rather than showing nothing
+  // while the engine is demonstrably recording first tokens.
+  const recentTtft = Array.isArray(ENGINE.recentTtft) ? ENGINE.recentTtft : [];
+  const ttftShown = (t != null) ? t : (recentTtft.length ? recentTtft[recentTtft.length - 1] : null);
   $('inst').innerHTML = instOptions();
   $('inst').value = current;
   $('i-state').innerHTML = '<span class="tag eng">engine</span>' +
@@ -1578,7 +1590,7 @@ function renderInstanceLive(){
   $('i-pre').innerHTML = fmtNum(p, 0) + '<small>tok/s</small>';
   $('i-pre-sub').textContent = '累计 prefill ' + fmtInt(rt.computed_prefill_tokens) + ' tok · chunk ' + fmtInt(m.prefill_chunk);
   $('i-pre-bar').style.width = p == null ? '0%' : Math.min(100, p / 620 * 100).toFixed(0) + '%';
-  $('i-ttft').innerHTML = fmtNum(t, 0) + '<small>ms</small>';
+  $('i-ttft').innerHTML = fmtNum(ttftShown, 0) + '<small>ms</small>';
   const q = inst.ttftBins;
   $('i-ttft2').textContent = (q && q.count)
     ? (fmtMs(binsQuantile(q, 0.5)) + ' / ' + fmtMs(binsQuantile(q, 0.99)) + ' · ' + q.count + ' 样本')
@@ -2495,8 +2507,13 @@ $('clock').textContent = new Date().toLocaleTimeString();
     L('lMsg').textContent = r.ok?'已停止':('失败：'+r.error); L('lStop').disabled=false; };
   async function tickLaunch(){
     try{ const s=await (await fetch('/api/launch/status.json')).json();
-      L('lState').textContent = s.running ? ('运行中 pid '+s.pid) : (s.exit_code!=null?('已退出('+s.exit_code+')'):'未启动');
-      L('lStart').disabled=launching; L('lStart').textContent=s.running?'重启':'启动'; L('lStop').disabled=!s.running;
+      L('lState').textContent = s.running
+        ? ((s.external || s.managed === false) ? '运行中（外部启动）' : ('运行中 pid '+s.pid))
+        : (s.exit_code!=null?('已退出('+s.exit_code+')'):'未启动');
+      L('lStart').disabled=launching; L('lStart').textContent=s.running?'重启':'启动';
+      // Stopping belongs to whoever owns the process: an externally started engine is reported, not
+      // killed from here.
+      L('lStop').disabled=!s.running || s.external === true || s.managed === false;
       const argvKey=(s.argv||[]).join(' '); if(argvKey && argvKey!==appliedArgs){ appliedArgs=argvKey; applyLaunchArgs(s.argv); }
       const log=s.log||[]; L('lLog').textContent = (s.started && log.length) ? log.slice(-12).join('\n') : '—';
     }catch(e){}

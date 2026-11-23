@@ -793,8 +793,13 @@ class Launcher:
 
     def __init__(self, exe: Path, roots: list[Path], log_path: Path, attach,
                  lmcache_probe=None, engine_host: str = "127.0.0.1",
-                 lmcache_endpoint: str = "tcp://127.0.0.1:6555") -> None:
+                 lmcache_endpoint: str = "tcp://127.0.0.1:6555",
+                 engine_base: str = "") -> None:
         self.exe = exe
+        # Where the engine this page reports on answers. It is known before anything is launched
+        # (the console is told with --engine), and it is what lets an engine started outside this
+        # page be reported as running instead of "未启动".
+        self.engine_base = (engine_base or "").rstrip("/")
         self.engine_host = engine_host           # 127.0.0.1 default; 0.0.0.0 exposes the API on the LAN
         # The client reaches the WSL-side server through whichever address the operator names. On
         # this box the mirror-mode address is the fast one: 127.0.0.1 goes through the user-mode
@@ -1042,6 +1047,11 @@ class Launcher:
         with self.lock:
             proc = self.proc
             if proc is None or proc.poll() is not None:
+                # An engine this page did not start is still an engine: say who owns it instead of
+                # claiming there is nothing there. Killing it from here would be the wrong authority.
+                if self.engine_answers():
+                    return {"ok": False,
+                            "error": "该引擎不是由本控制台启动，请在启动它的终端或脚本中停止"}
                 return {"ok": True, "note": "no engine started here is running"}
             # Ask before forcing: the child owns a CUDA context and its own log flush, so a console
             # break is a shutdown the engine can still answer. Terminate, then kill, only if it does
@@ -1073,12 +1083,40 @@ class Launcher:
             return []
         return text.splitlines()[-self.LOG_TAIL:]
 
+    def engine_answers(self, timeout: float = 1.0) -> bool:
+        """True when an engine is serving on this launcher's port, whoever started it.
+
+        Started from a script (or by a previous console) is still started. Reporting "未启动" while
+        a 163k-serving engine listens on the port made the page blank the TTFT card and the request
+        table - the one lie this panel cannot afford, because every other number was real.
+        """
+        base = self.engine_base
+        if not base:
+            # Before the first launch only the port is known (and it is None until then).
+            base = f"http://127.0.0.1:{self.port}" if self.port else ""
+        if not base:
+            return False
+        try:
+            with urllib.request.urlopen(f"{base}/monitor/info", timeout=timeout) as response:
+                return response.status == 200
+        except Exception:  # noqa: BLE001 - an unreachable port is the normal "not running"
+            return False
+
     def status(self) -> dict:
         proc = self.proc
         running = proc is not None and proc.poll() is None
         if proc is not None and not running:
             self.exit_code = proc.returncode
+        # `managed` says who owns the process: this page (True) or somebody else (False). The page
+        # shows the difference instead of pretending an externally started engine is stopped.
+        managed = running
+        external = False
+        if not running and self.engine_answers():
+            running = True
+            external = True
         return {"ok": True, "running": running,
+                "managed": managed,
+                "external": external,
                 "pid": proc.pid if proc else None,
                 "alive": running,
                 # `started` survives the exit: the page keeps a failed run's log on screen.
@@ -1086,7 +1124,7 @@ class Launcher:
                 "exit_code": self.exit_code,
                 "port": self.port,
                 "model": self.model,
-                "uptime_seconds": round(time.time() - self.started_at, 1) if running else None,
+                "uptime_seconds": round(time.time() - self.started_at, 1) if managed else None,
                 "command": subprocess.list2cmdline(self.args) if self.args else "",
                 # The exact argv the engine was started with, kept after exit so a page
                 # reload (or a stop followed by a start) can refill the form instead of
@@ -1553,7 +1591,8 @@ def main() -> int:
     Handler.launcher = Launcher(exe, roots, log_path, attach,
                                 lmcache_probe=lambda: bool(Handler.lmcache and Handler.lmcache._probe()),
                                 engine_host=args.engine_host,
-                                lmcache_endpoint=args.lmcache_endpoint)
+                                lmcache_endpoint=args.lmcache_endpoint,
+                                engine_base="" if args.engine in (None, "", "none") else args.engine)
     Handler.lmcache = ScriptService(Path(__file__).resolve().parent / "start_lmcache.cmd",
                                    Path(__file__).resolve().parent / "lmcache-service.log",
                                    "lmcache", probe_url=args.upstream)
