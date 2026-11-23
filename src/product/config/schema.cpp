@@ -50,7 +50,8 @@ constexpr FieldSpec kFields[] = {
     {Field::MaxPendingRequests, "engine.max_pending_requests", "--max-pending-requests", "", "", "",
      "N", "Pending request capacity (16).", Scope::Serve},
     {Field::PendingTimeout, "engine.pending_timeout_ms", "--pending-timeout-ms", "", "", "", "N",
-     "Queue timeout before execution in milliseconds (30000).", Scope::Serve},
+     "Queue timeout before execution in milliseconds (180000; raised from 30000 because a busy "
+     "queue was expiring requests two seconds before admission).", Scope::Serve},
     {Field::PrefixReuse, "context_cache.prefix_reuse", "", "", "", "--no-prefix-reuse", "",
      "Cross-request history reuse (serve, on by default).", Scope::Serve},
     {Field::DeviceStateSlots, "context_cache.device_state_slots", "--device-state-slots", "", "",

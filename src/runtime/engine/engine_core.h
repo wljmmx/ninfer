@@ -878,6 +878,12 @@ private:
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return false; }
         }
+        // 13.5: the queue is alive. A waiting request's deadline is extended while this stamp keeps
+        // moving (see extend_pending_deadlines_locked) - a queue timeout means the engine is stuck,
+        // not that it was busy. Measured shape of the wrong reading: eight 800-token requests need
+        // about 32 s of service, the third batch would have been admitted two seconds later, and the
+        // 30 s pending timeout killed it at 30.48 s with a 503.
+        last_completion_ms_.store(monotonic_ms(), std::memory_order_relaxed);
         if (request->preemption_count) {
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
         }
@@ -1354,6 +1360,14 @@ private:
     // the 15-minute ceiling the service itself uses.
     static constexpr std::uint32_t kMaxQueueExtensions = 4;
 
+    // How recently a request must have finished for the queue to count as "moving". Five seconds is
+    // several service windows on this box (a 400-token request at 4 lanes finishes in ~2 s), so a
+    // stalled engine ages past it quickly and the ordinary expiry fires again.
+    static constexpr std::uint64_t kProgressStallMs = 5000;
+    // monotonic_ms() of the last completed request; 0 means none yet (a fresh engine is not
+    // "moving" until something finishes, so the first requests are judged by the lane estimate).
+    std::atomic<std::uint64_t> last_completion_ms_{0};
+
     void extend_pending_deadlines_locked(Clock::time_point now) {
         if (pending_.empty()) { return; }
         // Off switch for the A/B: the comparison is "the same probe behind the same prefill, one
@@ -1377,23 +1391,43 @@ private:
         }
         if (ahead < 1.0) { return; }
         const bool probe = std::getenv("NINFER_QUEUE_PROBE") != nullptr;
+        // A queue timeout has to mean "the engine is stuck", not "it was busy while you waited".
+        // Measured on this box: eight 800-token requests need about 32 s of service, so the third
+        // batch was two seconds from admission when the 30 s pending timeout answered 503 at 30.48 s
+        // - the queue was healthy the whole time (waiting rose to 66 and drained to zero). While the
+        // engine keeps completing requests a deadline is therefore pushed out; once it stops, the
+        // stamp ages and the ordinary expiry fires again.
+        const auto now_ms       = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      now.time_since_epoch())
+                                      .count();
+        const auto last_done_ms = static_cast<long long>(
+            last_completion_ms_.load(std::memory_order_relaxed));
+        const bool progressing =
+            last_done_ms != 0 && now_ms >= last_done_ms && now_ms - last_done_ms < kProgressStallMs;
+        if (ahead < 1.0 && !progressing) { return; }
         // 1.5x the remaining work, with a 30 s floor: a request that is about to be admitted must
         // not be expired in the step before its lane frees up.
         const auto extension = std::chrono::milliseconds(
             std::max<long long>(30000, static_cast<long long>(ahead * 1500.0)));
         for (auto& request : pending_) {
             if (request->queue_extensions >= kMaxQueueExtensions) { continue; }
-            const auto next =
-                std::min(now + extension, request->submitted + std::chrono::minutes(15));
+            auto next = std::min(now + extension, request->submitted + std::chrono::minutes(15));
+            if (progressing) {
+                // The queue is moving: never expire a request the engine is still working towards.
+                // One service window per extension, so a trickle of progress cannot keep a request
+                // alive forever - kMaxQueueExtensions bounds it (4 x 30 s past the base timeout).
+                next = std::min(std::max(next, now + std::chrono::seconds(30)),
+                                request->submitted + std::chrono::minutes(15));
+            }
             if (next <= request->deadline) { continue; }
             ++request->queue_extensions;
             request->deadline = next;
             if (probe) {
                 std::fprintf(stderr,
-                             "[queue] req#%llu deadline extended: %.0f s of work ahead, +%lld ms "
-                             "(extension %u)\n",
+                             "[queue] req#%llu deadline extended: %.0f s of work ahead, "
+                             "progressing=%d, +%lld ms (extension %u)\n",
                              static_cast<unsigned long long>(request->id), ahead,
-                             static_cast<long long>(extension.count()),
+                             progressing ? 1 : 0, static_cast<long long>(extension.count()),
                              static_cast<unsigned>(request->queue_extensions));
                 std::fflush(stderr);
             }

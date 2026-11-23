@@ -283,7 +283,13 @@ struct EngineOptions {
     std::size_t startup_planning_headroom_bytes = kDefaultStartupPlanningHeadroomBytes;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    // How long a request may wait for a lane before it is answered with a queue timeout. Raised
+    // from 30 s (2026-11-24): measured on this box, eight concurrent 800-token requests need about
+    // 32 s of service, and the third batch - two seconds from admission - was killed at 30.48 s with
+    // a 503 while the queue was healthy the whole time (waiting rose to 66 and drained to zero).
+    // 180 s keeps the timeout a stall detector; the engine also extends a deadline while requests
+    // are still completing, so a busy queue no longer expires its own work.
+    std::uint32_t pending_timeout_ms   = 180000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // appendix IK: resolved once at startup; `On`/`Auto` only ever install a window when the KV
