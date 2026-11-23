@@ -283,13 +283,12 @@ struct EngineOptions {
     std::size_t startup_planning_headroom_bytes = kDefaultStartupPlanningHeadroomBytes;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    // How long a request may wait for a lane before it is answered with a queue timeout. Raised
-    // from 30 s (2026-11-24): measured on this box, eight concurrent 800-token requests need about
-    // 32 s of service, and the third batch - two seconds from admission - was killed at 30.48 s with
-    // a 503 while the queue was healthy the whole time (waiting rose to 66 and drained to zero).
-    // 180 s keeps the timeout a stall detector; the engine also extends a deadline while requests
-    // are still completing, so a busy queue no longer expires its own work.
-    std::uint32_t pending_timeout_ms   = 180000;
+    // How long a request may wait for a lane before it is answered with a queue timeout.
+    // 0 means "derive from max_context" (default_pending_timeout_ms below): a fixed number cannot
+    // be right for both a 1k chat turn and a 256k document, and the wrong one either expires a
+    // healthy queue or keeps a stuck client forever. Measured on this box: 163k tokens prefill in
+    // 103.5 s, so a full 256k request needs ~180-200 s of service before its own decode starts.
+    std::uint32_t pending_timeout_ms   = 0;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // appendix IK: resolved once at startup; `On`/`Auto` only ever install a window when the KV
@@ -319,6 +318,25 @@ struct EngineOptions {
     // carry the runtime pieces the engine calls back into, and this is one more.
     std::shared_ptr<CheckpointCacheBackend> checkpoint_cache;
 };
+
+// The queue timeout a context length asks for, used when EngineOptions::pending_timeout_ms is 0.
+//
+// A fixed timeout cannot serve both ends of the range: 30 s answered a healthy 8-request queue with
+// 503s at 30.48 s (measured: the third batch was two seconds from admission), while a 256k request
+// does not even finish its prefill in 180 s. So the default scales with the context:
+//   * one full-context prefill at a conservative 1400 tok/s - measured 1600 tok/s at 163k on this box
+//     (103.5 s), and attention is quadratic in the prefix, so 256k extrapolates to ~1.8x that time;
+//   * 1.5x that figure, which covers the quadratic tail plus the decode that follows the prefill;
+//   * floored at 60 s (a 1k turn must not be judged by a 1 s budget) and capped at 15 minutes, the
+//     same ceiling the engine's own deadline extension uses.
+// Computed: 8k -> 69 s, 32k -> 94 s, 131k -> 201 s, 256k -> 334 s.
+[[nodiscard]] inline std::uint32_t default_pending_timeout_ms(std::uint32_t max_context) {
+    const double prefill_seconds = static_cast<double>(max_context) / 1400.0;
+    double milliseconds          = prefill_seconds * 1500.0 + 60000.0;
+    if (milliseconds < 60000.0) { milliseconds = 60000.0; }
+    if (milliseconds > 900000.0) { milliseconds = 900000.0; }
+    return static_cast<std::uint32_t>(milliseconds);
+}
 
 enum class SamplingMode : std::uint8_t {
     Thinking,

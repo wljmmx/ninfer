@@ -617,6 +617,12 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry) {
         if (parsed.cli.reasoning_effort == ReasoningEffort::None)
             generation.enable_thinking = false;
     } else {
+        // The queue deadline is computed from this struct (generation_service), not from the engine's
+        // normalized copy, so an unset timeout has to be derived here as well - and from the context
+        // this launch will actually serve.
+        if (engine.pending_timeout_ms == 0) {
+            engine.pending_timeout_ms = default_pending_timeout_ms(engine.max_context);
+        }
         // port (sm_89): the queue deadline is computed from this struct, not from the engine's
         // normalized copy, so a streamed expert tier has to scale it here as well.
         if (const char* experts = std::getenv("NINFER_EXPERT_CACHE_MB");

@@ -133,6 +133,13 @@ public:
         // arm) exactly as they were.
         prefill_merge_enabled_.store(prefill_merge_from_env_, std::memory_order_relaxed);
         prefill_admit_first_.store(prefill_admit_from_env_, std::memory_order_relaxed);
+        // One line, once: the queue budget the engine will judge waiting requests by. It is derived
+        // from the context when the caller left it unset, and that has to be visible at startup - the
+        // only other way to see it was to wait for a 503.
+        std::fprintf(stderr, "[queue] pending timeout %lld ms (max_context %u, max_concurrency %u)\n",
+                     static_cast<long long>(pending_timeout_.count()), max_context_,
+                     max_concurrency_);
+        std::fflush(stderr);
         paused_.reserve(max_outstanding_);
         std::promise<void> startup;
         std::future<void> started = startup.get_future();

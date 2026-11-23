@@ -1752,6 +1752,12 @@ void resolve_kv_storage(EngineOptions& options, const models::qwen3_5::TextConfi
 }
 
 ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& device) {
+    // 0 = "derive from the context". The serve layer resolves it too (it builds the per-request
+    // deadline from its own copy); this covers every other caller, and keeping the rule in one
+    // function means the two cannot disagree.
+    if (options.pending_timeout_ms == 0) {
+        options.pending_timeout_ms = default_pending_timeout_ms(options.max_context);
+    }
     validate_options(options);
     // port (sm_89): the pool layout decides whether a captured decode graph is valid, so the
     // caller's intent is kept here and applied after attach_expert_cache().
