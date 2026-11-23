@@ -2927,6 +2927,7 @@ public:
         if (exec_ != nullptr && key_ == key) {
             (void)cudaGraphLaunch(exec_, stream);
             ++replays_;
+            report();
             return;
         }
         if (exec_ != nullptr) {
@@ -2950,7 +2951,11 @@ public:
         if (exec_ != nullptr && key_ == key) {
             (void)cudaGraphLaunch(exec_, stream);
         } else {
-            // The capture recorded instead of executed and could not be kept: run it for real.
+            // The capture recorded instead of executed and could not be kept: run it for real, and
+            // switch the whole mechanism off. That is the MoE case -- a layer that needs a host fetch
+            // synchronizes inside the step, which a capture forbids -- so it pays ONE failed
+            // recording and never again, while a dense artifact keeps replaying.
+            enabled_ = false;
             work();
         }
         if (std::getenv("NINFER_PREFILL_GRAPH_DEBUG") != nullptr) {
@@ -2966,16 +2971,24 @@ public:
     }
 
 private:
+    // Printed on hits too: a counter that only prints on a miss reads as "replays=0" while the
+    // graph is being replayed every chunk, which is exactly the wrong conclusion to draw from it.
+    void report() const {
+        if (std::getenv("NINFER_PREFILL_GRAPH_DEBUG") == nullptr) { return; }
+        std::fprintf(stderr, "[pfgraph] captures=%llu replays=%llu (replay)\n",
+                     static_cast<unsigned long long>(captures_),
+                     static_cast<unsigned long long>(replays_));
+        std::fflush(stderr);
+    }
+
     PrefillLayerGraphs()
         : enabled_([] {
-              // Opt-in, and only after the workspace is pinned. Measured at 163k with it on:
-              // `captures=3 replays=0` -- the chunk's roots move between chunks, so the capture is
-              // paid every time and never replayed. Short prompts (the gates) happen to capture once,
-              // which is why the bit-exact gates pass while the long path gets no benefit.
-              // The prerequisite is a fixed prefill workspace: `workspace.alloc` inside the layer
-              // bodies hands out rotating addresses, and a graph bakes addresses in.
+              // Default ON. The stack is capturable on this artifact and the replay removes the wait
+              // that used to sit inside the layer loop: measured at 163k, `submit` 28.3 s -> 42.9 ms
+              // with the same total wall time (the wait moves to the step's own sync).
+              // `NINFER_PREFILL_GRAPH=0` turns it off; the bit-exact gates are what keep it honest.
               const char* value = std::getenv("NINFER_PREFILL_GRAPH");
-              return value != nullptr && value[0] != '0';
+              return !(value != nullptr && value[0] == '0');
           }()) {}
     cudaGraphExec_t exec_    = nullptr;
     std::uint64_t key_       = 0;
@@ -3182,6 +3195,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 mix(reinterpret_cast<std::uintptr_t>(rope_positions.data));
                 mix(reinterpret_cast<std::uintptr_t>(ids_device.data));
                 stack_graphs.run(key, s, [&] { run_layers(x, Phase::Prefill, tap); });
+                if (std::getenv("NINFER_PREFILL_GRAPH_DEBUG") != nullptr) {
+                    std::fprintf(stderr, "[pfkey] len=%d x=%p pos=%p rope=%p ids=%p key=%016llx\n",
+                                 len, x.data, positions.data, rope_positions.data, ids_device.data,
+                                 static_cast<unsigned long long>(key));
+                    std::fflush(stderr);
+                }
             } else {
                 run_layers(x, Phase::Prefill, tap);
             }
