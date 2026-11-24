@@ -1067,7 +1067,7 @@ static void dump_page_placement(PagedKVCache& cache, KVAddressSpaceStore& addres
     const std::uint32_t end = std::min(live, capacity);
     if (end == 0) { return; }
     std::vector<std::int32_t> table(static_cast<std::size_t>(end), -1);
-    const Tensor row = cache.execution_tables().row(addresses.execution_row(address).handle());
+    const Tensor row = cache.execution_tables().row(addresses.execution_row(address, "sequence.cpp:1070").handle());
     core::copy_bytes(table.data(), row.data,
                      static_cast<std::size_t>(end) * sizeof(std::int32_t),
                      core::TransferDirection::DeviceToHost, stream);
@@ -1133,7 +1133,7 @@ void ProgramImpl::apply_kv_eviction_window(KVAddressSpaceStore& addresses, Paged
     }
     const std::uint32_t frontier = addresses.committed_frontier(address);
     if (frontier == 0) { return; }
-    const KVExecutionRowHandle row = addresses.execution_row(address).handle();
+    const KVExecutionRowHandle row = addresses.execution_row(address, "sequence.cpp:1136").handle();
     const std::uint32_t live       = kv_live_pages(frontier);
     const std::uint32_t eff_window = effective_window_pages(window.window_pages, live);
     // The ratio supersedes the page-count budget: setting it expresses an intent about the fraction,
@@ -1549,7 +1549,7 @@ std::uint32_t ProgramImpl::restore_addressed_host_pages(KVAddressSpaceStore& add
         // without this the restore was invisible and the kernel kept reading the page the demotion
         // gave back. This is the half that makes the fetch actually mean something.
         {
-            const KVExecutionRowHandle fetch_row = addresses.execution_row(address).handle();
+            const KVExecutionRowHandle fetch_row = addresses.execution_row(address, "sequence.cpp:1552").handle();
             const std::span<const DeviceKVPageHandle> restored(&destination, 1);
             cache.execution_tables().publish(fetch_row, page, restored, device.stream);
         }
@@ -1681,7 +1681,7 @@ bool ProgramImpl::borrow_slot_from_another_row(KVAddressSpaceStore& addresses, P
                               .keep_begin = end > window_pages ? end - window_pages : 0U,
                               .keep       = keep_pages}
                 : step_read_set(window, cache.execution_tables(),
-                                addresses.execution_row(other).handle(), other_live, end);
+                                addresses.execution_row(other, "sequence.cpp:1684").handle(), other_live, end);
         for (std::uint32_t page = 0; page < end; ++page) {
             if (reads.addresses(page)) { addressed.push_back(addresses.logical_page(other, page)); }
         }
@@ -1707,7 +1707,7 @@ bool ProgramImpl::borrow_slot_from_another_row(KVAddressSpaceStore& addresses, P
         if (end == 0) { return; }
         // A row whose mask was deferred reads its whole history this step: nothing of it is spare.
         const void* const victim_key =
-            cache.execution_tables().page_score_row(addresses.execution_row(other).handle()).data;
+            cache.execution_tables().page_score_row(addresses.execution_row(other, "sequence.cpp:1710").handle()).data;
         if (std::find(deferred_mask_rows_.begin(), deferred_mask_rows_.end(), victim_key) !=
             deferred_mask_rows_.end()) {
             return;
@@ -1745,7 +1745,7 @@ bool ProgramImpl::borrow_slot_from_another_row(KVAddressSpaceStore& addresses, P
             if (!demote_page_for_room(addresses, cache, candidate.address, page)) { continue; }
             if (candidate.row >= 0) {
                 const KVExecutionRowHandle victim_row =
-                    addresses.execution_row(candidate.address).handle();
+                    addresses.execution_row(candidate.address, "sequence.cpp:1748").handle();
                 const std::array<std::uint32_t, 1> taken{page};
                 cache.execution_tables().mark_absent(victim_row, taken, device.stream);
             }
@@ -1847,7 +1847,7 @@ std::uint32_t ProgramImpl::page_in_addressed_pages(KVAddressSpaceStore& addresse
         const TransferWork work = pages->physical_pool().copy_from_host(host, one, device.stream);
         pages->publish_device_replica(handle);
         {
-            const KVExecutionRowHandle fetch_row = addresses.execution_row(address).handle();
+            const KVExecutionRowHandle fetch_row = addresses.execution_row(address, "sequence.cpp:1850").handle();
             const std::span<const DeviceKVPageHandle> restored(&destination, 1);
             cache.execution_tables().publish(fetch_row, page, restored, device.stream);
         }
@@ -1875,7 +1875,7 @@ void ProgramImpl::stage_step_kv_pages(KVAddressSpaceStore& addresses, PagedKVCac
     }
     const std::uint32_t frontier = addresses.committed_frontier(address);
     if (frontier == 0) { return; }
-    const KVExecutionRowHandle row = addresses.execution_row(address).handle();
+    const KVExecutionRowHandle row = addresses.execution_row(address, "sequence.cpp:1878").handle();
     const KvEvictionWindow& window = kv_eviction_window();
     const std::uint32_t live       = kv_live_pages(frontier);
     // The addressed set, in the window's own vocabulary. With NO window installed every page of the
@@ -2067,7 +2067,7 @@ void ProgramImpl::dump_page_scores(KVAddressSpaceStore& addresses, PagedKVCache&
     if (path == nullptr || *path == '\0') { return; }
     const std::uint32_t frontier = addresses.committed_frontier(address);
     if (frontier == 0) { return; }
-    const KVExecutionRowHandle row = addresses.execution_row(address).handle();
+    const KVExecutionRowHandle row = addresses.execution_row(address, "sequence.cpp:2070").handle();
     const Tensor counts = cache.execution_tables().page_score_row(row);
     const Tensor peaks  = cache.execution_tables().page_score_peak_row(row);
     const Tensor recents = cache.execution_tables().page_score_recent_row(row);
@@ -2164,13 +2164,13 @@ void ProgramImpl::trim_sequence_kv(SequenceState& state, std::uint32_t main,
 }
 
 PagedKVCacheView ProgramImpl::text_kv_view(const SequenceState& state) const {
-    return decoder->text_kv.execution_view(text_kv_addresses->execution_row(state.kv->text));
+    return decoder->text_kv.execution_view(text_kv_addresses->execution_row(state.kv->text, "sequence.cpp:2167"));
 }
 
 PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
     return speculative_backend == SpeculativeBackend::Mtp
                ? decoder->mtp_cache()->execution_view(
-                     backend_kv_addresses->execution_row(*state.kv->backend))
+                     backend_kv_addresses->execution_row(*state.kv->backend, "sequence.cpp:2173"))
                : PagedKVCacheView{};
 }
 
@@ -2183,11 +2183,11 @@ void ProgramImpl::ordered_reset(SequenceState& state) {
     refresh_state_views(state);
     // P6 2c: the relevance counters accumulate, so a reused execution row must start from zero.
     decoder->text_kv.execution_tables().reset_page_scores(
-        text_kv_addresses->execution_row(state.kv->text).handle(), device.stream);
+        text_kv_addresses->execution_row(state.kv->text, "sequence.cpp:2186").handle(), device.stream);
     if (state.kv->backend) {
         if (PagedKVCache* cache = backend_kv_cache(); cache != nullptr) {
             cache->execution_tables().reset_page_scores(
-                backend_kv_addresses->execution_row(*state.kv->backend).handle(), device.stream);
+                backend_kv_addresses->execution_row(*state.kv->backend, "sequence.cpp:2190").handle(), device.stream);
         }
     }
     state.text_kv_valid = state.mtp_kv_valid = state.dflash_context_frontier = 0;

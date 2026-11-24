@@ -1167,7 +1167,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t reserved_growth_pages(KVAddressSpaceHandle handle) const {
-        const Address& address = require(handle);
+        const Address& address = require(handle, "reserved_growth_pages");
         return address.reservation.valid() ? address.reservation.pages() : 0U;
     }
 
@@ -1215,8 +1215,8 @@ public:
         std::fflush(stderr);
     }
 
-    [[nodiscard]] const KVExecutionRowLease& execution_row(KVAddressSpaceHandle handle) const {
-        const Address& address = require(handle);
+    [[nodiscard]] const KVExecutionRowLease& execution_row(KVAddressSpaceHandle handle, const char* where = "execution_row") const {
+        const Address& address = require(handle, where);
         // Steps 1-3: a retired address is not a source for execution, whatever its stale row says.
         if (address.state == Address::State::Retired) {
             throw std::logic_error("KV address space is retired");
@@ -1229,7 +1229,7 @@ public:
 
     [[nodiscard]] DeviceKVPageHandle physical_page(KVAddressSpaceHandle handle,
                                                    std::uint32_t logical_page) const {
-        const Address& address = require(handle);
+        const Address& address = require(handle, "physical_page");
         if (logical_page >= address.page_count) {
             throw std::out_of_range("KV logical page is outside the address space");
         }
@@ -1238,7 +1238,7 @@ public:
 
     [[nodiscard]] std::uint64_t content_epoch(KVAddressSpaceHandle handle,
                                               std::uint32_t logical_page) const {
-        const Address& address = require(handle);
+        const Address& address = require(handle, "content_epoch");
         if (logical_page >= address.page_count) {
             throw std::out_of_range("KV logical page is outside the address space");
         }
@@ -1247,7 +1247,7 @@ public:
 
     [[nodiscard]] LogicalKVPageHandle logical_page(KVAddressSpaceHandle handle,
                                                    std::uint32_t logical_page) const {
-        const Address& address = require(handle);
+        const Address& address = require(handle, "logical_page");
         if (logical_page >= address.page_count) {
             throw std::out_of_range("KV logical page is outside the address space");
         }
@@ -1507,8 +1507,34 @@ private:
         return addresses_[handle.index_];
     }
 
-    [[nodiscard]] const Address& require(KVAddressSpaceHandle handle) const {
-        if (!valid(handle)) { throw std::invalid_argument("KV address-space handle is stale"); }
+    [[nodiscard]] const Address& require(KVAddressSpaceHandle handle,
+                                         const char* api = "require") const {
+        if (!valid(handle)) {
+            if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
+                // "handle is stale" covered two different faults: an empty handle (owner_ == nullptr,
+                // never assigned) and a generation that moved on. Measured 2026-11-24: it was the
+                // empty one - six hypotheses were spent on the stale reading - so the message now
+                // says which, and which API was handed it.
+                if (handle.index_ < addresses_.size()) {
+                    const Address& slot = addresses_[handle.index_];
+                    std::fprintf(stderr,
+                                 "[require-fail] api=%s set=%d ask=%u/%u slot(occupied=%d state=%d "
+                                 "gen=%u refs=%u active=%d row=%d pages=%u committed=%u)\n",
+                                 api, handle.owner_ != nullptr ? 1 : 0, handle.index_,
+                                 handle.generation_, slot.occupied ? 1 : 0,
+                                 static_cast<int>(slot.state), slot.generation, slot.refs,
+                                 slot.active ? 1 : 0, slot.row ? 1 : 0, slot.page_count,
+                                 slot.committed_frontier);
+                } else {
+                    std::fprintf(stderr, "[require-fail] api=%s set=%d ask=%u/%u OUT OF RANGE\n", api,
+                                 handle.owner_ != nullptr ? 1 : 0, handle.index_, handle.generation_);
+                }
+                std::fflush(stderr);
+            }
+            throw std::invalid_argument(handle.owner_ != nullptr
+                                            ? "KV address-space handle is stale"
+                                            : "KV address-space handle was never set");
+        }
         return addresses_[handle.index_];
     }
 
@@ -1533,7 +1559,7 @@ private:
     }
 
     [[nodiscard]] const Address& require_active(KVAddressSpaceHandle handle) const {
-        const Address& address = require(handle);
+        const Address& address = require(handle, "require_active");
         if (!address.active || !address.row || !address.reservation.valid()) {
             throw std::logic_error("KV address space is not active");
         }
