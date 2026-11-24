@@ -159,10 +159,16 @@ public:
             if (worker_.joinable()) { worker_.join(); }
             throw;
         }
+        // A separate thread, because a hang is exactly the case where the worker cannot report on
+        // itself: on 2026-11-25 the engine stopped logging for 85 minutes in the middle of a
+        // prefill (no throughput lines at all, then "host 4798.7% (4m 0.2s)" when the blocked call
+        // returned) and 38 client requests were lost with nothing in the log to say where it was.
+        watchdog_ = std::thread([this] { hang_watchdog_loop(); });
     }
 
     ~EngineCore() noexcept {
         request_stop();
+        if (watchdog_.joinable()) { watchdog_.join(); }
         if (worker_.joinable()) { worker_.join(); }
     }
 
@@ -171,6 +177,7 @@ public:
     // generation handler blocked in a wait has to see "stopping" and return, and it cannot do that
     // while the join in the destructor is the only place the flag is raised.
     void request_stop() noexcept {
+        watchdog_stop_.store(true, std::memory_order_release);
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
@@ -3568,15 +3575,72 @@ private:
     // stale" does not say WHICH call held the stale handle, and the addresses involved are gone by
     // the time anyone reads the log - measured 2026-11-24, a checkpoint released at a publish left a
     // handle stale and the message alone left four candidate call sites.
-    const char* worker_phase_ = "idle";
+    // Read by the worker on its failure path and by the hang watchdog from another thread, so it is
+    // atomic: a plain pointer written by one thread and read by two is exactly the kind of race a
+    // diagnostic must not introduce.
+    std::atomic<const char*> worker_phase_{"idle"};
+
+    // A hang is the one failure the worker cannot report: it is inside a turn that never returns.
+    // Measured 2026-11-25: the engine logged nothing for 85 minutes mid-prefill (no throughput lines
+    // at all, then "host 4798.7% (4m 0.2s)" when the blocked call finally returned) and 38 client
+    // requests were lost with no indication of where the time went. This thread watches the heartbeat
+    // and says which phase went quiet, once per stall and again every five minutes.
+    static constexpr std::uint64_t kHangReportMs   = 20000;
+    static constexpr std::uint64_t kHangReminderMs = 300000;
+
+    void report_hang(std::uint64_t stalled_ms) const noexcept {
+        RuntimeStats stats;
+        {
+            std::lock_guard lock(stats_mutex_);
+            stats = published_stats_;
+        }
+        std::size_t waiting = 0;
+        {
+            std::lock_guard lock(queue_mutex_);
+            waiting = pending_.size();
+        }
+        // Only a stall with work outstanding is a hang. An idle engine (nothing queued, no lane busy)
+        // legitimately takes no turns - warmup and the gap between requests both look like that - and
+        // reporting those would bury the real one.
+        if (waiting == 0 && stats.prefilling_requests == 0 && stats.decode_ready_requests == 0) {
+            return;
+        }
+        std::fprintf(stderr,
+                     "[hang] no scheduling pass for %.1f s | phase=%s | waiting=%zu | "
+                     "prefilling=%u decode_ready=%u\n",
+                     static_cast<double>(stalled_ms) / 1000.0,
+                     worker_phase_.load(std::memory_order_relaxed), waiting,
+                     stats.prefilling_requests, stats.decode_ready_requests);
+        std::fflush(stderr);
+    }
+
+    void hang_watchdog_loop() noexcept {
+        bool reported              = false;
+        std::uint64_t reported_at  = 0;
+        while (!watchdog_stop_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const auto last = last_pass_ms_.load(std::memory_order_relaxed);
+            if (last == 0) { continue; }
+            const auto now = monotonic_ms();
+            if (now <= last) { continue; }
+            const auto stalled = now - last;
+            if (stalled < kHangReportMs) {
+                reported = false;
+                continue;
+            }
+            if (reported && now - reported_at < kHangReminderMs) { continue; }
+            reported    = true;
+            reported_at = now;
+            report_hang(stalled);
+        }
+    }
 
     void log_worker_failure(std::exception_ptr error) const noexcept {
-        // Preserve the first cause before cleanup mutates membership or drains the queue.
         const auto report = [&](const char* reason) {
             std::fprintf(stderr,
                          "NInfer worker failed: %s | phase=%s progress_owner=%llu paused=%zu "
                          "context=%d materializing=%d\n",
-                         reason, worker_phase_ != nullptr ? worker_phase_ : "?",
+                         reason, worker_phase_.load(std::memory_order_relaxed),
                          static_cast<unsigned long long>(scheduler_.progress_owner().value_or(0)),
                          paused_.size(), instance_.program->has_context_transaction() ? 1 : 0,
                          materializing_.has_value() ? 1 : 0);
@@ -3707,6 +3771,9 @@ private:
             publish_control_state("startup", 0);
         }
         for (;;) {
+            // Heartbeat for the hang watchdog: stamped once per loop turn, so a turn that never
+            // returns shows up as "no pass for N s" instead of an 85-minute silence.
+            last_pass_ms_.store(monotonic_ms(), std::memory_order_relaxed);
             bool idle_for_pool_dial = false;
             {
                 std::unique_lock lock(queue_mutex_);
@@ -4367,6 +4434,12 @@ private:
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;
+    // Hang watchdog (see hang_watchdog_loop): the worker stamps last_pass_ms_ every loop turn, and a
+    // second thread reports when the stamp stops moving. The worker cannot do this itself - the whole
+    // failure mode is a turn that never returns.
+    std::atomic<std::uint64_t> last_pass_ms_{0};
+    std::atomic<bool> watchdog_stop_{false};
+    std::thread watchdog_;
 };
 
 } // namespace ninfer::runtime
