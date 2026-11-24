@@ -70,7 +70,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             {.phase_timings = true,
              .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
              .first_token   = first_token_observer(req_id)},
-            [&req] { return client_disconnected(req); });
+            [&req] { return client_disconnected(req); }, req_id);
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -134,10 +134,28 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
+    // Admission before SSE: see the note in openai_chat_http.cpp - a refusal here is the engine
+    // answering a request-level question, so it carries the status its kind names instead of the
+    // 500 the rendering catch below would give it.
     try {
-        // Admission must be established before the response commits to SSE: a queued or rejected
-        // request still has a JSON error body to send.
         service_->wait_for_admission(prepared, [&req] { return client_disconnected(req); });
+    } catch (const ApiException& exception) {
+        const ApiError error = normalize_anthropic_error(exception.error());
+        lifecycle->failure(make_generation_request_failure(error));
+        write_anthropic_error(res, error, request_id);
+        return;
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = exception.what();
+        write_anthropic_error(res, error, request_id);
+        return;
+    }
+
+    try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
                                                                  request.eager_tool_inputs);

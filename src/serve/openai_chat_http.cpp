@@ -51,7 +51,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepared = service_->prepare(
             request.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            std::move(observation), [&req] { return client_disconnected(req); });
+            std::move(observation), [&req] { return client_disconnected(req); }, req_id);
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));
@@ -108,10 +108,30 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
+    // Admission must be established before the response commits to SSE: a queued or rejected request
+    // still has a JSON error body to send. It is answered HERE, with the status its kind carries,
+    // because the engine refuses for reasons a client can read - context_length_exceeded, a queue
+    // timeout, an overloaded queue - and the rendering catch below reports every one of them as 500
+    // internal_error. Measured 2026-11-24 in the shared-KV-pool refusal: "HTTP 500 | internal error |
+    // detail KV residency cannot serve...", which no client can tell from an engine fault.
     try {
-        // Admission must be established before the response commits to SSE: a queued or rejected
-        // request still has a JSON error body to send.
         service_->wait_for_admission(prepared, [&req] { return client_disconnected(req); });
+    } catch (const ApiException& exception) {
+        lifecycle->failure(make_generation_request_failure(exception.error()));
+        write_openai_error(res, exception.error());
+        return;
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = exception.what();
+        write_openai_error(res, error);
+        return;
+    }
+
+    try {
         const bool return_progress   = request.return_progress;
         const bool timings_per_token = request.timings_per_token;
         auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));

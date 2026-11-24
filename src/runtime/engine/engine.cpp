@@ -45,6 +45,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.output                            = options.output;
     resolved.constraint                        = options.constraint;
     resolved.tool_choice                       = std::move(options.tool_choice);
+    resolved.client_request_id                 = options.client_request_id;
     return resolved;
 }
 

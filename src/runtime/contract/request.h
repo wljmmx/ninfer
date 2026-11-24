@@ -33,6 +33,8 @@ struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    // See RequestOptions::client_request_id: the caller's own request number, 0 when it has none.
+    std::uint64_t client_request_id = 0;
 };
 
 enum class ContinuationAction : std::uint8_t {

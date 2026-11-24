@@ -277,7 +277,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             {.phase_timings = true,
              .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
              .first_token   = first_token_observer(req_id)},
-            [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
+            [&req] { return client_disconnected(req); }, req_id, std::move(resolved.cache_hints));
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -363,10 +363,24 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
+    // Admission before SSE: see the note in openai_chat_http.cpp - a refusal here is the engine
+    // answering a request-level question, so it carries the status its kind names instead of the
+    // 500 the rendering catch below would give it.
     try {
-        // Admission must be established before the response commits to SSE: a queued or rejected
-        // request still has a JSON error body to send.
         service_->wait_for_admission(prepared, [&req] { return client_disconnected(req); });
+    } catch (const ApiException& exception) {
+        const ApiError error = responses_error(exception.error());
+        lifecycle->failure(make_generation_request_failure(error));
+        write_openai_error(res, error);
+        return;
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+        write_openai_error(res, internal_error(exception));
+        return;
+    }
+
+    try {
         auto stream                      = std::make_shared<StreamingResponse>();
         stream->prepared                 = std::move(prepared);
         stream->storage.input_turns      = std::move(request.prompt.input_turns);

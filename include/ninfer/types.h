@@ -477,6 +477,12 @@ struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    // The number the caller's own request log uses. serve numbers requests at its HTTP edge and
+    // prints `req#<n> started` / `req#<n> done`; the engine's lines ([admit], [queue], [ckpt]) are
+    // about the same request, so they print this number too and one request keeps ONE id across both
+    // halves of the log. 0 means the caller has no such number (CLI, tests, warmup) and the engine's
+    // own counter is printed instead - the two are never mixed for one request.
+    std::uint64_t client_request_id = 0;
 };
 
 enum class MediaKind : std::uint8_t {

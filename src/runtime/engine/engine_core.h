@@ -1178,8 +1178,8 @@ private:
                      "[admit] req#%llu waits for KV residency: prompt_tokens=%u request_tokens=%u "
                      "live_lanes=%u live_tokens=%u live_lane_tokens=%s aggregate_tokens=%u "
                      "resident_tokens=%u (queue deadline in %.0f s)\n",
-                     static_cast<unsigned long long>(request->id), prompt_tokens, request_tokens,
-                     budget.lane_count, budget.live_tokens,
+                     static_cast<unsigned long long>(request->log_id()), prompt_tokens,
+                                 request_tokens, budget.lane_count, budget.live_tokens,
                      lanes.empty() ? "-" : lanes.c_str(), budget.live_tokens + request_tokens,
                      budget.capacity_tokens, remaining);
         std::fflush(stderr);
@@ -1292,8 +1292,8 @@ private:
             if (finished.status != ConsumeStatus::Consumed) {
                 throw std::logic_error("terminal native sequence could not finish");
             }
-            report_boundary_work(
-                "program finish", request->id,
+                report_boundary_work(
+                    "program finish", request->log_id(),
                 std::chrono::duration<double>(Clock::now() - finish_started).count(),
                 request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             if (finished.checkpoint) {
@@ -1310,7 +1310,7 @@ private:
                                                 request->continuation_owner);
                 }
                 report_boundary_work(
-                    "publish", request->id,
+                    "publish", request->log_id(),
                     std::chrono::duration<double>(Clock::now() - publish_started).count(),
                     request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             } else if (std::getenv("NINFER_PUBLISH_PROBE") != nullptr) {
@@ -1319,7 +1319,7 @@ private:
                 // request. Print it rather than leaving it silent.
                 std::fprintf(stderr,
                              "[publish] finish produced NO checkpoint | req %llu | prompt %u\n",
-                             static_cast<unsigned long long>(request->id),
+                             static_cast<unsigned long long>(request->log_id()),
                              request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
                 std::fflush(stderr);
             }
@@ -1331,7 +1331,7 @@ private:
             request->speculative_stats  = std::move(finished.speculative);
             request->terminal_reason.reset();
             report_boundary_work(
-                "resources finish", request->id,
+                "resources finish", request->log_id(),
                 std::chrono::duration<double>(Clock::now() - release_started).count(),
                 request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
 
@@ -1339,7 +1339,7 @@ private:
             const auto complete_started = Clock::now();
             complete_success(request, reason);
             report_boundary_work(
-                "complete", request->id,
+                "complete", request->log_id(),
                 std::chrono::duration<double>(Clock::now() - complete_started).count(),
                 request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             boundary = begin_host_phase();
@@ -1448,7 +1448,7 @@ private:
                 std::fprintf(stderr,
                              "[queue] req#%llu deadline extended: %.0f s of work ahead, "
                              "progressing=%d, +%lld ms (extension %u)\n",
-                             static_cast<unsigned long long>(request->id), ahead,
+                             static_cast<unsigned long long>(request->log_id()), ahead,
                              progressing ? 1 : 0, static_cast<long long>(extension.count()),
                              static_cast<unsigned>(request->queue_extensions));
                 std::fflush(stderr);
@@ -1587,7 +1587,7 @@ private:
                     // for a row the program already considers constraint-dead, and the program's own
                     // mark comes from the mask, which is exactly the side that accepted these tokens.
                     std::fprintf(stderr, "[grammar] request %llu failed: %s\n",
-                                 static_cast<unsigned long long>(request->id), violation.what());
+                                 static_cast<unsigned long long>(request->log_id()), violation.what());
                     std::fflush(stderr);
                     pending.mark_constraint_failed(row, true);
                     failed[row]    = true;   // expected disposition: FailedReleased (see below)

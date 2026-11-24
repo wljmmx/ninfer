@@ -160,6 +160,14 @@ struct RequestRecord {
         return model_state == EngineRequestState::ModelFinished;
     }
 
+    // The number an engine log line prints for this request. serve numbers requests at its HTTP edge
+    // (`req#<n> started` / `req#<n> done`) and passes that number down, so the engine's own lines
+    // name the same request with the same id; a caller that supplies none (CLI, tests, warmup) keeps
+    // the engine's internal id, which is what those lines printed before this existed.
+    [[nodiscard]] std::uint64_t log_id() const noexcept {
+        return options.client_request_id != 0 ? options.client_request_id : id;
+    }
+
     // The process range follows Request ownership across submit, worker, and consumer threads.
     nvtx::ScopedAsyncRange generation_range;
     const std::uint64_t id;

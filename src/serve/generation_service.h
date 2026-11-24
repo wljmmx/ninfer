@@ -178,6 +178,7 @@ public:
                                           GenerationConsumerMode consumer_mode,
                                           ninfer::GenerationObservationOptions observation = {},
                                           std::function<bool()> is_cancelled               = {},
+                                          std::uint64_t client_request_id = 0,
                                           ContextCacheHints context_cache = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
@@ -228,7 +229,8 @@ private:
     [[nodiscard]] PreparedRequest
     prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
                  ninfer::GenerationObservationOptions observation,
-                 std::function<bool()> is_cancelled, ContextCacheHints context_cache,
+                 std::function<bool()> is_cancelled, std::uint64_t client_request_id,
+                 ContextCacheHints context_cache,
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;

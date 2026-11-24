@@ -1503,9 +1503,10 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            GenerationConsumerMode consumer_mode,
                                            ninfer::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
+                                           std::uint64_t client_request_id,
                                            ContextCacheHints context_cache) const {
     return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
-                        std::move(context_cache),
+                        client_request_id, std::move(context_cache),
                         options_.launch.engine.context_cache.enabled ? CacheParticipation::ReadWrite
                                                     : CacheParticipation::Disabled,
                         DeadlinePolicy::ClientPendingTimeout);
@@ -1525,6 +1526,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 GenerationConsumerMode consumer_mode,
                                                 ninfer::GenerationObservationOptions observation,
                                                 std::function<bool()> is_cancelled,
+                                                std::uint64_t client_request_id,
                                                 ContextCacheHints context_cache,
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
@@ -1535,6 +1537,9 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
+    // One number per request across both halves of the log: the engine prints this one in its own
+    // lines, so "req#4 started" (serve) and "[admit] req#4 waits" (engine) are the same request.
+    request_options.client_request_id = client_request_id;
     prepared.thinking_budget     = request_options.execution.thinking.budget;
     prepared.reasoning_effort    = semantics.reasoning_effort;
     prepared.preserve_thinking   = semantics.preserve_thinking;
@@ -1760,7 +1765,7 @@ void GenerationService::warmup() {
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
     PreparedRequest prepared =
-        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
+        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {}, {},
                      CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
     run(prepared, nullptr);
 }
