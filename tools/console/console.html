@@ -76,6 +76,10 @@
   /* 行标签退到次要色，数值承担强调 */
   .row > span{color:var(--muted)}
   .n{color:#cfe3ff;font-variant-numeric:tabular-nums}
+/* 数字列的表头必须和数字同侧，否则表头靠左、数字靠右，读起来就是错位（反馈项 1）。
+   th.n 与 td.n 同族：右对齐 + 等宽数字；th.c/td.c 给需要居中的列（事件时间、状态标签）。 */
+th.n{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums;color:var(--dim)}
+th.c,td.c{text-align:center}
   pre{color:#c9d6e6}
 
   table{width:100%;border-collapse:collapse;font-size:12.5px}
@@ -134,8 +138,13 @@
   .feed .fk-mode b{color:var(--accent)}
   .feed .fk-auto{color:var(--cyan)}
   .feed .fk-auto b{color:var(--cyan)}
-  .feed .fk-gap{color:var(--warn)}
-  .feed .fk-gap b{color:var(--warn)}
+.feed .fk-gap{color:var(--warn)}
+.feed .fk-gap b{color:var(--warn)}
+/* 告警/报错滚动日志（反馈项 2）：级别用颜色区分，时间用等宽，便于对时间线。 */
+.feed .bad{color:#ff9aa2}
+.feed .warn{color:var(--warn)}
+.feed .ok{color:var(--accent)}
+.feed .lognum{color:var(--dim);font-family:var(--mono);font-variant-numeric:tabular-nums}
   .wband{display:flex;height:14px;border-radius:4px;overflow:hidden;margin-top:6px;border:1px solid var(--line2)}
   .wband i{display:block;height:100%}
   .wlegend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted);margin-top:6px}
@@ -533,6 +542,13 @@
       <tbody id="reqRows"></tbody>
     </table>
     <div class="note">decode 批内 KV 分行已通；prefill 仍串行（advance_prefill 单请求，固定开销 ≈0.9–1.2 s/请求）。车道数随控制器并发决策；点击行看生命周期分解。观测不含 prompt 与输出文本。</div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3>运行日志 / 告警 <span class="r" id="i-logCount">—</span></h3>
+    <div class="feed" id="i-log" style="max-height:190px" aria-live="polite"></div>
+    <div class="note" id="i-logNote">来源：引擎事件流（request_failed / rejected / cancelled / timeout 等）
+      + 控制台自检（事件流断开、等待准入积压、KV 池将满）。新的在上，保留最近 40 条；仅列出需要关注的条目，正常完成不入此表。</div>
   </div>
 </section>
 
@@ -1638,12 +1654,13 @@ function renderInstanceLive(){
   $('w-cov').innerHTML = NOT_PUBLISHED;
 
   renderRequestsLive(inst);
+  renderInstanceLog();
   drawInst();
 }
 
-const REQ_HEAD_LIVE = '<tr><th>Phase</th><th>ID</th><th>协议</th><th class="n">prompt</th>'
+const REQ_HEAD_LIVE = '<tr><th class="c">Phase</th><th class="n">ID</th><th>协议</th><th class="n">prompt</th>'
   + '<th class="n">completion</th><th class="n" title="首个已提交 token：prepare + 提交后区间（T009）">TTFT</th>'
-  + '<th>事件</th></tr>';
+  + '<th class="c">事件</th></tr>';
 function renderRequestsLive(inst){
   const svc = ENGINE.service || {};
   const active = svc.requests || [];
@@ -1653,24 +1670,68 @@ function renderRequestsLive(inst){
   $('reqCount').textContent = active.length + ' 活跃 · ' + finished.length + ' 最近事件 · submitted ' +
     fmtInt(svc.submitted) + ' / completed ' + fmtInt(svc.completed);
   let html = active.map(r => '<tr>'
-    + '<td>' + (r.preparing ? '<span class="tag pf">prefill</span>' : '<span class="tag dc">decode</span>') + '</td>'
+    + '<td class="c">' + (r.preparing ? '<span class="tag pf">prefill</span>' : '<span class="tag dc">decode</span>') + '</td>'
     + '<td class="n">#' + r.id + '</td>'
     + '<td class="sub">' + (r.protocol || '—') + (r.stream ? ' · stream' : '') + '</td>'
     + '<td class="n">—</td><td class="n">—</td><td class="n">—</td>'
-    + '<td class="sub">进行中</td></tr>').join('');
+    + '<td class="c sub">进行中</td></tr>').join('');
   if (finished.length){
     html += '<tr class="reqdiv"><td colspan="7">Recently completed（事件流）</td></tr>';
     html += finished.slice(0, 10).map(r => '<tr>'
-      + '<td><span class="tag ' + (r.kind === 'request_cancelled' ? 'max' : 'done') + '">' + (r.kind === 'request_cancelled' ? 'cancelled' : 'done') + '</span></td>'
+      + '<td class="c"><span class="tag ' + (r.kind === 'request_cancelled' ? 'max' : 'done') + '">' + (r.kind === 'request_cancelled' ? 'cancelled' : 'done') + '</span></td>'
       + '<td class="n">#' + r.id + '</td>'
       + '<td class="sub">—</td>'
       + '<td class="n">' + fmtInt(r.prompt) + '</td>'
       + '<td class="n">' + fmtInt(r.completion) + '</td>'
       + '<td class="n">' + (r.ttft_s == null ? '—' : fmtMs(r.ttft_s * 1000)) + '</td>'
-      + '<td class="sub">' + (r.at ? new Date(r.at).toLocaleTimeString() : '—') + '</td></tr>').join('');
+      + '<td class="c sub">' + (r.at ? new Date(r.at).toLocaleTimeString() : '—') + '</td></tr>').join('');
   }
   $('reqRows').innerHTML = html || '<tr><td colspan="7" class="sub">暂无请求（发起一次 chat 后出现）</td></tr>';
   renderTTFT(inst.ttftBins);
+}
+
+// 实例大屏的告警/报错滚动日志（反馈项 2）。此前面板只显示正常完成的请求流水，失败只能去翻
+// console.log；这里把「引擎事件流里的失败类条目」与「控制台自检结论」合成一条时间线，新的在上。
+const LOG_KIND = /fail|error|reject|timeout|cancel|overload|exhaust|unavailable|dead|stale|refus/i;
+function logText(node){
+  return String(node == null ? '' : node).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function renderInstanceLog(){
+  const el = $('i-log');
+  if (!el) return;
+  const rows = [];
+  const rt = engRuntime();
+  // 控制台自检：这三条是"即将出事"的先行信号，和引擎报错同等对待。
+  if (ENGINE.health && ENGINE.health.event_ok === false) {
+    rows.push({t: Date.now(), cls: 'bad', text: '事件流断开 · ' + (ENGINE.health.event_reason || '原因未知')});
+  }
+  if (rt.waiting_requests) {
+    rows.push({t: Date.now(), cls: 'warn', text: '等待准入 ' + rt.waiting_requests + ' 个请求'});
+  }
+  const budget = engBudget(), pages = rt.device_main_kv_occupied_pages, cap = budget.kv_capacity_page_groups;
+  if (pages != null && cap) {
+    const pct = pages / cap * 100;
+    if (pct >= 90) rows.push({t: Date.now(), cls: 'warn', text: 'KV 设备池已用 ' + pct.toFixed(1) + '%（' + pages + '/' + cap + ' 页）'});
+  }
+  // 引擎事件：只挑需要关注的 kind，正常完成/首 token 不入此表。
+  for (const e of (ENGINE.events || [])) {
+    const kind = e.kind || '';
+    if (!LOG_KIND.test(kind)) continue;
+    const d = e.details || {};
+    const detail = d.detail || d.reason || d.message || d.error || d.phase || '';
+    rows.push({
+      t: e.timestamp_unix_ms || 0,
+      cls: /fail|error|stale|dead|unavailable|refus/i.test(kind) ? 'bad' : 'warn',
+      text: (e.request_id != null ? 'req#' + e.request_id + ' · ' : '') + kind + (detail ? ' · ' + detail : ''),
+    });
+  }
+  rows.sort((a, b) => (b.t || 0) - (a.t || 0));
+  const shown = rows.slice(0, 40);
+  if ($('i-logCount')) $('i-logCount').textContent = rows.length + ' 条' + (rows.length > shown.length ? '（显示最近 40）' : '');
+  el.innerHTML = shown.length
+    ? shown.map(r => '<div class="' + r.cls + '"><span class="lognum">'
+        + (r.t ? new Date(r.t).toLocaleTimeString() : '—') + '</span> · ' + logText(r.text) + '</div>').join('')
+    : '<div class="ok">无告警：近 ' + (Array.isArray(ENGINE.events) ? ENGINE.events.length : 0) + ' 条事件里没有失败、拒绝、超时或取消记录</div>';
 }
 
 function renderFleet(){
