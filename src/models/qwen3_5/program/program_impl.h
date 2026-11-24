@@ -383,6 +383,14 @@ public:
     // checkpoint record, or a binding/reservation in flight. Reclaim must never free one of those -
     // the handle goes stale, require() throws, and the serving worker dies.
     [[nodiscard]] bool kv_address_named(const KVAddressSpaceHandle& handle) const noexcept;
+    // The three accounts behind that answer, separately. The reclaim veto only asks "any of them?";
+    // a freed address that turned out to be in use asks which account should have withheld it.
+    [[nodiscard]] bool
+    kv_address_named_by_sequence(const KVAddressSpaceHandle& handle) const noexcept;
+    [[nodiscard]] bool
+    kv_address_named_by_checkpoint(const KVAddressSpaceHandle& handle) const noexcept;
+    [[nodiscard]] bool
+    kv_address_named_by_transaction(const KVAddressSpaceHandle& handle) const noexcept;
     // Diagnostics only: one line per live checkpoint slot, with the address it owns. Answers "which
     // checkpoint still holds this address" without guessing from the page accounts.
     void debug_checkpoint_table(const char* tag) const;

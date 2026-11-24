@@ -331,30 +331,52 @@ bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept
 
 bool ProgramImpl::kv_address_named(const KVAddressSpaceHandle& handle) const noexcept {
     if (!handle.valid()) { return false; }
+    if (kv_address_named_by_sequence(handle)) { return true; }
+    if (kv_address_named_by_checkpoint(handle)) { return true; }
+    return kv_address_named_by_transaction(handle);
+}
+
+// The three accounts, separately: reclaim_retired()'s veto is "any of them names it", but when a
+// freed address turns out to have been in use, the useful question is WHICH account missed it.
+// Measured 2026-11-24: a lane was stepping over its own prompt when the address it held was freed,
+// and the combined answer could not say whether the sequence list, the checkpoint table or a binding
+// in flight was the one that should have withheld it.
+bool ProgramImpl::kv_address_named_by_sequence(const KVAddressSpaceHandle& handle) const noexcept {
+    if (!handle.valid()) { return false; }
+    for (const auto& sequence : sequences) {
+        if (!sequence.kv) { continue; }
+        if (sequence.kv->text == handle) { return true; }
+        if (sequence.kv->backend.has_value() && *sequence.kv->backend == handle) { return true; }
+    }
+    return false;
+}
+
+bool ProgramImpl::kv_address_named_by_checkpoint(const KVAddressSpaceHandle& handle) const noexcept {
+    if (!handle.valid()) { return false; }
+    for (const auto& slot : checkpoints) {
+        if (!slot.value || !slot.value->kv) { continue; }
+        if (slot.value->kv->text == handle) { return true; }
+        if (slot.value->kv->backend.has_value() && *slot.value->kv->backend == handle) { return true; }
+    }
+    return false;
+}
+
+bool ProgramImpl::kv_address_named_by_transaction(const KVAddressSpaceHandle& handle) const noexcept {
+    if (!handle.valid() || !context_transaction_) { return false; }
+    const auto& tx   = *context_transaction_;
     const auto names = [&handle](const std::shared_ptr<KVHistory>& history) {
         if (!history) { return false; }
         if (history->text == handle) { return true; }
         return history->backend.has_value() && *history->backend == handle;
     };
-    for (const auto& sequence : sequences) {
-        if (names(sequence.kv)) { return true; }
+    if (tx.reserved_kv) {
+        if (tx.reserved_kv->text == handle) { return true; }
+        if (tx.reserved_kv->backend && *tx.reserved_kv->backend == handle) { return true; }
     }
-    for (const auto& slot : checkpoints) {
-        if (slot.value && names(slot.value->kv)) { return true; }
-    }
-    const auto in_transaction = [&names, &handle](const ContextTransaction& tx) {
-        if (tx.reserved_kv) {
-            if (tx.reserved_kv->text == handle) { return true; }
-            if (tx.reserved_kv->backend && *tx.reserved_kv->backend == handle) { return true; }
-        }
-        if (tx.tier && tx.tier->text && *tx.tier->text == handle) { return true; }
-        if (tx.tier && tx.tier->backend && *tx.tier->backend == handle) { return true; }
-        // The binding's own two names: the history being bound and the one it came from.
-        if (names(tx.binding_history) || names(tx.source_history)) { return true; }
-        return false;
-    };
-    if (context_transaction_ && in_transaction(*context_transaction_)) { return true; }
-    return false;
+    if (tx.tier && tx.tier->text && *tx.tier->text == handle) { return true; }
+    if (tx.tier && tx.tier->backend && *tx.tier->backend == handle) { return true; }
+    // The binding's own two names: the history being bound and the one it came from.
+    return names(tx.binding_history) || names(tx.source_history);
 }
 
 void ProgramImpl::reclaim_retired() noexcept {
@@ -362,8 +384,24 @@ void ProgramImpl::reclaim_retired() noexcept {
     // reclaim is an all-or-nothing walk over its own Retired slots - but only over slots nothing
     // names any more. "Retire" is a mark; "reclaim" is the only step that invalidates handles, so it
     // is the one that must ask whether anyone still holds the name.
-    const auto keep = [this](const KVAddressSpaceHandle& handle) {
-        return !kv_address_named(handle);
+    const bool probe = std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr;
+    const auto keep  = [this, probe](const KVAddressSpaceHandle& handle) {
+        const bool seq  = kv_address_named_by_sequence(handle);
+        const bool ckpt = kv_address_named_by_checkpoint(handle);
+        const bool tx   = kv_address_named_by_transaction(handle);
+        if (probe && !seq && !ckpt && !tx) {
+            // About to free: name the slot so a later stale-handle failure can be matched to it.
+            static int printed = 0;
+            if (printed < 24) {
+                ++printed;
+                std::fprintf(stderr,
+                             "[reclaim] free slot=%u gen=%u named(seq=%d ckpt=%d tx=%d)\n",
+                             handle.index(), handle.generation(), seq ? 1 : 0, ckpt ? 1 : 0,
+                             tx ? 1 : 0);
+                std::fflush(stderr);
+            }
+        }
+        return !(seq || ckpt || tx);
     };
     if (text_kv_addresses) { (void)text_kv_addresses->reclaim_retired(keep); }
     if (backend_kv_addresses) { (void)backend_kv_addresses->reclaim_retired(keep); }

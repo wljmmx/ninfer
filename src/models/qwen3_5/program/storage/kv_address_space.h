@@ -25,6 +25,11 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
+    // Diagnostics: which slot and which life of it. Reclaim-time logs need the pair to tell a freed
+    // slot apart from one that was re-allocated since.
+    [[nodiscard]] std::uint32_t index() const noexcept { return index_; }
+    [[nodiscard]] std::uint32_t generation() const noexcept { return generation_; }
+
     [[nodiscard]] friend bool operator==(KVAddressSpaceHandle,
                                          KVAddressSpaceHandle) noexcept = default;
 
