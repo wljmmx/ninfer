@@ -1510,27 +1510,27 @@ private:
     [[nodiscard]] const Address& require(KVAddressSpaceHandle handle,
                                          const char* api = "require") const {
         if (!valid(handle)) {
-            if (std::getenv("NINFER_KV_LIFECYCLE_PROBE") != nullptr) {
-                // "handle is stale" covered two different faults: an empty handle (owner_ == nullptr,
-                // never assigned) and a generation that moved on. Measured 2026-11-24: it was the
-                // empty one - six hypotheses were spent on the stale reading - so the message now
-                // says which, and which API was handed it.
-                if (handle.index_ < addresses_.size()) {
-                    const Address& slot = addresses_[handle.index_];
-                    std::fprintf(stderr,
-                                 "[require-fail] api=%s set=%d ask=%u/%u slot(occupied=%d state=%d "
-                                 "gen=%u refs=%u active=%d row=%d pages=%u committed=%u)\n",
-                                 api, handle.owner_ != nullptr ? 1 : 0, handle.index_,
-                                 handle.generation_, slot.occupied ? 1 : 0,
-                                 static_cast<int>(slot.state), slot.generation, slot.refs,
-                                 slot.active ? 1 : 0, slot.row ? 1 : 0, slot.page_count,
-                                 slot.committed_frontier);
-                } else {
-                    std::fprintf(stderr, "[require-fail] api=%s set=%d ask=%u/%u OUT OF RANGE\n", api,
-                                 handle.owner_ != nullptr ? 1 : 0, handle.index_, handle.generation_);
-                }
-                std::fflush(stderr);
+            // Always printed, not gated on a probe: this path is fatal to the serving worker (one
+            // refused handle turns every later request into 503), so its one line belongs in the log
+            // the operator already reads. "handle is stale" covered two different faults - an empty
+            // handle (owner_ == nullptr, never assigned) and a generation that moved on - and named
+            // neither the API nor the slot. Measured 2026-11-24 in the field: the empty one, at
+            // sequence.cpp:2173 (mtp_kv_view dereferencing an empty state.kv->backend).
+            if (handle.index_ < addresses_.size()) {
+                const Address& slot = addresses_[handle.index_];
+                std::fprintf(stderr,
+                             "[require-fail] api=%s set=%d ask=%u/%u slot(occupied=%d state=%d "
+                             "gen=%u refs=%u active=%d row=%d pages=%u committed=%u)\n",
+                             api, handle.owner_ != nullptr ? 1 : 0, handle.index_,
+                             handle.generation_, slot.occupied ? 1 : 0,
+                             static_cast<int>(slot.state), slot.generation, slot.refs,
+                             slot.active ? 1 : 0, slot.row ? 1 : 0, slot.page_count,
+                             slot.committed_frontier);
+            } else {
+                std::fprintf(stderr, "[require-fail] api=%s set=%d ask=%u/%u OUT OF RANGE\n", api,
+                             handle.owner_ != nullptr ? 1 : 0, handle.index_, handle.generation_);
             }
+            std::fflush(stderr);
             throw std::invalid_argument(handle.owner_ != nullptr
                                             ? "KV address-space handle is stale"
                                             : "KV address-space handle was never set");
