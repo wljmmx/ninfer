@@ -599,15 +599,19 @@ int exercise_256k_growth(const char* artifact) {
 //   R1, R2  two lanes that fit TOGETHER (each ~40% of the resident set), submitted before either
 //           has finished, admitted, and both must complete;
 //   R3      one request that is legal on its own (~70% of the resident set, under the single-request
-//           bound) but does not fit beside R1+R2: it must be REFUSED at admission, in bounded time,
-//           with the per-lane and the aggregate numbers, while R1 and R2 keep running untouched;
-//   R4      a normal short request after the refusal: the engine still serves it.
+//           bound) but does not fit beside R1+R2: it must WAIT in the queue - refused only if the
+//           pool could not hold it with every lane empty - and be served once R1 and R2 finish, with
+//           a queue wait that carries the time they still held;
+//   R4      a normal short request afterwards: the engine still serves it.
 //
 // Correctness is pinned on the shape-independent property: the same two-lane batch run twice must
 // produce the same greedy tokens (the 1-row and 2-row decode compositions are known to differ - see
 // the merged-prefill fixture - so a cross-shape comparison would pin the composition, not the pool).
 int exercise_256k_lanes(const char* artifact) {
-    constexpr double kAggregateRefusalBudgetSeconds = 1.0;
+    // The wait a request held back by the resident pair has to show in its own queue time. 200 ms is
+    // an order of magnitude below the pair's remaining service and an order above the submit path, so
+    // the assertion separates "waited for the pool" from "was admitted next pass".
+    constexpr double kMinimumQueueWaitSeconds = 0.2;
     // Enough outputs for an engine-reported decode rate per lane, short enough that the arm stays a
     // contract test rather than a benchmark.
     constexpr std::uint32_t kPairOutputs = 32;
@@ -705,16 +709,17 @@ int exercise_256k_lanes(const char* artifact) {
         return true;
     };
 
-    // --- two lanes that fit together, with the shared-pool refusal in the middle -----------------
+    // --- two lanes that fit together, with a request that cannot fit beside them -----------------
     std::vector<ninfer::TokenId> first_a, first_b, second_a, second_b;
     {
         auto a = engine->submit(engine->prepare_tokens(lane_a), greedy_options(kPairOutputs, false));
         auto b = engine->submit(engine->prepare_tokens(lane_b), greedy_options(kPairOutputs, false));
         a.wait_for_admission();
         b.wait_for_admission();
-        // The refusal is delivered at the next scheduling boundary, so it is measured where the
-        // engine is busy with SHORT rounds - both lanes decoding. Waiting for prefill would measure
-        // the 1024-token chunk that happens to be in flight (~2 s observed) instead of the rule.
+        // The aggregate answer is delivered at the next scheduling boundary, so it is measured where
+        // the engine is busy with SHORT rounds - both lanes decoding. Waiting for prefill would
+        // measure the 1024-token chunk that happens to be in flight (~2 s observed) instead of the
+        // rule.
         const auto decode_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(300);
         while (engine->runtime_stats().decode_ready_requests < 2 &&
                std::chrono::steady_clock::now() < decode_deadline) {
@@ -729,57 +734,62 @@ int exercise_256k_lanes(const char* artifact) {
             std::cerr << "[256k-lanes] the two lanes never reached a decode round together\n";
             return 1;
         }
-        std::cerr << "[256k-lanes] both lanes decoding; submitting the over-subscribing request"
+        std::cerr << "[256k-lanes] both lanes decoding; submitting the request that cannot fit "
+                     "beside them"
                   << std::endl;
 
-        const auto refusal_started = std::chrono::steady_clock::now();
-        bool refused               = false;
+        // R3: legal on its own (~70% of the pool) but not beside the pair. The aggregate check has to
+        // hold it in the QUEUE, not refuse it: the pair's share comes back when the pair finishes, so
+        // the request is only ever early, never impossible.
+        const auto queued_started = std::chrono::steady_clock::now();
+        auto c = engine->submit(engine->prepare_tokens(over), greedy_options(1, false));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const ninfer::RuntimeStats holding = engine->runtime_stats();
+        std::cerr << "[256k-lanes] while the pair holds the pool: waiting="
+                  << holding.waiting_requests << " prefilling=" << holding.prefilling_requests
+                  << " decode_ready=" << holding.decode_ready_requests << std::endl;
+        if (holding.waiting_requests == 0) {
+            std::cerr << "[256k-lanes] the over-subscribing request was not left in the queue\n";
+            return 1;
+        }
+        bool served = false;
         std::string message;
+        ninfer::GenerationResult rc;
         try {
-            auto c = engine->submit(engine->prepare_tokens(over), greedy_options(1, false));
-            (void)c.wait();
-            std::cerr << "[256k-lanes] the over-subscribing request was SERVED" << std::endl;
-        } catch (const std::exception& error) {
-            refused = true;
-            message = error.what();
-        }
-        const double refusal_seconds =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - refusal_started)
-                .count();
-        std::cerr << "[256k-lanes] aggregate refusal: refused=" << (refused ? 1 : 0)
-                  << " seconds=" << refusal_seconds << " message=\"" << message << "\""
-                  << std::endl;
-        if (!refused) {
-            std::cerr << "[256k-lanes] two lanes over-subscribed the resident pool and the second "
-                         "request was not refused\n";
+            rc     = c.wait();
+            served = true;
+        } catch (const std::exception& error) { message = error.what(); }
+        const double waited = std::chrono::duration<double>(
+                                  std::chrono::steady_clock::now() - queued_started)
+                                  .count();
+        std::cerr << "[256k-lanes] the request that could not fit beside the pair: served="
+                  << (served ? 1 : 0) << " outputs=" << rc.generated_token_ids.size()
+                  << " queue_wait_s=" << rc.engine_timing.queue_wait_seconds
+                  << " wall_s=" << waited << " message=\"" << message << "\"" << std::endl;
+        if (!served) {
+            std::cerr << "[256k-lanes] an aggregate shortfall was answered as a failure instead of "
+                         "a wait: "
+                      << message << '\n';
             return 1;
         }
-        // Both the per-lane numbers and the aggregate must be in the message: the caller's remedy
-        // depends on which lane holds what.
-        for (const char* field : {"prompt_tokens=", "request_tokens=", "live_lanes=",
-                                 "live_tokens=", "live_lane_tokens=", "aggregate_tokens=",
-                                 "resident_tokens="}) {
-            if (message.find(field) == std::string::npos) {
-                std::cerr << "[256k-lanes] the refusal does not name " << field << ": " << message
-                          << '\n';
-                return 1;
-            }
-        }
-        if (message.find("live_lanes=2") == std::string::npos) {
-            std::cerr << "[256k-lanes] the refusal did not count both resident lanes: " << message
-                      << '\n';
+        if (rc.generated_token_ids.size() != 1 ||
+            rc.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "[256k-lanes] the queued request did not complete its budget (outputs="
+                      << rc.generated_token_ids.size() << ")\n";
             return 1;
         }
-        if (refusal_seconds > kAggregateRefusalBudgetSeconds) {
-            std::cerr << "[256k-lanes] the aggregate refusal took " << refusal_seconds
-                      << " s (budget " << kAggregateRefusalBudgetSeconds << " s)\n";
+        // It was held while the pair was resident, so its own queue wait has to carry that time.
+        if (rc.engine_timing.queue_wait_seconds < kMinimumQueueWaitSeconds) {
+            std::cerr << "[256k-lanes] the queued request was admitted at once (queue_wait="
+                      << rc.engine_timing.queue_wait_seconds
+                      << " s) although the pair held the whole pool\n";
             return 1;
         }
 
-        // The lane that was already resident must be untouched by the refusal: both complete.
+        // The lanes that were already resident must be untouched by the wait: both complete.
         const ninfer::GenerationResult ra = a.wait();
         const ninfer::GenerationResult rb = b.wait();
-        std::cerr << "[256k-lanes] after the refusal: A outputs="
+        std::cerr << "[256k-lanes] after the queued request: A outputs="
                   << ra.generated_token_ids.size() << " prefill_s=" << ra.timings.prefill_seconds
                   << " decode_s=" << ra.timings.decode_seconds << " | B outputs="
                   << rb.generated_token_ids.size() << " prefill_s=" << rb.timings.prefill_seconds
@@ -788,7 +798,7 @@ int exercise_256k_lanes(const char* artifact) {
             rb.generated_token_ids.size() != kPairOutputs ||
             ra.finish_reason != ninfer::FinishReason::OutputLimit ||
             rb.finish_reason != ninfer::FinishReason::OutputLimit) {
-            std::cerr << "[256k-lanes] the refusal disturbed the resident lanes (A="
+            std::cerr << "[256k-lanes] the wait disturbed the resident lanes (A="
                       << ra.generated_token_ids.size() << " B=" << rb.generated_token_ids.size()
                       << ")\n";
             return 1;
@@ -823,17 +833,17 @@ int exercise_256k_lanes(const char* artifact) {
         return 1;
     }
 
-    // --- a normal request after the refusal: the engine still serves it --------------------------
+    // --- a normal request afterwards: the engine still serves it ---------------------------------
     const std::vector<ninfer::TokenId> sample =
         engine->tokenize_text("The quick brown fox jumps over the lazy dog.");
     const ninfer::GenerationResult after =
         engine->generate(engine->prepare_tokens(sample), greedy_options(1, false));
-    std::cerr << "[256k-lanes] after the refusal, one lane: outputs="
+    std::cerr << "[256k-lanes] after the queued request, one lane: outputs="
               << after.generated_token_ids.size()
               << " finish=" << static_cast<int>(after.finish_reason) << std::endl;
     if (after.generated_token_ids.size() != 1 ||
         after.finish_reason != ninfer::FinishReason::OutputLimit) {
-        std::cerr << "[256k-lanes] the engine did not serve a normal request after the refusal\n";
+        std::cerr << "[256k-lanes] the engine did not serve a normal request after the wait\n";
         return 1;
     }
     const ninfer::MemorySummary summary = engine->memory_summary();

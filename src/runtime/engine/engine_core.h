@@ -1134,17 +1134,39 @@ private:
                          "(--kv-residency-slack-mib, or a smaller max_context).");
     }
 
-    // port (sm_89): refuse a request that DOES fit on its own but not beside the lanes already
-    // resident. The Device pool is one physical page pool shared by every lane (LogicalKVPageStore's
+    // port (sm_89): the aggregate half of the residency contract, now an admission answer rather than
+    // a refusal. The Device pool is one physical page pool shared by every lane (LogicalKVPageStore's
     // physical pool, sized `kv_resident_page_groups`), and under residency a lane's whole history has
-    // to stay in it for every step. So the aggregate is the admission question, and the per-request
-    // bound alone lets two legal requests over-subscribe the pool: each then fails to reserve a page,
-    // each pauses itself (reserve_resident_units), and neither is ever driven back - measured
-    // non-terminating. The numbers are per lane AND total, because the caller's remedy depends on
-    // which lane is holding what (shorten the prompt, lower max_concurrency, or plan more residency).
-    void refuse_kv_residency_shared(const std::shared_ptr<Request>& request,
-                                    std::uint32_t prompt_tokens, std::uint32_t request_tokens,
-                                    const models::qwen3_5::Program::KvResidencyBudget& budget) {
+    // to stay in it for every step. The per-request bound alone therefore lets two legal requests
+    // over-subscribe the pool: each then fails to reserve a page, each pauses itself
+    // (reserve_resident_units), and neither is ever driven back - measured non-terminating. That is
+    // why the aggregate has to be asked; what changed is the answer when it does not fit.
+    // port (sm_89): an aggregate shortfall is a WAIT, not a length property.
+    //
+    // `kv_residency_share_fits()` answers an ADMISSION question: the Device pool is one physical page
+    // pool shared by every lane, and the lanes already resident give their pages back when they
+    // finish. So when the request fits the pool on its own (`request_tokens <= capacity_tokens`) the
+    // only thing in its way is who else is resident right now, and the answer is to stay in pending_
+    // and be offered again at the next admission generation - release_request() arms one - rather
+    // than fail a request that would be legal a minute later. Measured on this box (max_context
+    // 262144, max_concurrency 4, 2769 resident pages = 177,216 tokens): a 153,600-token request was
+    // refused in this shape 20 times in one run (prompts 27.6k-31.8k against a live 155,264-token
+    // lane, and 153,600 against a live 33,856-token lane), and every client retry met the same
+    // refusal because nothing about the pool had changed.
+    //
+    // The refusal that remains - `request_tokens > capacity_tokens` - is the one no lane in front of
+    // it can fix, and refuse_kv_residency() is the message for it.
+    void note_kv_residency_wait(const std::shared_ptr<Request>& request,
+                                std::uint32_t prompt_tokens, std::uint32_t request_tokens,
+                                const models::qwen3_5::Program::KvResidencyBudget& budget) {
+        ++request->residency_waits;
+        // One line per request, not one per pass: a wait that lasts is reported by the queue timeout,
+        // which already names the request, its prompt and the work still ahead of it.
+        if (request->residency_waits != 1) { return; }
+        const auto remaining =
+            std::chrono::duration<double>(request->deadline - Clock::now()).count();
+        // The per-lane composition, because which lane holds what is what the operator's remedy
+        // depends on (the same numbers the refusal used to carry).
         std::string lanes;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const std::uint32_t held = budget.lane_tokens[lane];
@@ -1152,22 +1174,15 @@ private:
             if (!lanes.empty()) { lanes += '+'; }
             lanes += std::to_string(held);
         }
-        complete_error(
-            request,
-            std::make_exception_ptr(RequestError(
-                RequestErrorKind::ContextLengthExceeded,
-                "KV residency cannot serve a request beside the lanes already resident: "
-                "prompt_tokens=" +
-                    std::to_string(prompt_tokens) +
-                    " request_tokens=" + std::to_string(request_tokens) +
-                    " live_lanes=" + std::to_string(budget.lane_count) +
-                    " live_tokens=" + std::to_string(budget.live_tokens) +
-                    " live_lane_tokens=" + (lanes.empty() ? std::string("-") : lanes) +
-                    " aggregate_tokens=" + std::to_string(budget.live_tokens + request_tokens) +
-                    " resident_tokens=" + std::to_string(budget.capacity_tokens) +
-                    " (the pool is shared by every live lane, so lowering max_concurrency is a "
-                    "remedy too)" +
-                    kv_residency_limit_note(instance_.program->kv_read_priced()))));
+        std::fprintf(stderr,
+                     "[admit] req#%llu waits for KV residency: prompt_tokens=%u request_tokens=%u "
+                     "live_lanes=%u live_tokens=%u live_lane_tokens=%s aggregate_tokens=%u "
+                     "resident_tokens=%u (queue deadline in %.0f s)\n",
+                     static_cast<unsigned long long>(request->id), prompt_tokens, request_tokens,
+                     budget.lane_count, budget.live_tokens,
+                     lanes.empty() ? "-" : lanes.c_str(), budget.live_tokens + request_tokens,
+                     budget.capacity_tokens, remaining);
+        std::fflush(stderr);
     }
 
     // port (sm_89): refuse ONE lane whose GROWTH has nothing left to preempt.
@@ -2922,13 +2937,27 @@ private:
                         const KvResidencyShare share{budget.capacity_tokens, budget.live_tokens,
                                                      request_tokens};
                         if (!kv_residency_share_fits(share)) {
-                            {
-                                std::lock_guard lock(queue_mutex_);
-                                std::erase(pending_, request);
+                            // terminal: a prompt the pool could not hold even with every lane empty.
+                            // Nothing resident can make room for it, so it is the length property
+                            // refuse_kv_residency() names, not a scheduling wait.
+                            if (request_tokens > budget.capacity_tokens) {
+                                {
+                                    std::lock_guard lock(queue_mutex_);
+                                    std::erase(pending_, request);
+                                }
+                                refuse_kv_residency(request, prompt_tokens,
+                                                    budget.capacity_tokens);
+                                request_admission_check();
+                                continue;
                             }
-                            refuse_kv_residency_shared(request, prompt_tokens, request_tokens,
-                                                       budget);
-                            request_admission_check();
+                            // transient: what is missing is the resident lanes' share and they hand
+                            // it back when they finish. Stay queued (the queue deadline, which
+                            // already stretches with the work ahead, bounds the wait) and be
+                            // offered again at the next admission generation, which the completing
+                            // lane arms. Marking the scan deferred is what keeps this pass from
+                            // re-arming itself: the retry must ride on a real capacity event.
+                            note_kv_residency_wait(request, prompt_tokens, request_tokens, budget);
+                            admission_deferred_ = true;
                             continue;
                         }
                     }

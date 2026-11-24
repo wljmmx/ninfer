@@ -331,11 +331,12 @@ set_tests_properties(ninfer_qwen3_5_dense_256k_swap_test PROPERTIES
 # is one physical page pool for every lane, so two requests that each fit can still over-subscribe it
 # together; before the aggregate rule the second lane was admitted on its own length alone, both
 # lanes then failed to reserve a page, each paused itself, and the load never terminated. The arm
-# pins: two lanes that fit together both complete (twice, token-identically), a request that is legal
-# alone but not beside them is REFUSED at admission in under a second with the per-lane and the
-# aggregate numbers, and the engine still serves a normal request afterwards. Its own process, like
-# the other two arms: this card holds one 19 GiB engine at a time. The 1 s refusal budget is asserted
-# inside the binary; the ctest ceiling is the outer guard against a regression that never returns.
+# pins: two lanes that fit together both complete (twice, token-identically); a request that is legal
+# alone but not beside them is HELD IN THE QUEUE (it is only early, never impossible - the pair's
+# share comes back when the pair finishes) and is served once they drain, with a queue wait that
+# carries that time; and the engine still serves a normal request afterwards. Its own process, like
+# the other two arms: this card holds one 19 GiB engine at a time. The wait floor is asserted inside
+# the binary; the ctest ceiling is the outer guard against a regression that never returns.
 add_test(NAME ninfer_qwen3_5_dense_256k_lanes_test
   COMMAND ninfer_qwen3_5_dense_real_test)
 set_tests_properties(ninfer_qwen3_5_dense_256k_lanes_test PROPERTIES

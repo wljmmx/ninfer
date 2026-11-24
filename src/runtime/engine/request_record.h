@@ -204,6 +204,10 @@ struct RequestRecord {
     EngineRequestState resume_phase           = EngineRequestState::Prefill;
     std::uint32_t admission_bypasses          = 0;
     std::uint64_t admission_generation        = 0;
+    // How many admission passes found this request legal on its own but short of the shared Device KV
+    // pool. It is a WAIT, not a refusal (see note_kv_residency_wait): the count is reported once and
+    // is what tells a long wait from a request that was never offered.
+    std::uint32_t residency_waits             = 0;
     bool admission_observed                   = false;
     GenerationAdmissionStats admission;
     std::optional<Clock::time_point> source_wait_started;
