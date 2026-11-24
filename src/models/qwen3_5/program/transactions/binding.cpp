@@ -406,6 +406,16 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         }
         if (tx.borrow_text) {
             tx.binding_history = checkpoint(*source).kv;
+            // A restored (imported) checkpoint carries text KV only - the backend half is not in the
+            // cache - so this history has no backend address while the binding just allocated one
+            // above. Leaving it unattached lost that address and gave the lane a history with no
+            // draft storage, which the MTP view then dereferenced as an empty handle: production
+            // 2026-11-24, right after "[lmcache] restore ... [ckpt] adopt ... [kvt] import refs:
+            // addr_refs=1", the worker died in advance_prefill and every later request answered 503.
+            // The prefill is about to rebuild this KV anyway; it needs somewhere to write it.
+            if (tx.reserved_kv->backend && !tx.binding_history->backend) {
+                tx.binding_history->backend = tx.reserved_kv->backend;
+            }
         } else {
             tx.binding_history          = std::make_shared<KVHistory>();
             tx.binding_history->text    = tx.reserved_kv->text;
