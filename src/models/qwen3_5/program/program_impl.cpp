@@ -630,6 +630,9 @@ std::size_t ProgramImpl::run_causal_score(PreparedPromptData&& prompt, std::uint
 
     std::optional<StateImageHandle> state;
     std::optional<KVAddressSpaceHandle> address;
+    // The backend (draft) half of this pass. See the allocation below: the MTP plan's frame carries
+    // MTP IO, and every MTP step requires this view to exist.
+    std::optional<KVAddressSpaceHandle> backend_address;
     const auto cleanup = [&] {
         bool released = true;
         if (address) {
@@ -641,6 +644,15 @@ std::size_t ProgramImpl::run_causal_score(PreparedPromptData&& prompt, std::uint
             // by their Host replicas until the extent goes).
             release_live_host_extents(row);
             address.reset();
+        }
+        if (backend_address && backend_kv_addresses) {
+            const std::int32_t backend_row = backend_kv_addresses->bound_row(*backend_address);
+            if (backend_kv_addresses->active(*backend_address)) {
+                backend_kv_addresses->deactivate(*backend_address);
+            }
+            released = backend_kv_addresses->release(*backend_address) && released;
+            release_live_host_extents(backend_row);
+            backend_address.reset();
         }
         if (state) {
             released = state_store->release(*state) && released;
@@ -663,6 +675,15 @@ std::size_t ProgramImpl::run_causal_score(PreparedPromptData&& prompt, std::uint
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
+        if (backend_kv_addresses) {
+            backend_address = backend_kv_addresses->create_active(required_pages, 0, device.stream);
+            if (!backend_address) { throw std::bad_alloc(); }
+            if (backend_kv_addresses->bound_row(*backend_address) != 0) {
+                throw std::logic_error("causal score did not bind the unique backend KV row");
+            }
+            backend_kv_addresses->ensure_mapped_to_tokens(*backend_address, predictor_count,
+                                                          device.stream);
+        }
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
@@ -687,13 +708,22 @@ std::size_t ProgramImpl::run_causal_score(PreparedPromptData&& prompt, std::uint
         std::uint32_t cursor = 0;
         while (cursor < predictor_count) {
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            // The frame carries MTP IO whenever the Program runs an MTP plan, and every MTP step
+            // insists on a backend KV view - text.cpp:921 refuses the whole pass without one
+            // ("MTP prefill is not enabled", measured 2026-11-24). This scoring address used to be
+            // text-only, so the empty view walked into those paths and killed the serving worker.
+            // Allocating the backend half here is the allocation-side guarantee: the pass now has
+            // both, exactly like a bound lane.
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, ple.get(), draft_conf},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
-                {},
+                (backend_address && backend_kv_addresses && backend_kv_cache() != nullptr)
+                    ? backend_kv_cache()->execution_view(
+                          backend_kv_addresses->execution_row(*backend_address))
+                    : qwen3_5::PagedKVCacheView{},
                 decoder->text_kv,
-                nullptr,
+                (backend_address && backend_kv_addresses) ? backend_kv_cache() : nullptr,
                 nullptr,
                 cursor,
                 nullptr,
