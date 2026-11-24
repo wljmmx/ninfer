@@ -1288,6 +1288,7 @@ private:
             }
             const FinishReason reason = *request->terminal_reason;
             const auto finish_started = Clock::now();
+            worker_phase_            = "finish";
             auto finished             = instance_.program->finish(*request->sequence);
             if (finished.status != ConsumeStatus::Consumed) {
                 throw std::logic_error("terminal native sequence could not finish");
@@ -1298,6 +1299,7 @@ private:
                 request->base_plan ? request->base_plan->summary().prompt_tokens : 0U);
             if (finished.checkpoint) {
                 const auto publish_started = Clock::now();
+                worker_phase_             = "publish";
                 resources_.publish(*instance_.program, request->continuation_owner,
                                    *finished.checkpoint, monotonic_ms());
                 // The finish-time checkpoint is the one a later request can actually match: it covers
@@ -1305,6 +1307,7 @@ private:
                 // retained for pause/replay only and the external cache never sees a byte, because
                 // publish_to_cache() used to be reachable from the active-capture path alone.
                 if (request->base_plan) {
+                    worker_phase_ = "publish to cache";
                     resources_.publish_to_cache(*instance_.program, *request->base_plan,
                                                 *finished.checkpoint,
                                                 request->continuation_owner);
@@ -1324,6 +1327,7 @@ private:
                 std::fflush(stderr);
             }
             const auto release_started = Clock::now();
+            worker_phase_             = "resources finish";
             resources_.finish(*instance_.program, request->continuation_owner, *request->base_plan,
                               request->publication_order);
             request->continuation_owner = 0;
@@ -3031,6 +3035,7 @@ private:
                     retain_admission_source(request, choice, restoring);
                 }
                 auto binding_started = Clock::now();
+                worker_phase_        = "binding";
                 const auto bind      = [&](const auto& source) {
                     return instance_.program->start_binding(
                         *request->base_plan, LaneId{*lane}, source,
@@ -3557,13 +3562,21 @@ private:
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
+    //
+    // worker_phase_ is the last thing the pass said it was doing: a plain pointer store on the hot
+    // path, read only when the worker dies. A failure that names only "KV address-space handle is
+    // stale" does not say WHICH call held the stale handle, and the addresses involved are gone by
+    // the time anyone reads the log - measured 2026-11-24, a checkpoint released at a publish left a
+    // handle stale and the message alone left four candidate call sites.
+    const char* worker_phase_ = "idle";
+
     void log_worker_failure(std::exception_ptr error) const noexcept {
         // Preserve the first cause before cleanup mutates membership or drains the queue.
         const auto report = [&](const char* reason) {
             std::fprintf(stderr,
-                         "NInfer worker failed: %s | progress_owner=%llu paused=%zu context=%d "
-                         "materializing=%d\n",
-                         reason,
+                         "NInfer worker failed: %s | phase=%s progress_owner=%llu paused=%zu "
+                         "context=%d materializing=%d\n",
+                         reason, worker_phase_ != nullptr ? worker_phase_ : "?",
                          static_cast<unsigned long long>(scheduler_.progress_owner().value_or(0)),
                          paused_.size(), instance_.program->has_context_transaction() ? 1 : 0,
                          materializing_.has_value() ? 1 : 0);
@@ -3948,12 +3961,14 @@ private:
                     // only; a prefill layer pass carries a whole chunk and its interval reads as
                     // a fraction-of-a-token tps. This is the decode dispatch's own marker.
                     models::qwen3_5::execution::policy_controller().observe_prefill(false);
+                    worker_phase_ = "decode round";
                     run_decode_round(decode, cancelled);
                     executed = true;
                 }
                 if (instance_.program->has_context_transaction()) {
                     set_host_work_class(HostWorkClass::Control);
                     auto progress_boundary = begin_host_phase();
+                    worker_phase_         = "context transaction";
                     executed |= progress_context_transaction(progress_boundary);
                     if (!instance_.program->has_context_transaction()) {
                         // Control/Decode permits were consumed. Only the still-unexecuted
@@ -4170,6 +4185,7 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
+                        worker_phase_ = "prefill step";
                         run_prefill_step(*lane, snapshot_cancellations());
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);
@@ -4182,7 +4198,10 @@ private:
                 // becomes Retired when its owner ends, so with nothing retired this is one counter
                 // compare -- and a Retired address whose pages are still pinned stays Retired for
                 // the next pass instead of aborting the engine.
-                if (instance_.program != nullptr) { instance_.program->reclaim_retired(); }
+                if (instance_.program != nullptr) {
+                    worker_phase_ = "reclaim";
+                    instance_.program->reclaim_retired();
+                }
                 publish_runtime_stats();
             } catch (...) {
                 auto error = std::current_exception();
