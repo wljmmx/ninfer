@@ -218,8 +218,8 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
             }
         }
     }
-    context_transaction_.emplace(std::move(tx));
     note_transaction_open(ContextOperationKind::Pause);
+    context_transaction_.emplace(std::move(tx));
     auto& active = *context_transaction_;
     if (active.state_transfer) { enqueue_state_backup(active); }
     enqueue_context_transfers(active);

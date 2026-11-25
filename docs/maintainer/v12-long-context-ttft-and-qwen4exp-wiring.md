@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 已定位到“事务开而不再关”，非慢事务 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 事务计时给出反证：`bind n=5 avg=3.7ms max=8.6`、`capture n=2 avg=12.6 max=17.1`、`demote n=3 avg=23.4 max=43.5`、`pause n=0`——整轮事务占用只有 ~150 ms，**“单次太慢”被推翻**。但同一轮里 `ok=6`（6 次成功准入）只对应 `bind n=5`（5 次关闭），且 `tx_busy` 随调用次数单调升到 88/105：说明有一次事务**开启后没有 commit**，`has_value()` 常真；此后每次 emplace 都在已占用的事务上替换它，计时器随之重置，这正是“测出来都很短、但永远 busy”的原因。下一步：找那条 open 后不 commit（或直接替换）的路径，而不是缩短临界区 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-3 预填充车道 | 根因已定位：单次 Bind 事务持锁 6.6 s | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 事务开启状态探针（`[tx] open=<kind> age=<ms> opens=<n> replaces=<n>`）在一轮 burst 里给出：`replaces=0`（不存在替换/泄漏）、`opens≈380`（每轮 prefill chunk 都开一次 Capture）、以及 **`open=0 age=6635ms`——一次 Bind 事务持续 6.6 秒**。Bind 在事务里做完整个 prompt 的 KV 页预留（361 页 × 4 lane 量级）、147 MiB 状态镜像与转移；期间所有其它绑定被拒，于是两条 lane 各花 ~6.6 s 绑定、再一起 prefill，正好对应 17–19 s 的 TTFT 与“恒为 2 条”。修法有两个方向：(a) 把 KV 预留从绑定事务里挪到按 chunk 增量申请；(b) 允许不同 lane 并发绑定（地址空间不冲突时）。两者都动 KV 绑定这条最敏感的路径，需单独一轮带门禁 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -149,4 +149,10 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   demote n=3 avg=23.4ms | pause n=0`，整轮事务占用约 150 ms；但 `ok=6` 对 `bind n=5`，成对少一次，
   且 `tx_busy` 单调升到 88/105——是“有一次事务开而不关、后续 emplace 替换它并重置计时”，
   不是临界区过慢。P0-3 的下一步因此改为定位“开而不 commit”的路径。
+- 2026-11-25：开启状态探针（`open kink / age / opens / replaces`）给出最终答案，也再次更正上一条：
+  `replaces=0`（没有替换，也没有泄漏），`opens≈380`（每次 prefill chunk 触发一次 Capture），
+  但存在 **`open=0 age=6635ms`** —— 一次 **Bind 事务持锁 6.6 秒**。短事务的中位数掩盖了长尾：
+  绑定把整个 prompt 的 KV 页预留、147 MiB 状态镜像与转移都放在事务里，23k prompt 因此 6.6 s，
+  期间所有其它绑定被拒。两条 lane 各绑一次（≈13 s）再一起 prefill，正好是 17–19 s 的 TTFT。
+  修法：把 KV 预留移出事务（按 chunk 增量申请），或允许不同 lane 并发绑定。
 

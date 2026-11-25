@@ -355,8 +355,8 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         transaction.tier = std::move(tier);
         tier.reset();
     }
-    context_transaction_.emplace(std::move(transaction));
     note_transaction_open(ContextOperationKind::Bind);
+    context_transaction_.emplace(std::move(transaction));
     auto& tx = *context_transaction_;
     if (source) { ++checkpoints[source->index].pins; }
     try {

@@ -422,6 +422,11 @@ void Program::context_transaction_timing(std::uint64_t counts[4], double total_m
     }
 }
 
+void Program::context_transaction_state(int& kind, double& age_ms, std::uint64_t& opens,
+                                        std::uint64_t& replaces) const noexcept {
+    impl_->transaction_state(kind, age_ms, opens, replaces);
+}
+
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
                                          runtime::TokenMaskProvider* m) {
     return impl_->advance_prefill(h, t, m);

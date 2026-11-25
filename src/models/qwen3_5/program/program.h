@@ -697,6 +697,9 @@ public:
     // back". Counts, total milliseconds and the worst single one, indexed by ContextOperationKind.
     void context_transaction_timing(std::uint64_t counts[4], double total_ms[4],
                                     double max_ms[4]) const noexcept;
+    // What is open right now (kind or -1), how long it has been open, and the open/replace counters.
+    void context_transaction_state(int& kind, double& age_ms, std::uint64_t& opens,
+                                   std::uint64_t& replaces) const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;

@@ -454,6 +454,11 @@ public:
         double max_ms       = 0.0;
     };
     void note_transaction_open(ContextOperationKind kind) {
+        // Called before the emplace: if the optional is already engaged, this open replaces a
+        // transaction that never committed. That is the shape the burst showed (six admissions, five
+        // closes) and it also resets the span, so the pair has to be counted separately.
+        if (context_transaction_) { ++transaction_replaces_; }
+        ++transaction_opens_;
         transaction_opened_ = std::chrono::steady_clock::now();
         transaction_kind_   = static_cast<int>(kind);
     }
@@ -470,6 +475,19 @@ public:
     }
     [[nodiscard]] const TransactionTiming* transaction_timing() const noexcept {
         return transaction_timing_.data();
+    }
+    // What is open right now, for the engine's probe: kind, how long it has been open, and the
+    // open/replace counters that a replacement would otherwise hide.
+    void transaction_state(int& kind, double& age_ms, std::uint64_t& opens,
+                           std::uint64_t& replaces) const noexcept {
+        kind     = transaction_opened_ ? transaction_kind_ : -1;
+        age_ms   = transaction_opened_
+                       ? std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - *transaction_opened_)
+                             .count()
+                       : 0.0;
+        opens    = transaction_opens_;
+        replaces = transaction_replaces_;
     }
 
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
@@ -694,6 +712,8 @@ public:
 
     std::optional<ContextTransaction> context_transaction_;
     std::array<TransactionTiming, 4> transaction_timing_{};
+    std::uint64_t transaction_opens_    = 0;
+    std::uint64_t transaction_replaces_ = 0;
     std::optional<std::chrono::steady_clock::time_point> transaction_opened_;
     int transaction_kind_ = 0;
     CudaCompletionEvent context_source_ready_;

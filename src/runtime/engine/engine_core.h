@@ -4291,7 +4291,17 @@ private:
                                  tx_worst[2], static_cast<unsigned long long>(tx_counts[3]),
                                  tx_avg(3), tx_worst[3]);
                     std::fflush(stderr);
-                    std::fflush(stderr);
+                    int tx_open_kind = -1;
+                    double tx_age_ms = 0.0;
+                    std::uint64_t tx_opens = 0;
+                    std::uint64_t tx_replaces = 0;
+                    instance_.program->context_transaction_state(tx_open_kind, tx_age_ms, tx_opens,
+                                                                 tx_replaces);
+                    std::fprintf(stderr,
+                                 "[tx] open=%d age=%.0fms opens=%llu replaces=%llu\n",
+                                 tx_open_kind, tx_age_ms,
+                                 static_cast<unsigned long long>(tx_opens),
+                                 static_cast<unsigned long long>(tx_replaces));
                 }
                 bool hold_prefill = false;
                 if (prefill_hold_active()) {
