@@ -71,12 +71,12 @@
 
 | 项 | 状态 | 问题 | 做法 | 判据 |
 |---|---|---|---|---|
-| P0-1 KV 句柄失效 | 待复跑 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | 用同形状请求（72/14 messages + 54 tools、4 并发）重放，确认 841b532a 的 lane 修复是否覆盖此路径；必要时按 `NINFER_KV_*` 探针定位 | 连续 200 请求 0×500 |
-| P0-2 失败后不恢复 | 待复跑 | 一次 KV 错误后 admission 永久拒绝 | 错误请求隔离 + arena 重新绑定，不把坏句柄留在共享状态 | 注入一次 500 后，下一条请求 200 |
-| P0-3 预填充饿死 | 未开始 | 解码占边界时 prefill 得不到执行 | 每 N 个 decode step 强制放行一个 prefill chunk（N 可配，默认 2），或等待中请求的 prefill 提权 | 19k prompt TTFT 150 s → <30 s，同期 decode 劣化 <10% |
-| P0-4 prepare 61.5 s | 未开始 | 同形状请求的 prepare 差 2,000 倍（26 ms vs 61.5 s） | 拆解模板渲染 / 工具 schema / tokenize 三段，定位后修 | 同形状 prompt prepare <200 ms |
-| P0-5 前缀缓存 0% | 未开始 | 54 tools 的相同前缀不命中 | 查 prefix index 的 key 是否含 tools/thinking 段、`--kv-evict auto` 是否把前缀页当冷页驱逐、checkpoint 是否落在请求边界 | 第二次相同前缀命中 >90%，TTFT 降一个数量级 |
-| P0-6 KV 预留按实际输出 | 未开始 | `--default-max-tokens 32768` + `kv-capacity auto` 下 `running 2 / waiting 2`，疑似按最大输出预留 | 先用 `--default-max-tokens 4k` 重跑同批请求验证假设，再改成按声明/按需增长 | 并发 4 时 running 达到 4；TTFT 同比例下降 |
+| P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
+| P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
+| P0-3 预填充车道 | 未开始 | `--max-concurrency 4`，但 `throughput` 行稳定报告 `running 2 (prefill 2) | waiting 2`；4 条 23k 请求分成两波，TTFT 17.0–20.6 s | 先定位“prefill 并行度=2”的来源（KV 预算/车道策略/控制器），再决定放行配额 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
+| P0-5 前缀缓存 0% | 已关闭 | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天启动日志写的是 `checkpoint cache | off`；本轮开启后，两条同 prompt 请求命中 `cache 23,083 (100.0%, checkpoint)` | 不是缺陷 |
+| P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
 
 ### P1：长上下文
 
@@ -102,7 +102,8 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   selector-off dump `636e38de95046781` 逐位；
 - `--tier moe`：35B 三点 `7.111129 / 7.777808 / 6.479183` 与 decode digest `d093ac2070ab3292`；
 - `ctest -R "expert_cache|resize|kv_tier"`；
-- 发布冒烟两份（`SMOKE.txt` / `SMOKE-UI.txt`）。
+- 发布冒烟两份（`SMOKE.txt` / `SMOKE-UI.txt`）；
+- 故障回放：`powershell -NoProfile -File tools\serve\replay_burst.ps1`（退出码 0 才通过）。
 
 ## 4. 记录
 
@@ -122,3 +123,8 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   `selector-off dump e95cacb864d8b1ab` 逐位、9 个 salient 点全 PASS、`regressions: 0`；
   自动池 OOM 消失（W4a 关闭）。W4b 三层守卫落地后，Qwen4Exp 115 GB 工件首次跑出困惑度数值。
   注意：这轮的 PPL 只跑了两窗就被停掉（为释放显卡跑门禁），不作为精度结论。
+- 2026-11-25：P0 回放（`tools/serve/replay_burst.ps1`，4 并发 × 23,090 token + 54 tools）：
+  全部 200，0×500/0×503，follow-up 468 ms。新增两条结论——(a) 昨天 `cache 0%` 的原因是启动参数里
+  `checkpoint cache | off`，本轮开启后同 prompt 命中 100%；(b) `--default-max-tokens` 的有无对本轮
+  TTFT 无影响，真正的限制是 `running 2 (prefill 2) | waiting 2`，即 **prefill 并行度只有 2**，
+  4×23k 被分成两波（17–21 s）。P0-3 据此重写，P0-6 关闭。
