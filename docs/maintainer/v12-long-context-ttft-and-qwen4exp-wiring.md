@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 进行中（探针已就位） | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 三组对照排除“合并矩形随 chunk 变”与“并发上限”：chunk 1024 → 19.0–20.9 s，chunk 512 → 23.1–24.7 s，`--max-concurrency 8` → 18.6–19.7 s，车道恒为 2。`NINFER_PREFILL_BATCH=all` 的每轮输出显示只有 l0/l1 两条被绑定、其余 `waiting=2` 常驻；启动期 `[ctl] engine prefill merge: on (controller)`，并且 `--max-concurrency 8` 时引擎明确告警“arena 只能容纳 4 条全长 lane，超出部分排队”——**并发是引擎按 KV arena 现算的，不是写死**。下一步：在准入处加“本次为何只绑 2 条”的原因位（arena 页数 / 状态镜像 / merge 窗口），用同一条回放验证 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-3 预填充车道 | 已定位根因：绑定串行化 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 结论不是 KV、不是显存、也不是车道不够：新增的准入探针（`NINFER_PREFILL_BATCH` 打开时打印）在 72 次准入里给出 `tx_busy=56, no_lane=0, kv_wait=0, phys_wait=0, ok=5`。也就是说每条新请求都在等 `Program::has_context_transaction()` 释放——上下文事务（KV 页转移 + 147 MiB 状态备份 + 绑定安装）一次只能有一个，23k prompt 的绑定因此把车道数压到 ~2。修法是把事务按 lane 分段、或把它缩短到只覆盖 KV 发布，而不是调 chunk/并发 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -124,8 +124,9 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   自动池 OOM 消失（W4a 关闭）。W4b 三层守卫落地后，Qwen4Exp 115 GB 工件首次跑出困惑度数值。
   注意：这轮的 PPL 只跑了两窗就被停掉（为释放显卡跑门禁），不作为精度结论。
 - 2026-11-25：P0 回放（`tools/serve/replay_burst.ps1`，4 并发 × 23,090 token + 54 tools）：
-  全部 200，0×500/0×503，follow-up 468 ms。新增两条结论——(a) 昨天 `cache 0%` 的原因是启动参数里
-  `checkpoint cache | off`，本轮开启后同 prompt 命中 100%；(b) `--default-max-tokens` 的有无对本轮
+  全部 200，0×500/0×503，follow-up 468 ms。新增两条结论——(a) **此条后经核对更正，见下条**：
+  `cache 0%` 曾被归因于 `checkpoint cache | off`，实际昨天是 `attached`，0% 来自四条互不相同的对话；
+  (b) `--default-max-tokens` 的有无对本轮
   TTFT 无影响，真正的限制是 `running 2 (prefill 2) | waiting 2`，即 **prefill 并行度只有 2**，
   4×23k 被分成两波（17–21 s）。P0-3 据此重写，P0-6 关闭。
 - 2026-11-25：P0-3 三组对照（chunk 1024 / chunk 512 / `--max-concurrency 8`）显示车道数恒为 2，
@@ -137,3 +138,8 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   (b) **P0-3 的约束含控制器**：`--max-concurrency 8` 时引擎告警“arena 只能容纳 4 条全长 lane”，
   且 `[ctl] engine prefill merge: on (controller)`；`NINFER_PREFILL_BATCH=all` 显示只有 2 条被绑定、
   其余 `waiting` 常驻。并发数量是引擎按 arena 现算的，下一步要在准入处打印“本次只绑 2 条”的原因位。
+- 2026-11-25：准入原因位落地（`[admit] calls/ok/tx_busy/no_lane/kv_wait/phys_wait`，随
+  `NINFER_PREFILL_BATCH` 打印）。4×23k 回放给出 `tx_busy=56/72`，其余三项为 0——**绑定被
+  `Program` 级上下文事务串行化**，每个绑定的 KV 转移 + 状态备份 + 安装一次只能有一个，
+  这是车道数停在 2 的原因，与 KV 容量无关。P0-3 的修法据此改为“事务分段/缩短”。
+

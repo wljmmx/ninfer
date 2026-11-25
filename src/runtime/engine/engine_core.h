@@ -3037,6 +3037,7 @@ private:
                             // lane arms. Marking the scan deferred is what keeps this pass from
                             // re-arming itself: the retry must ride on a real capacity event.
                             note_kv_residency_wait(request, prompt_tokens, request_tokens, budget);
+                            if (admit_probe) { ++admit_probe_kv_wait_; }
                             admission_deferred_ = true;
                             continue;
                         }
@@ -3046,6 +3047,7 @@ private:
                         // resident lane to release its bytes.
                         if (available_physical_bytes() < kHostAdmissionReserveBytes) {
                             note_kv_residency_wait(request, prompt_tokens, request_tokens, budget);
+                            if (admit_probe) { ++admit_probe_phys_wait_; }
                             admission_deferred_ = true;
                             continue;
                         }
@@ -4250,6 +4252,19 @@ private:
                 // lane is down to its 7-token tail). Holding the prefill dispatch for a pass while
                 // a queued lane can still be bound is what puts two heads in the same pass; it is
                 // opt-in until it has been measured.
+                if (prefill_batch_report_ && prefill_batch_reports_ % 32 == 0) {
+                    // Why the queued lanes are not in lanes yet, one counter per refusal branch.
+                    std::fprintf(stderr,
+                                 "[admit] calls=%llu ok=%llu tx_busy=%llu no_lane=%llu "
+                                 "kv_wait=%llu phys_wait=%llu\n",
+                                 static_cast<unsigned long long>(admit_probe_calls_),
+                                 static_cast<unsigned long long>(admit_probe_ok_),
+                                 static_cast<unsigned long long>(admit_probe_tx_busy_),
+                                 static_cast<unsigned long long>(admit_probe_no_lane_),
+                                 static_cast<unsigned long long>(admit_probe_kv_wait_),
+                                 static_cast<unsigned long long>(admit_probe_phys_wait_));
+                    std::fflush(stderr);
+                }
                 bool hold_prefill = false;
                 if (prefill_hold_active()) {
                     // Hold while anything is still queued - not only while a bind can start right
@@ -4494,6 +4509,11 @@ private:
     std::uint64_t admit_probe_tx_busy_  = 0;
     std::uint64_t admit_probe_no_lane_  = 0;
     std::uint64_t admit_probe_ok_       = 0;
+    // Why a queued request is not in a lane yet. One counter per refusal branch in try_admit_one,
+    // so a burst can say "the arena's residency arithmetic is what holds the third lane" instead of
+    // inferring it from lane states.
+    std::uint64_t admit_probe_kv_wait_   = 0;
+    std::uint64_t admit_probe_phys_wait_ = 0;
     // Q67/S1: set by try_admit_one when a candidate was refused for capacity rather than ordering.
     bool admission_deferred_ = false;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
