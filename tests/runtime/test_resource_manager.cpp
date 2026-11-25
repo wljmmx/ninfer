@@ -160,8 +160,9 @@ struct Program {
         return blocks.size() - 1;
     }
 
-    // resource_manager.h's recovery path asks the program these three. The fixture models no fork,
-    // so nothing shares pages with anything and no group retires anything.
+    // resource_manager.h's recovery path asks the program these four. The fixture models no fork
+    // and one history, so nothing shares pages or history with anything and no group retires.
+    [[nodiscard]] std::vector<Handle> checkpoints_sharing_history(Handle) const { return {}; }
     [[nodiscard]] std::vector<Handle> checkpoints_sharing_pages(Handle) const { return {}; }
     void debug_checkpoint_table(const char*) const {}
     [[nodiscard]] std::uint32_t retire_checkpoint_group(std::span<const Handle>) { return 0; }
