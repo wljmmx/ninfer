@@ -362,6 +362,7 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
         out.complete = out.published = true;
         out.transfers                = std::move(tx.observations);
         out.operations               = tx.operations;
+        note_transaction_close();
         context_transaction_.reset();
         return out;
     }
@@ -464,6 +465,7 @@ void ProgramImpl::abort_context() noexcept {
         for (const auto& [handle, role] : tx.capture_points) {
             if (!valid_checkpoint(handle)) { checkpoints[handle.index].reserved = false; }
         }
+        note_transaction_close();
         context_transaction_.reset();
     } catch (...) { std::terminate(); }
 }

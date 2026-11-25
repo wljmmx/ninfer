@@ -241,6 +241,7 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     const bool host_state = ticket->host.has_value();
     ticket->owner         = nullptr;
     context_transaction_.emplace(std::move(tx));
+    note_transaction_open(ContextOperationKind::Capture);
     auto& operation = *context_transaction_;
     try {
         const bool shared =

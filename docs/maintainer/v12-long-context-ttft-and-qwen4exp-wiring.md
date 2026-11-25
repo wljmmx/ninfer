@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 已定位到事务，待计时 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 准入探针给出 `calls=103, ok=5, tx_busy=87, no_lane=0, kv_wait=0, phys_wait=0, idle_wait=0`。结论有三层：(1) 不是 KV、不是显存、不是车道不够；(2) **也不是准入被饿死**——`idle_wait=0` 说明有请求在等时每一轮都在尝试；(3) 排除结果是 `Program` 级上下文事务（Bind/Capture/Pause 共用 `context_transaction_`，一次只能有一个），在 burst 期间几乎全程被占。下一步：按 kind 记录事务的 open→commit 时长，判断是「单次太慢」还是「接连不断地开」，再决定是缩短临界区还是让 Capture 不阻塞新绑定 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-3 预填充车道 | 已定位到“事务开而不再关”，非慢事务 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 事务计时给出反证：`bind n=5 avg=3.7ms max=8.6`、`capture n=2 avg=12.6 max=17.1`、`demote n=3 avg=23.4 max=43.5`、`pause n=0`——整轮事务占用只有 ~150 ms，**“单次太慢”被推翻**。但同一轮里 `ok=6`（6 次成功准入）只对应 `bind n=5`（5 次关闭），且 `tx_busy` 随调用次数单调升到 88/105：说明有一次事务**开启后没有 commit**，`has_value()` 常真；此后每次 emplace 都在已占用的事务上替换它，计时器随之重置，这正是“测出来都很短、但永远 busy”的原因。下一步：找那条 open 后不 commit（或直接替换）的路径，而不是缩短临界区 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -145,4 +145,8 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
 - 2026-11-25：踩到并记录一个已知坑的实例：改 `engine_core.h` 后 ninja 未重编（depfile 对头文件不可靠），
   二进制停留在旧版本、探针字段没出现。删 `ninfer_engine.dir` 下的引擎 obj 强制重编后恢复正常。
   以后改 `engine_core.h` 一律先清对应 obj。
+- 2026-11-25：事务计时推翻上一轮的“事务太慢”结论。`[tx] bind n=5 avg=3.7ms | capture n=2 avg=12.6ms |
+  demote n=3 avg=23.4ms | pause n=0`，整轮事务占用约 150 ms；但 `ok=6` 对 `bind n=5`，成对少一次，
+  且 `tx_busy` 单调升到 88/105——是“有一次事务开而不关、后续 emplace 替换它并重置计时”，
+  不是临界区过慢。P0-3 的下一步因此改为定位“开而不 commit”的路径。
 

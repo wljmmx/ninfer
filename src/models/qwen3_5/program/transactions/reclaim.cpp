@@ -1207,6 +1207,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
     }
 
     context_transaction_.emplace(std::move(transaction));
+    note_transaction_open(ContextOperationKind::Demote);
     try {
         context_source_ready_.record(device.stream);
         context_source_ready_.wait(device.transfer_stream);

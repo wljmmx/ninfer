@@ -1860,8 +1860,9 @@ private:
                                          "[ckpt] prompt-frontier capture skipped | frontier %u | "
                                          "finish-time publish keeps the record\n",
                                          request->base_plan->summary().prompt_tokens);
-                            std::fflush(stderr);
-                        }
+                    std::fflush(stderr);
+
+                }
                     } else {
                         reserve_active_capture(request, post_capture_state);
                     }
@@ -4270,6 +4271,26 @@ private:
                                  static_cast<unsigned long long>(admit_probe_kv_wait_),
                                  static_cast<unsigned long long>(admit_probe_phys_wait_),
                                  static_cast<unsigned long long>(admit_probe_idle_waiting_));
+                    std::uint64_t tx_counts[4]{};
+                    double tx_total[4]{};
+                    double tx_worst[4]{};
+                    instance_.program->context_transaction_timing(tx_counts, tx_total, tx_worst);
+                    const auto tx_avg = [&](int kind) {
+                        return tx_counts[kind] == 0
+                                   ? 0.0
+                                   : tx_total[kind] / static_cast<double>(tx_counts[kind]);
+                    };
+                    std::fprintf(stderr,
+                                 "[tx] bind n=%llu avg=%.1f max=%.1f | capture n=%llu avg=%.1f "
+                                 "max=%.1f | demote n=%llu avg=%.1f max=%.1f | pause n=%llu "
+                                 "avg=%.1f max=%.1f (ms)\n",
+                                 static_cast<unsigned long long>(tx_counts[0]), tx_avg(0),
+                                 tx_worst[0], static_cast<unsigned long long>(tx_counts[1]),
+                                 tx_avg(1), tx_worst[1],
+                                 static_cast<unsigned long long>(tx_counts[2]), tx_avg(2),
+                                 tx_worst[2], static_cast<unsigned long long>(tx_counts[3]),
+                                 tx_avg(3), tx_worst[3]);
+                    std::fflush(stderr);
                     std::fflush(stderr);
                 }
                 bool hold_prefill = false;
@@ -4553,3 +4574,4 @@ private:
 } // namespace ninfer::runtime
 
 #include "runtime/engine/engine_metrics.inl"
+

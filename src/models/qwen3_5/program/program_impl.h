@@ -445,6 +445,33 @@ public:
         return context_transaction_.has_value();
     }
 
+    // P0-3: admission refuses while a context transaction is engaged, and the engine cannot tell
+    // from the outside whether a lane is held back by one slow transaction or by transactions
+    // opening back to back (every request captures after its prefill). Time each one by kind.
+    struct TransactionTiming {
+        std::uint64_t count = 0;
+        double total_ms     = 0.0;
+        double max_ms       = 0.0;
+    };
+    void note_transaction_open(ContextOperationKind kind) {
+        transaction_opened_ = std::chrono::steady_clock::now();
+        transaction_kind_   = static_cast<int>(kind);
+    }
+    void note_transaction_close() {
+        if (!transaction_opened_) { return; }
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - *transaction_opened_)
+                              .count();
+        auto& timing = transaction_timing_[static_cast<std::size_t>(transaction_kind_) % 4];
+        ++timing.count;
+        timing.total_ms += ms;
+        timing.max_ms = std::max(timing.max_ms, ms);
+        transaction_opened_.reset();
+    }
+    [[nodiscard]] const TransactionTiming* transaction_timing() const noexcept {
+        return transaction_timing_.data();
+    }
+
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
 
@@ -666,6 +693,9 @@ public:
     };
 
     std::optional<ContextTransaction> context_transaction_;
+    std::array<TransactionTiming, 4> transaction_timing_{};
+    std::optional<std::chrono::steady_clock::time_point> transaction_opened_;
+    int transaction_kind_ = 0;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
     std::array<CudaEventTimer, 3> context_transfer_timers_;

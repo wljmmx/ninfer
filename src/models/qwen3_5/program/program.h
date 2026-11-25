@@ -692,6 +692,11 @@ public:
                                    runtime::ExecutionTiming* timing = nullptr);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // P0-3: per-kind cost of a context transaction (Bind, Capture, Demote, Pause). Admission refuses
+    // while one is engaged, so this separates "one transaction is slow" from "captures open back to
+    // back". Counts, total milliseconds and the worst single one, indexed by ContextOperationKind.
+    void context_transaction_timing(std::uint64_t counts[4], double total_ms[4],
+                                    double max_ms[4]) const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;

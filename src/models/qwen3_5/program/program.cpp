@@ -412,6 +412,16 @@ bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
+void Program::context_transaction_timing(std::uint64_t counts[4], double total_ms[4],
+                                         double max_ms[4]) const noexcept {
+    const auto* timing = impl_->transaction_timing();
+    for (int kind = 0; kind < 4; ++kind) {
+        counts[kind]   = timing[kind].count;
+        total_ms[kind] = timing[kind].total_ms;
+        max_ms[kind]   = timing[kind].max_ms;
+    }
+}
+
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
                                          runtime::TokenMaskProvider* m) {
     return impl_->advance_prefill(h, t, m);
