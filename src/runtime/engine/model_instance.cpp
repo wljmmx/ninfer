@@ -16,6 +16,7 @@
 #include "models/qwen3_5/execution/expert_prefetch.h"
 #include "models/qwen3_5/execution/expert_path_control.h"
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/layer_capture.h"
 #include "models/qwen3_5/execution/host_expert_reader.h"
 #include "models/qwen3_5/execution/host_expert_residency.h"
 #include "models/qwen3_5/load.h"
@@ -2143,9 +2144,17 @@ ConstructedModel construct_model_once(EngineOptions& options, DeviceContext& dev
         // measured 2026-11-22 on this 27B dense artifact: `[graph] skipped: layer needs host fetch`,
         // graph off, and the prefill paid ~350 ms per chunk in per-kernel submission (submit 28.3 s
         // over ~80 chunks).
+        // The exact question, not a share: every expert of every bank must own a slot before a
+        // capture can be legal. `can_hold_every_layer()` answered the weaker "does the total fit"
+        // and said yes for the Qwen4Exp artifact's 48-bank pool, whose per-bank share cannot hold a
+        // layer - the capture then died in the split path's cudaStreamSynchronize
+        // (ffn.cpp:372, cudaErrorStreamCaptureUnsupported) with no `[graph] skipped` line to say why.
         const bool every_layer =
             instance->expert_cache == nullptr ||
-            instance->expert_cache->can_hold_every_layer();
+            instance->expert_cache->all_experts_resident();
+        // text.cpp captures the whole prefill stack and has no handle on the pool, so the answer is
+        // published once, here.
+        models::qwen3_5::execution::set_layer_stack_capturable(every_layer);
         if (every_layer && instance->expert_cache != nullptr) {
             instance->expert_cache->preload_all();
         }

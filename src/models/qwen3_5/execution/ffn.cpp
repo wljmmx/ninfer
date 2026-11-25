@@ -2628,7 +2628,12 @@ void streamed_ffn(const Tensor& hidden, const RoutedMoeParameters& moe, Tensor& 
         };
         const auto dev_begin = std::chrono::steady_clock::now();
         auto& graphs = LayerGraphs::instance();
-        if (graphs.enabled()) {
+        // A capture records the work; it cannot run a host fetch, and the split path's fetch waits
+        // on cudaStreamSynchronize (the branch above this one, `ffn.cpp:372`), which a capture
+        // forbids. Only a bank that holds its whole layer is capturable. Measured on the Qwen4Exp
+        // artifact: 48 banks, windows=0, `NINFER_LAYER_GRAPH` on by default, and the first scored
+        // window died with cudaErrorStreamCaptureUnsupported.
+        if (graphs.enabled() && moe.stream->fully_resident()) {
             // What the capture baked in is the argument list, so the key is the set of buffer
             // addresses the kernels read and write. A moved buffer changes an argument the capture
             // recorded and the graph has to be rebuilt.

@@ -2073,6 +2073,12 @@ std::uint64_t ExpertCache::resident_experts() const noexcept {
 
 bool ExpertCache::can_hold_every_layer() const noexcept { return impl_->holds_every_layer(); }
 
+bool ExpertCache::all_experts_resident() const noexcept {
+    std::uint64_t total = 0;
+    for (const auto& bank : impl_->banks) { total += bank.count; }
+    return total != 0 && resident_experts() == total;
+}
+
 bool ExpertCache::window_resident(std::uint32_t bank) const noexcept {
     return bank < impl_->resident_count.size() &&
            impl_->resident_count[bank] == impl_->banks[bank].count;

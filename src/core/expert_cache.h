@@ -274,6 +274,11 @@ void prepare(std::span<const ExpertCacheKey> required, cudaStream_t stream = nul
     // Experts the pool actually holds, summed over every bank. `capacity_bytes() / slot_bytes()`
     // undercounts a per-bank layout, because the banks are not one width.
     [[nodiscard]] std::uint64_t resident_experts() const noexcept;
+    // True only when every expert of every bank owns a slot right now. This is the exact form of
+    // "no layer can take the host-fetch path", which is what a whole-step capture requires; the
+    // share-based `can_hold_every_layer()` answers a weaker question and said yes for a 48-bank
+    // pool whose per-bank share could not hold a layer (measured on the Qwen4Exp artifact).
+    [[nodiscard]] bool all_experts_resident() const noexcept;
     // port (sm_89): byte origin of a bank window, so a strided bank view can rebase onto it. The
     // pool is a flat slot space, so this is always 0; it stays so such a view keeps compiling.
     [[nodiscard]] std::uint64_t window_origin(std::uint32_t bank) const;

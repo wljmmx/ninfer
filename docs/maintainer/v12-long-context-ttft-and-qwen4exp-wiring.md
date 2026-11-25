@@ -63,9 +63,9 @@
 | W1 三 bank 专家流 | 已完成（代码级） | `ExpertStream` 有 split 形态，但需要模型侧构造并绑定 | `parameters.cpp:682` 已按 gate/up/down 三个 `ExpertMatrixBankDesc` 构造；`model_instance.cpp` 已按 `runs[i].split` 调 `attach_split()` 绑三个 bank | 代码就位；待 W4 端到端证明 |
 | W2 PLE / HC 注入 | 已完成（代码级） | `run_layers` 需要 PLE 表与四流残差 | `text.cpp` 已接 `PleStepWindow`（3 处）与 HC 残差折叠 | 同上 |
 | W3 QSA 规划 | 部分完成 | QSA 的 KV 页与索引计划要进 startup | `startup.cpp:220/463` 已调用 `qsa_geometry` / `qsa_plan_inputs`；`qsa.cpp` 只产出几何，sparse 执行未落地 | 缺 QSA 内核与层执行 |
-| W4 端到端跑通 115 GB 工件 | 进行中 | 首次运行：加载 3.24 GiB 权重、PLE 表、KV 计划、容量计划全部通过，最后 `vmm_pool: cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY` | 第一层根因：`VmmPool` 构造即映射整个**增长上限**（17.5 GiB），与"只映射 capacity"的设计相反。已改为构造函数接收 `mapped_bytes`，只映射 live 段，尾段留给 `resize()` 的 `acquire` | 单元测试与 4 GiB 池路径已通过（见下）；自动池仍 OOM，第二层根因见下 |
-| W4a 容量计划与已加载权重 | 待复测（可能不是计划问题） | 自动池 `achieved_pool_mb=17514` 仍 `cuMemCreate` OOM，规划日志自称 `free=19526 MiB` | `nvidia-smi` 显示本机有常驻 `ninfer-serve`（pid 65468）占 **10,924 MiB**，同时 27B 的 15.9 GiB 权重加载也 `cudaMalloc insufficient`。即 OOM 可能来自**卡被占用**，而非计划超配 | 停掉常驻 serve 后在空卡上复跑：若不再 OOM 则本项关闭；若仍 OOM 再查 free 是否把 WDDM 可回收内存算成可用 |
-| W4b split 层与图捕获 | 未开始 | 4 GiB 池下进入执行后崩在 `ffn.cpp:372 cudaStreamSynchronize: cudaErrorStreamCaptureUnsupported`，说明捕获已开而该层要走 split 的 host 取数 | 捕获守卫在 `model_instance.cpp:2172`，判据是 `expert_cache == nullptr \|\| can_hold_every_layer()`；`windows=0` 的 Qwen4Exp 池没被这个判据拦住（日志无 `[graph] skipped`）。查 qwen4exp 构造是否在池建立前就做了图决策，或走了另一条构造分支 | 该工件启动时打印 `[graph] skipped: layer needs host fetch` 并正常跑完困惑度 |
+| W4 端到端跑通 115 GB 工件 | 已完成（能执行） | 依次卡在 `vmm_pool` OOM、`cudaErrorStreamCaptureUnsupported` | 三层修复：池只映射 live 段；`ExpertCache::all_experts_resident()` 取代份额判据；prefill 栈捕获增加 `layer_stack_capturable()` 开关（`layer_capture.h`，引擎在池建立后写入）；另在 `ffn.cpp` 的 per-bank 图缓存上加 `fully_resident()` 守卫 | 同命令（512 ctx、`rk4v4-e8`）连续出数：窗口 1 PPL 14.59、窗口 2 PPL 16.02，7–8 tok/s（44 万专家里约 5.6 万驻留，其余流式）。数值不作为精度结论，仅证明执行链路通 |
+| W4a 容量计划与已加载权重 | 已关闭（环境） | 自动池曾 `cuMemCreate` OOM | 停掉占 10,924 MiB 的常驻 serve 后，`gpu=18000 (22500 MiB) host_cache=5058 unslotted=55728 of 73728`，池正常建立 | 无规划缺陷 |
+| W4b split 层与图捕获 | 已完成 | 捕获里执行 split 的 host 取数 → `ffn.cpp:372` 断言 | 三个入口分别加守卫：`model_instance` 的整步图用 `all_experts_resident()`；`ffn.cpp` 的 per-bank 图用 `stream->fully_resident()`；`text.cpp` 的 prefill 栈图用 `layer_stack_capturable()` | 同一份工件不再崩；预填充按普通路径执行 |
 
 ### P0：TTFT 与稳定性
 
@@ -118,3 +118,7 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
 - 2026-11-25：门禁与 W4a 被环境阻塞：本机常驻 `ninfer-serve`（pid 65468）占 10,924 MiB，
   27B 权重加载与自动池都因此 `cudaMalloc/cuMemCreate` OOM。**不擅自停该服务**；空卡后再复跑
   `--tier fast` 与 W4a。本文件的状态以此为准，不把环境导致的失败记成代码结论。
+- 2026-11-25（获授权停 pid 65468 后）：`--tier fast` 通过——`default PPL 7.359779` 逐位、
+  `selector-off dump e95cacb864d8b1ab` 逐位、9 个 salient 点全 PASS、`regressions: 0`；
+  自动池 OOM 消失（W4a 关闭）。W4b 三层守卫落地后，Qwen4Exp 115 GB 工件首次跑出困惑度数值。
+  注意：这轮的 PPL 只跑了两窗就被停掉（为释放显卡跑门禁），不作为精度结论。

@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/expert_stream.h"
+#include "models/qwen3_5/execution/layer_capture.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/shape_class.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -3183,7 +3184,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ple_window.opened(len, false);
             }
             auto& stack_graphs = PrefillLayerGraphs::instance();
-            if (stack_graphs.enabled()) {
+            // The stack is only capturable when no layer can take the expert split path: its host
+            // fetch synchronises the stream, which a capture forbids. The engine sets this once the
+            // pool exists (ExpertCache::all_experts_resident()).
+            if (stack_graphs.enabled() && layer_stack_capturable()) {
                 std::uint64_t key = 1469598103934665603ULL;
                 const auto mix    = [&key](std::uintptr_t value) {
                     key ^= value;
