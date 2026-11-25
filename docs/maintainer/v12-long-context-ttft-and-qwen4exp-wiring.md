@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 已定位：`auto` 的 2 张状态镜像是正确默认，不是准入缺陷 | 车道数由 `controller_residency_policy(auto).device_state_images = 2` 决定（`planning/startup.h` 的 `device_state_image_slots()` 取 `min(policy, logical_slots)`，`NINFER_STATE_IMAGE_DEVICE_SLOTS` 仍可覆盖；`performance` 才是 4）。2 条 lane 占满 2 张 device image 后，第 3/4 条 bind 被拒、只能等前两条完成，且错过后无法插队（`[prefill-reject] mid_capture`）。崩溃修复后事务不是限制（`[tx] bind avg=4.1ms`） | 同二进制 A/B（`replay_burst.ps1` 4×23k，唯一变量 `NINFER_STATE_IMAGE_DEVICE_SLOTS`）：**2 张** → `running 2 \| waiting 2`，队头 18.6 s、队尾 37.0 s；**4 张** → `running 4 (prefill 4)`，全员 36.4 s。两臂总 prefill 吞吐都锁定在 2.04–3.08k tok/s，墙钟严格 = 总 token / 吞吐。4 张多花 294 MiB state image（307,908,608→615,817,216 B）并挤掉 295 个 device KV 页（3,646→3,351，19.5%→18.0%），无吞吐收益 | 原判据“4×23k ≤10 s”在当前吞吐下不可达（需 ≥2.3× prefill 吞吐）；改为：车道策略保持 `auto=2`，TTFT 的优化目标改为 prefill 吞吐 |
+| P0-3 预填充车道 | 已完成：`auto` 的 2 张状态镜像是正确默认，不是准入缺陷；“18 s 几乎全是排队”已更正 | 车道数由 `controller_residency_policy(auto).device_state_images = 2` 决定（`planning/startup.h` 的 `device_state_image_slots()` 取 `min(policy, logical_slots)`，`NINFER_STATE_IMAGE_DEVICE_SLOTS` 仍可覆盖；`performance` 才是 4）。2 条 lane 占满 2 张 device image 后，第 3/4 条 bind 被拒、只能等前两条完成，且错过后无法插队（`[prefill-reject] mid_capture`）。崩溃修复后事务不是限制（`[tx] bind avg=4.1ms`） | 同二进制 A/B（`replay_burst.ps1` 4×23k，唯一变量 `NINFER_STATE_IMAGE_DEVICE_SLOTS`）：**2 张** → `running 2 \| waiting 2`，队头 18.6 s、队尾 37.0 s；**4 张** → `running 4 (prefill 4)`，全员 36.4 s。两臂总 prefill 吞吐都锁定在 2.04–3.08k tok/s，墙钟严格 = 总 token / 吞吐。4 张多花 294 MiB state image 并挤掉 295 个 device KV 页，无吞吐收益。GPU 侧采样：三种配置 util.gpu p50=99、413–417 W、带宽 30%——compute-bound | 车道策略保持 `auto=2`；TTFT 的优化目标改为 prefill 吞吐（需 ≥2.3× 才能把 4×23k 拉进 10 s）。原判据不可达，已废 |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -82,7 +82,7 @@
 
 | 项 | 状态 | 问题 | 做法 | 判据 |
 |---|---|---|---|---|
-| P1-1 SplitKv 是否启用 | 未开始 | 27B 32k 2,643 vs 4k 3,215（−18%），不知是注意力还是调度 | `context/launch.cu` 的 SplitKv 路由开关做同会话 A/B | 明确 −18% 的归属；若已启用则到此为止 |
+| P1-1 SplitKv 是否启用 | 已完成 | 27B 32k 2,643 vs 4k 3,215（−18%），不知是注意力还是调度 | 代码：`dense/context/launch.cu` 的 `direct = (envelope.max_context == 0)`，服务跑 262k 上限时必然走 `SplitKv`，**没有 env 开关**。同会话串行探针 `tools/serve/p11_context_probe.ps1`（unique 前缀、单条、chunk 1024、rk4v4-e8、MTP7） | 3,546 tok → 2.74/2.79k；13,947 → 2.78/2.79k；27,818 → 2.59/2.60k。两轮重复一致，**8× 长度只掉 5.5%**，与 23k 的 2.66k 同量级。−18% 不能复现：4k 的 3,215 与 32k 的 2,643 不是同一口径。注意力不是长上下文瓶颈，P1-2 继续查精度 |
 | P1-2 32k 的 KV 精度 | 未开始 | 4k 有 fp8 +0.13% / rk4v4-e8 +3.33%，32k 空白 | 32k 补测 fp8 / rk4v4-e8 | 若 fp8 在 32k 仍 ≤+0.5%，可直接换更大池 |
 
 ### P2：不投入
@@ -242,3 +242,24 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
 - 2026-11-25：**读日志的坑**：`throughput | ... | host 16.5% (828 ms)` 里的 `host` 是
   CPU 侧活跃时间 / 窗口（`host_active_ns / interval`），不是 GPU 利用率；20% 表示 80% 时间在等 GPU，
   不是“GPU 只用了 20%”。GPU 是否空闲只能用 `nvidia-smi` 采样判定。
+- 2026-11-25：**P0-3 收尾，并更正“TTFT 的 18 秒几乎全是排队等车道”**：
+  - 仍成立：只有 2 条能同时 prefill；后两条确实 `queue 18.4 s`；6.6 s 确实是崩溃副产物。
+  - 已证伪（只对“四条 prompt 逐字相同”成立）：等待者 `engine-wall 69–201 ms`、`cache 23,083 (100%)`。
+    `-UniquePrompts` 复测同一形状，等待者 `engine-wall 17.5 s`，TTFT 36.9 s 里约一半是真计算。
+  - 已证伪（归因）：不是“调度器一次只放行 2 条”的策略选择，而是 2 张 device state image 的容量；
+    且单条 23k 就要 8.9 s、GPU 99%，所谓排队是在等算力，不是等闲置产能。
+  结论：P0-3 关闭，不再加车道；后续只做 prefill 吞吐。
+- 2026-11-25：**P1-1 结案：SplitKv 无开关，且 32k 没有额外劣化。**
+  `dense/context/launch.cu`：`direct = (envelope.max_context == 0)`，服务跑 `--max-context 262144`
+  时必然走 `SplitKv`，`NINFER_*` 也没有路由覆盖。同会话串行探针
+  （`tools/serve/p11_context_probe.ps1`，每条不同开头、单条、chunk 1024、rk4v4-e8、MTP7）：
+
+  | prompt tokens | TTFT | prefill | submit | devwait |
+  |---|---|---|---|---|
+  | 3,546 | 1.3 s | 2.74 / 2.79k | 347 ms | 1.1 s |
+  | 13,947 | 5.1 / 5.0 s | 2.78 / 2.79k | 1.4 s | 3.8 s |
+  | 27,818 | 10.8 / 10.7 s | 2.59 / 2.60k | 3.1 s | 7.7 s |
+
+  两轮重复一致，8× 长度只掉 5.5%，且 32k 的 2.59k 与 23k 的 2.66k 同量级。
+  所以台账原先记的“4k 3,215 → 32k 2,643（−18%）”是两次不同口径的对比（4k 那次 3,215
+  在当前配置下复现为 2.74k），不是长上下文让注意力变慢。P1-2 继续查精度。
