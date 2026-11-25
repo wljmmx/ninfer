@@ -63,7 +63,9 @@
 |---|---|---|---|---|
 | W1 三 bank 专家流 | 已完成（W4 端到端已证明） | `ExpertStream` 有 split 形态，但需要模型侧构造并绑定 | `parameters.cpp:682` 已按 gate/up/down 三个 `ExpertMatrixBankDesc` 构造；`model_instance.cpp` 已按 `runs[i].split` 调 `attach_split()` 绑三个 bank | W4 的 115 GB 工件跑出 PPL，三 bank 路径实际执行 |
 | W2 PLE / HC 注入 | 已完成（W4 端到端已证明） | `run_layers` 需要 PLE 表与四流残差 | `text.cpp` 已接 `PleStepWindow`（3 处）与 HC 残差折叠 | 同上 |
-| W3 QSA 规划 | 部分完成 | QSA 的 KV 页与索引计划要进 startup | `startup.cpp:220/463` 已调用 `qsa_geometry` / `qsa_plan_inputs`；`qsa.cpp` 只产出几何，sparse 执行未落地 | 缺 QSA 内核与层执行 |
+| W3 QSA 执行 | 已完成（原判“sparse 执行未落地”已作废） | QSA 的 KV 页、索引计划与稀疏执行 | `qwen4_exp/execution/qsa_layer.cpp:101` 的 `qsa_mix` 走完整链路：`qsa_prepare` → `qsa_indexer` → `qsa_sparse_gqa` → `qsa_tail_extract`；kernel 在 `ops/softmax_attention/qsa/`（`sparse_gqa_kernel.cuh`、`sparse_gqa_prefill.cuh`、`sparse_gqa_launch.cu`）。`text.cpp:2775` 中 `indexed && !qsa_dense_arm()` 走 `qsa_mix`，即**默认就是稀疏路径**，只有 `NINFER_QSA_FORCE_FULL` 退回 dense | 支持 width×batch 矩形（merged prefill / decode / 单 lane 三种形状）；W4 的 65 窗 PPL 就是这条路径 |
+| W3a QSA 低比特 KV | 未开始 | QSA 的 KV 量化仍被 env 门控，默认降级 bf16 | `model_instance.cpp:1723` 的 `resolve_kv_storage`：`qsa_kv_storage_admitted()` 不通过就把存储改 `BFloat16` 并打印；只有 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1` 才启用低比特路由。所以 W4 用 `--kv-dtype rk4v4-e8` 跑出来的 PPL 实际是 **bf16 KV** | 低比特在 QSA 上资格化：PPL 对照 bf16 ≤+0.5%（与 P1-2 同口径），且 262k 上下文能装下 |
+| W3b QSA 与 dense 参考臂对照 | 未开始（依赖 W4 基线） | 稀疏选块是否改变了同一层的数值 | `NINFER_QSA_FORCE_FULL` 是同一种子的 dense 臂，可做逐窗对照 | 两臂 PPL 差与逐层 attention dump 差都有解释；作为 W3a 的前置参考 |
 | W4 端到端跑通 115 GB 工件 | 已完成（能执行） | 依次卡在 `vmm_pool` OOM、`cudaErrorStreamCaptureUnsupported` | 三层修复：池只映射 live 段；`ExpertCache::all_experts_resident()` 取代份额判据；prefill 栈捕获增加 `layer_stack_capturable()` 开关（`layer_capture.h`，引擎在池建立后写入）；另在 `ffn.cpp` 的 per-bank 图缓存上加 `fully_resident()` 守卫 | 同命令（512 ctx、`rk4v4-e8`）连续出数：窗口 1 PPL 14.59、窗口 2 PPL 16.02，7–8 tok/s（44 万专家里约 5.6 万驻留，其余流式）。数值不作为精度结论，仅证明执行链路通 |
 | W4a 容量计划与已加载权重 | 已关闭（环境） | 自动池曾 `cuMemCreate` OOM | 停掉占 10,924 MiB 的常驻 serve 后，`gpu=18000 (22500 MiB) host_cache=5058 unslotted=55728 of 73728`，池正常建立 | 无规划缺陷 |
 | W4b split 层与图捕获 | 已完成 | 捕获里执行 split 的 host 取数 → `ffn.cpp:372` 断言 | 三个入口分别加守卫：`model_instance` 的整步图用 `all_experts_resident()`；`ffn.cpp` 的 per-bank 图用 `stream->fully_resident()`；`text.cpp` 的 prefill 栈图用 `layer_stack_capturable()` | 同一份工件不再崩；预填充按普通路径执行 |
@@ -297,3 +299,37 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
   decode 或 prefill，另一方整轮等待，谁先占住谁赢。修法不是调 pacing，而是让两类 row
   进同一个 batch pass（执行层已有多行 batch，缺的是 decode row + prefill row 混合）。
   这一项与 W3 同级工作量，排期需单独确认。
+
+## 6. 调度方案的模型差异（P0-7 设计）
+
+P0-7 的修法不能一套方案套三个模型。三个形态的 batch 形状能力不同，混合 decode+prefill 的代价也不同。
+
+### 6.1 现状：一个 pass 只能整块跑一类
+
+`engine_core.h` 的顺序是 control → decode → prefill，两者各自 `device.synchronize()`；decode 一侧
+还有采样、draft 提交、state fork 三处同步（`decode.cpp:948/1114` 等），所以不能靠“异步提交”绕过。
+唯一出路是让两类 row 进**同一个 pass**，一次同步覆盖两者。
+
+### 6.2 三种形态的形状能力
+
+| 模型 | prefill 侧 | decode 侧 | 混合可行性 | 关键约束 |
+|---|---|---|---|---|
+| 稠密 27B | `dense/context`：`T=1..16 × B=1..8`，**per-row `valid_columns`**（`context_softmax_attention.cpp:139–152`） | `dense/causal_cache`：每 warp 16 行 Q | **高**：context kernel 本身接受每行不同有效列，decode 行取 `T=1 / valid=1` 即可入同一矩形 | 一个 chunk 1024 token 要拆成 64 个 16-token tile，decode 行在第 1 个 tile 后必须“提前退场”；需要 tile 级行退场，而不是一整 pass 的行集合 |
+| MoE 35B | 同一注意力；FFN 走 `ffn.cpp` 的 routed 专家，routes 是 `{top_k, tokens}` | 同一 FFN，专家驻留或流式 | **中**：路由按 token 独立，混合不会算错 | 混合会把两行的**专家并集放大**，`ExpertCache` 的 miss 上升，流式上传可能吃掉 decode 的收益；必须按“专家重合度”门控 |
+| Qwen4Exp | `qsa_mix`：`width × batch` 矩形，注释明确 “a decode is that rectangle at width one” | 同一个 `qsa_mix` | **最高**：形状模型本身就是为“矩形 + 每行有效列”设计的 | `qsa_indexer` 对 1-token 行与 T-token 行的选块语义要分别核对（`sparse_gqa_prefill.cuh` 的 `Queries` 模板已按查询数分档） |
+
+### 6.3 结论：分三阶段，不能并行上
+
+1. **Qwen4Exp 先做**。`qsa_mix` 已是矩形模型，改动集中在调度入口（把 decode 行塞进同一个
+   `qsa_mix` 调用），不碰注意力数值路径。判据：混跑时 decode ≥70 tok/s（当前 7.8），
+   prefill 不低于单独值的 85%（当前 2.74k → ≥2.33k）。
+2. **27B 稠密次之**。需要给 `dense/context` 增加 tile 级的行退场，并让 decode 行改走 context
+   分支（放弃 `causal_cache` 的专用优化）。判据同上；另外要求 padding 到 16 的无效列不增加
+   FLOPs（`valid_columns` 已具备，但要确认 kernel 真的跳过）。
+3. **MoE 最后**，且必须先量“专家并集”代价。若混合导致 miss 上升超过 10%，就只在
+   “decode 行与 prefill 行的路由重合度高”时混合，否则保持串行。
+
+### 6.4 与 P0-3 的关系
+
+P0-3 已证明车道数不是瓶颈（2 张镜像就是硬件饱和点），所以本节的混合**不增加 lane 数**，
+只改变一个 pass 内的执行内容——两者不冲突：车道仍 2 条，每条 lane 上 decode 与 prefill 不再互斥。
