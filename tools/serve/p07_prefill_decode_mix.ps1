@@ -3,14 +3,15 @@
 param(
     [int]$Port = 11438,
     [int]$DecodeTokens = 1024,
-    [int]$PrefillRepeat = 1500
+    [int]$PrefillRepeat = 1500,
+    [int]$PrefillChunk = 1024
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $outDir = Join-Path $env:TEMP 'ninfer-p07'
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-$stamp = "p07-$([DateTime]::Now.ToString('HHmmss'))"
+$stamp = "p07-c$PrefillChunk-$([DateTime]::Now.ToString('HHmmss'))"
 $err = Join-Path $outDir "$stamp.err"
 Remove-Item $err -ErrorAction SilentlyContinue
 
@@ -18,7 +19,7 @@ $serve = Join-Path $repo 'build-win\apps\ninfer-serve.exe'
 $model = 'R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3_gguf.ninfer'
 $serveArgs = @(
     $model, '--host', '127.0.0.1', '--port', $Port,
-    '--max-context', '262144', '--max-concurrency', '4', '--prefill-chunk', '1024',
+    '--max-context', '262144', '--max-concurrency', '4', '--prefill-chunk', "$PrefillChunk",
     '--kv-dtype', 'rk4v4-e8', '--spec', 'mtp', '--draft-tokens', '7', '--lm-head-draft',
     '--max-pending-requests', '16', '--controller-mode', 'auto', '--kv-capacity', 'auto',
     '--host-context-mib', '16384', '--kv-residency-slack-mib', 'auto', '--kv-evict', 'auto',

@@ -61,8 +61,8 @@
 
 | 项 | 状态 | 问题 | 做法 | 判据 |
 |---|---|---|---|---|
-| W1 三 bank 专家流 | 已完成（代码级） | `ExpertStream` 有 split 形态，但需要模型侧构造并绑定 | `parameters.cpp:682` 已按 gate/up/down 三个 `ExpertMatrixBankDesc` 构造；`model_instance.cpp` 已按 `runs[i].split` 调 `attach_split()` 绑三个 bank | 代码就位；待 W4 端到端证明 |
-| W2 PLE / HC 注入 | 已完成（代码级） | `run_layers` 需要 PLE 表与四流残差 | `text.cpp` 已接 `PleStepWindow`（3 处）与 HC 残差折叠 | 同上 |
+| W1 三 bank 专家流 | 已完成（W4 端到端已证明） | `ExpertStream` 有 split 形态，但需要模型侧构造并绑定 | `parameters.cpp:682` 已按 gate/up/down 三个 `ExpertMatrixBankDesc` 构造；`model_instance.cpp` 已按 `runs[i].split` 调 `attach_split()` 绑三个 bank | W4 的 115 GB 工件跑出 PPL，三 bank 路径实际执行 |
+| W2 PLE / HC 注入 | 已完成（W4 端到端已证明） | `run_layers` 需要 PLE 表与四流残差 | `text.cpp` 已接 `PleStepWindow`（3 处）与 HC 残差折叠 | 同上 |
 | W3 QSA 规划 | 部分完成 | QSA 的 KV 页与索引计划要进 startup | `startup.cpp:220/463` 已调用 `qsa_geometry` / `qsa_plan_inputs`；`qsa.cpp` 只产出几何，sparse 执行未落地 | 缺 QSA 内核与层执行 |
 | W4 端到端跑通 115 GB 工件 | 已完成（能执行） | 依次卡在 `vmm_pool` OOM、`cudaErrorStreamCaptureUnsupported` | 三层修复：池只映射 live 段；`ExpertCache::all_experts_resident()` 取代份额判据；prefill 栈捕获增加 `layer_stack_capturable()` 开关（`layer_capture.h`，引擎在池建立后写入）；另在 `ffn.cpp` 的 per-bank 图缓存上加 `fully_resident()` 守卫 | 同命令（512 ctx、`rk4v4-e8`）连续出数：窗口 1 PPL 14.59、窗口 2 PPL 16.02，7–8 tok/s（44 万专家里约 5.6 万驻留，其余流式）。数值不作为精度结论，仅证明执行链路通 |
 | W4a 容量计划与已加载权重 | 已关闭（环境） | 自动池曾 `cuMemCreate` OOM | 停掉占 10,924 MiB 的常驻 serve 后，`gpu=18000 (22500 MiB) host_cache=5058 unslotted=55728 of 73728`，池正常建立 | 无规划缺陷 |
@@ -78,7 +78,7 @@
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
-| P0-7 prefill/decode 排序 | 已复现，未修（台账补录：此前只以 §1.3 现象存在，从未立项） | 11-24 日志：5 s 窗口常只有一个 chunk 推进（1,024 tok / 5 s = 205 tok/s），只有 decode 空档才出现 12,288 tok / 5 s 的爆发，按分钟波动 6.6×。复现后看到本质：**一个 pass 只能整块跑 decode 或 prefill，另一方整轮等待**，方向取决于谁先占住 | 代码顺序固定为 **control → decode → prefill**（`engine_core.h:4102–4139` 先跑 control/decode，`:4152–4386` 才跑 merge 或单 lane prefill），没有时间片、没有优先级旋钮；`pacing_ready_to_arm`、有界 hold、`--max-concurrency 2` 三组实验均无效果且已回退，回退后没有作为工作项留痕 | `tools/serve/p07_prefill_decode_mix.ps1`（2 张镜像、1 条长 decode + 1 条 19.5k prefill，互不抢 lane）：prefill 2.74k tok/s（单独 2.66k，几乎不受影响），decode 从 104 tok/s 掉到 **7.8 tok/s**（prefill 期间），prefill 结束后回到 73.1；反向（11-24）是 prefill 掉到 205 tok/s。判据：两向互相影响 ≤20%，或明确接受串行并写清理由 |
+| P0-7 prefill/decode 排序 | 已复现，未修（台账补录：此前只以 §1.3 现象存在，从未立项） | 11-24 日志：5 s 窗口常只有一个 chunk 推进（1,024 tok / 5 s = 205 tok/s），只有 decode 空档才出现 12,288 tok / 5 s 的爆发，按分钟波动 6.6×。复现后看到本质：**一个 pass 只能整块跑 decode 或 prefill，另一方整轮等待**，方向取决于谁先占住 | 代码顺序固定为 **control → decode → prefill**（`engine_core.h:4102–4139` 先跑 control/decode，`:4152–4386` 才跑 merge 或单 lane prefill），没有时间片、没有优先级旋钮；`pacing_ready_to_arm`、有界 hold、`--max-concurrency 2` 三组实验均无效果且已回退，回退后没有作为工作项留痕 | `tools/serve/p07_prefill_decode_mix.ps1`（2 张镜像、1 条长 decode + 1 条 19.5k prefill，互不抢 lane）：prefill 2.74k tok/s（单独 2.66k，几乎不受影响），decode 从 104 tok/s 掉到 **7.8 tok/s**（prefill 期间），prefill 结束后回到 73.1；反向（11-24）是 prefill 掉到 205 tok/s。**配置级已排除**：chunk 1024/512/256 三档扫描，decode 只从 7.8→10.8→15.6，prefill 却从 2.74k→2.16k→1.54k（19.5k 的耗时 8.4→11.0→15.9 s），两头都亏。判据：两向互相影响 ≤20%，或明确接受串行并写清理由；修法只能是调度层（decode 异步提交或混合 batch），需单独排期 |
 
 ### P1：长上下文
 
@@ -100,8 +100,9 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
 
 统一门禁（任何改动都要复跑，除非改动完全不触数值路径）：
 
-- `python H:\TeleAgentWorks\.temp\kv\regress.py --tier fast`：default PPL `7.441868` 逐位、
-  selector-off dump `636e38de95046781` 逐位；
+- `python H:\TeleAgentWorks\.temp\kv\regress.py --tier fast`：default PPL `7.359779` 逐位、
+  selector-off dump `e95cacb864d8b1ab` 逐位（V10-61 重录后的值；L104 曾写 `7.441868` /
+  `636e38de95046781`，是重录前的旧 golden，按旧值跑会把通过的门禁判成 FAIL）；
 - `--tier moe`：35B 三点 `7.111129 / 7.777808 / 6.479183` 与 decode digest `d093ac2070ab3292`；
 - `ctest -R "expert_cache|resize|kv_tier"`；
 - 发布冒烟两份（`SMOKE.txt` / `SMOKE-UI.txt`）；
@@ -127,7 +128,8 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
 
 验证：修复后连续两次 `replay_burst.ps1` 都 `PASS 4 burst request(s) + follow-up, no 5xx`
 （follow-up 216 ms / 232 ms，四条 23k 请求 18.5–19.7 s）；修复前同一脚本连续两次 FAIL
-（3/4 与 2/4 请求无应答）。`[prefill-reject] lane_count a=0 b=0` 仍会出现但不致命，记为观察项。
+（3/4 与 2/4 请求无应答）。`[prefill-reject] lane_count a=0 b=0` 仍会出现但不致命，
+是合并尝试在“可 prefill 的 lane 不足 2 条”时的正常拒绝，归到 P0-7 的调度观察里。
 
 
 
