@@ -5,14 +5,19 @@ param(
     [int]$Context = 32768,
     [int]$Stride  = 16384,
     [string[]]$Dtypes = @('bf16', 'fp8', 'rk4v4-e8'),
-    [int]$CorpusBytes = 220000
+    [int]$CorpusBytes = 220000,
+    [string]$Model = '',
+    [string]$Corpus = '',
+    [switch]$QsaQuantKv,
+    [switch]$QsaForceFull,
+    [string]$Tag = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $outDir = Join-Path $env:TEMP 'ninfer-p12'
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-$corpus = Join-Path $outDir "long_corpus_$Context.txt"
+$corpus = if ($Corpus) { $Corpus } else { Join-Path $outDir "long_corpus_$Context.txt" }
 $docs = Join-Path (Split-Path $repo -Parent) 'infer-upstream\docs'
 
 if (-not (Test-Path $corpus)) {
@@ -27,20 +32,33 @@ if (-not (Test-Path $corpus)) {
 Write-Output "corpus=$corpus bytes=$((Get-Item $corpus).Length)"
 
 $ppl = Join-Path $repo 'build-win\apps\ninfer-perplexity.exe'
-$model = 'R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer'
+$model = if ($Model) { $Model } else { 'R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3.ninfer' }
 if (-not (Test-Path $model)) { $model = 'R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3_gguf.ninfer' }
+if ($QsaQuantKv) {
+    # Qwen4Exp's indexed layers only admit a low-bit KV when this gate is open
+    # (model_instance.cpp: qsa_kv_storage_admitted); otherwise the run is downgraded to bf16.
+    $env:NINFER_QSA_SPARSE_GQA_QUANT_KV = '1'
+    Write-Output 'NINFER_QSA_SPARSE_GQA_QUANT_KV=1'
+}
+if ($QsaForceFull) {
+    # The dense reference arm of the same indexed layers (text.cpp: indexed && !qsa_dense_arm()).
+    $env:NINFER_QSA_FORCE_FULL = '1'
+    Write-Output 'NINFER_QSA_FORCE_FULL=1'
+}
 Write-Output "model=$model context=$Context stride=$Stride"
 
 # The gate's own report format: "overall <count> <something> <ppl>".
 $results = @()
 foreach ($dt in $Dtypes) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $out = & $ppl $model --text $corpus --context $Context --stride $Stride --kv-dtype $dt 2>&1
+    $logPath = Join-Path $outDir "ppl-$Tag$dt.log"
+    # Tee so a long run's progress is readable while it runs; the parse below reads the same file.
+    & $ppl $model --text $corpus --context $Context --stride $Stride --kv-dtype $dt 2>&1 |
+        Tee-Object -FilePath $logPath | Out-Null
     $code = $LASTEXITCODE
-    $text = ($out | ForEach-Object { "$_" }) -join "`n"
+    $text = Get-Content -LiteralPath $logPath -Raw
     $m = [regex]::Match($text, 'overall\s+\d+\s+[\d.]+\s+([\d.]+)')
     $val = if ($m.Success) { [double]$m.Groups[1].Value } else { $null }
-    $text | Set-Content -LiteralPath (Join-Path $outDir "ppl-$dt.log") -Encoding utf8
     $results += [pscustomobject]@{ Dtype = $dt; Exit = $code; Ppl = $val; Secs = [int]$sw.Elapsed.TotalSeconds }
     Write-Output ("dtype={0} exit={1} ppl={2} {3}s" -f $dt, $code, $val, [int]$sw.Elapsed.TotalSeconds)
 }
