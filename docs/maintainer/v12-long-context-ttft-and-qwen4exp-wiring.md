@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 未开始 | `--max-concurrency 4`，但 `throughput` 行稳定报告 `running 2 (prefill 2) | waiting 2`；4 条 23k 请求分成两波，TTFT 17.0–20.6 s | 先定位“prefill 并行度=2”的来源（KV 预算/车道策略/控制器），再决定放行配额 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-3 预填充车道 | 进行中（已定位约束层次） | `--max-concurrency 4`，但 `throughput` 行稳定报告 `running 2 (prefill 2) | waiting 2`；4 条 23k 请求分成两波，TTFT 17.0–20.6 s | 三组对照：chunk 1024 → 19.0–20.9 s；chunk 512 → 23.1–24.7 s；`--max-concurrency 8` → 18.6–19.7 s。**车道数始终是 2**，与 chunk、与 max-concurrency 都无关，因此不是合并矩形（`prefill_batch_fit`）也不是并发上限；`scheduler_.next_prefill` 每轮只推进一条，说明限制在**准入/绑定**（`waiting` 与 `materializing`）。下一步：给准入加计时与拒绝原因（绑定耗时、KV 页分配结果），而不是继续调参 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已关闭 | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天启动日志写的是 `checkpoint cache | off`；本轮开启后，两条同 prompt 请求命中 `cache 23,083 (100.0%, checkpoint)` | 不是缺陷 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -128,3 +128,7 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   `checkpoint cache | off`，本轮开启后同 prompt 命中 100%；(b) `--default-max-tokens` 的有无对本轮
   TTFT 无影响，真正的限制是 `running 2 (prefill 2) | waiting 2`，即 **prefill 并行度只有 2**，
   4×23k 被分成两波（17–21 s）。P0-3 据此重写，P0-6 关闭。
+- 2026-11-25：P0-3 三组对照（chunk 1024 / chunk 512 / `--max-concurrency 8`）显示车道数恒为 2，
+  TTFT 分别 19.0–20.9 s / 23.1–24.7 s / 18.6–19.7 s。排除「合并矩形」与「并发上限」两种解释；
+  约束落在准入与绑定（`waiting` 与 `materializing` 同时出现）。下一步不是调参，而是给准入加
+  计时与拒绝原因探针。

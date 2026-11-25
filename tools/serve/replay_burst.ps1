@@ -22,6 +22,8 @@ param(
     [string]$Model = 'R:\model\qwen3_8_27b_v3\qwen3_8_27b_v3_gguf.ninfer',
     [string]$Serve = '',
     [int]$Port = 11438,
+    [int]$PrefillChunk = 1024,
+    [int]$Concurrency = 4,
     [int]$ReadySeconds = 300
 )
 
@@ -37,7 +39,7 @@ Remove-Item $log,$err -ErrorAction SilentlyContinue
 
 $serveArgs = @(
     $Model, '--host', '127.0.0.1', '--port', $Port,
-    '--max-context', '262144', '--max-concurrency', '4', '--prefill-chunk', '1024',
+    '--max-context', '262144', '--max-concurrency', $Concurrency, '--prefill-chunk', $PrefillChunk,
     '--kv-dtype', 'rk4v4-e8', '--spec', 'mtp', '--draft-tokens', '7', '--lm-head-draft',
     '--max-pending-requests', '16', '--controller-mode', 'auto', '--kv-capacity', 'auto',
     '--host-context-mib', '16384', '--kv-residency-slack-mib', 'auto', '--kv-evict', 'auto',
