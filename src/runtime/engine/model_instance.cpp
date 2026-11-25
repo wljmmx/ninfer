@@ -1726,9 +1726,9 @@ void resolve_kv_storage(EngineOptions& options, const models::qwen3_5::TextConfi
     const auto requested = options.kv_cache;
     options.kv_cache     = KvCacheStorage::BFloat16;
     std::fprintf(stderr,
-                 "[kv] this artifact's indexed layers do not admit '%s' on this port (only bf16 is "
-                 "enabled; NINFER_QSA_SPARSE_GQA_QUANT_KV=1 opts into the ported low-bit routes); "
-                 "using bf16 for this run\n",
+                 "[kv] this artifact's indexed layers do not admit '%s' on this port "
+                 "(NINFER_QSA_SPARSE_GQA_QUANT_KV=0 pins bf16; unset admits every implemented "
+                 "storage); using bf16 for this run\n",
                  models::qwen4_exp::execution::qsa_kv_storage_name(requested));
     std::fflush(stderr);
 }

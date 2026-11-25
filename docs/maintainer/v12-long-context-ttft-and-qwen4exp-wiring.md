@@ -334,6 +334,21 @@ P0-7 的修法不能一套方案套三个模型。三个形态的 batch 形状�
 P0-3 已证明车道数不是瓶颈（2 张镜像就是硬件饱和点），所以本节的混合**不增加 lane 数**，
 只改变一个 pass 内的执行内容——两者不冲突：车道仍 2 条，每条 lane 上 decode 与 prefill 不再互斥。
 
+### 6.5 三档控制器各自的排序方式
+
+三档不是同一个策略的松紧，而是三种不同的取舍，所以排序也要分档：
+
+| 档位 | 驻留策略 | 排序方式 | 理由 |
+|---|---|---|---|
+| `stable` | 不分层，KV 全 resident，配置装不下就拒绝启动 | **严格顺序，不混合**：一个 pass 只做 decode 或 prefill，按到达顺序服务 | 这一档卖的是可预测性：混合 batch 会让 TTFT/ITL 随负载形状漂移，且分层换页会引入不可预期的停顿 |
+| `auto` | 2 张 device image + Host tiering | **混合 batch**：decode row（width=1）与 prefill row（chunk）进同一矩形，一次同步 | 默认档，两向都不该被对方饿死；2 条 lane 已能打满 GPU，混合不增加算力需求 |
+| `performance` | 4 张 device image + Host tiering | **混合 + 更激进的配额**：混合 batch，且允许 prefill chunk 上调、decode 多轮连投 | 这一档面向突发请求：队头延迟可以牺牲，换总完成时间；4 张镜像正是为此多花的显存 |
+
+实现上，`controller_residency_policy()` 已经是三档的单一来源，把排序方式也挂到同一个结构里
+（新增一个 `prefill_decode_order` 枚举），调度循环按它分支，避免再出现“环境变量与控制器各说一套”。
+
+
+
 ## 7. 记录（W3 / W4 结果）
 
 - 2026-11-25：**W3 更正**：QSA 的稀疏执行早已落地（`qsa_mix` 全链路 + `ops/softmax_attention/qsa/`
@@ -369,3 +384,54 @@ P0-3 已证明车道数不是瓶颈（2 张镜像就是硬件饱和点），所�
   2.28 倍**，262k 在 fp8 下有充足余量。注意启动时的 capacity plan 行：expert pool 按 auto 拿到
   18,501 MiB，KV 的 device 腿一度被压到 0、靠 host 腿（`host_kv_budget=16,256,040,960`）撑起
   9,363 页——这是 Qwen4Exp 在 24 GB 卡上的固有形态，不是缺陷。
+
+## 8. QSA 全 dtype 支持（2026-11-25）
+
+原先有两道门把 Qwen4Exp 锁在 bf16：引擎侧 `qsa_kv_storage_admitted()` 和 Op 侧
+`sparse_gqa.cpp` 的 `quantized_kv_enabled()`，都要求 `NINFER_QSA_SPARSE_GQA_QUANT_KV` 才放行。
+但 `ops/softmax_attention/qsa/storage.h` 的 `qsa_storage_supported()` 早已列出全部 11 种
+（bf16、int8-g64、fp8、nvfp4、k8v4、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8、rk4v2-e8），
+`qsa_prepare` 与 `qsa_sparse_gqa` 也都实现了它们——门比实现更严，且两处判据会漂移。
+
+改法：判据收到 `storage.h` 的 `qsa_low_bit_kv_enabled()` 一处——**默认放行全部已实现存储**，
+`NINFER_QSA_SPARSE_GQA_QUANT_KV=0` 显式退回 bf16（复现旧臂），`=1` 与不设等价。两处引用同一个函数。
+
+冒烟（2 窗、1,163 scored tokens，bf16 基线 11.858697）：
+
+| dtype | PPL | Δ vs bf16 | 结论 |
+|---|---|---|---|
+| bf16 | 11.858697 | — | 基线 |
+| int8 | 11.814408 | −0.37% | 可用 |
+| rk4v4 | 11.907859 | +0.41% | 可用 |
+| k8v4 | 11.911352 | +0.44% | 可用 |
+| rk8v4 | 11.960540 | +0.86% | 可用 |
+| nvfp4 | 11.971266 | +0.95% | 可用 |
+| rk2v4-e8 | 12.471646 | +5.17% | 2-bit K，精度代价明显 |
+| rk4v2-e8 | 13.581238 | +14.53% | 2-bit V，精度代价很大 |
+
+7 个 dtype 全部 `exit=0`，**“支持”达成**。注意 2 窗语料的噪声约 ±1%，所以 +0.4%～+0.95% 这几档
+只能说明“同量级”，精确排序要用全语料（fp8 与 rk4v4-e8 的全语料值见 §7：−0.014% / +3.33%）。
+`rk2v4-e8` 与 `rk4v2-e8` 的损失远超噪声，属于“能跑但默认不该选”。
+
+待确认：`--kv-dtype` 不指定时 Qwen4Exp 落到的默认值（perplexity 侧注释说默认 fp8）。放行后
+显式指定的低比特会被真正执行，不再静默降级——这一点需要在 serve 的默认值上确认一次。
+
+## 9. IQ3_XXS 权重格式（立项，未开始）
+
+Qwen4Exp 后续要引入 IQ3_XXS 权重（约 3.06 bpw），目标是解码 **85–97 tok/s**（strata 同条件）。
+现状：全仓 grep `IQ3_XXS` / `iq3` **零命中**，加载器只有 q4_g64_fp16 一类编码，所以这不是“打开开关”，
+而是新增一种权重量化格式。
+
+需要的工作：
+
+1. **格式与码本**：IQ3_XXS 的超块是 256 权重、8 个子块各 32；每块 4-bit scale 索引到码本、
+   3-bit 索引到 256 项码本、外加符号位。要先把码本与布局写进 `tensor-formats` 文档并加校验
+   （子块数 × 32 + scale + sign 的字节数必须与 artifact 对上）。
+2. **反量化 kernel**：权重侧要能在 expert streaming 的分块路径上就地反量化；不能整表展开
+   （115 GB 工件已经放不下）。
+3. **与 MoE 流式的配合**：expert 按需上传时上传的是 IQ3_XXS 原码，反量化在 device 侧做，
+   否则 host 侧解压会成为新瓶颈。
+4. **性能判据**：同条件（262k 上下文、fp8 KV、MTP7）解码 ≥85 tok/s，且相对 strata 的差距
+   要能被归因（是反量化额外带宽、还是 expert miss）。
+
+前置：先量出当前 Qwen4Exp（q4_g64_fp16 权重）的解码 tok/s 作为本机基线，再谈 85–97 的比较口径。

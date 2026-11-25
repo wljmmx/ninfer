@@ -11,23 +11,18 @@ namespace ninfer::ops {
 namespace {
 constexpr detail::qsa::ViewValidation v{"qsa_sparse_gqa"};
 
-// The low-bit cache routes are ported but kept off by default: only the BF16 profile has been
-// through the bit-exact gate on this port. NINFER_QSA_SPARSE_GQA_QUANT_KV=1 opts in.
-bool quantized_kv_enabled() {
-    const char* value = std::getenv("NINFER_QSA_SPARSE_GQA_QUANT_KV");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
+// The low-bit cache routes are ported and ready; storage.h owns the single switch that decides
+// whether they are admitted (default yes, NINFER_QSA_SPARSE_GQA_QUANT_KV=0 pins bf16).
 void profile(KvCacheStorage storage, int query_heads, int kv_heads, int lo, int hi, int batch,
              QsaSparseGqaExecutionEnvelope envelope, DeviceExecutionView execution) {
     v.require((query_heads == 24 && kv_heads == 2) || (query_heads == 12 && kv_heads == 1),
               "query/KV heads");
     v.require(envelope.max_visible_tokens <= 262144, "visible-token capacity");
-    // The implemented set is shared with prepare; the low-bit profiles additionally sit behind
-    // NINFER_QSA_SPARSE_GQA_QUANT_KV until each one has been through its own gate on this port.
+    // The implemented set is shared with prepare; the low-bit switch is shared with the engine.
     if (!detail::qsa::qsa_storage_supported(storage)) { detail::qsa::throw_unsupported_storage("qsa_sparse_gqa", storage); }
     const bool quantized = storage != KvCacheStorage::BFloat16;
-    v.require(!quantized || quantized_kv_enabled(), "cache storage (NINFER_QSA_SPARSE_GQA_QUANT_KV)");
+    v.require(!quantized || detail::qsa::qsa_low_bit_kv_enabled(),
+              "cache storage (NINFER_QSA_SPARSE_GQA_QUANT_KV)");
     v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
     v.require(execution.multiprocessor_count > 0, "SM count");
 }

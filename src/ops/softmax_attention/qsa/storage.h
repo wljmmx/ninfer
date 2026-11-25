@@ -2,6 +2,8 @@
 
 #include "ninfer/types.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -24,8 +26,16 @@ namespace ninfer::ops::detail::qsa {
            storage == KvCacheStorage::RK4V2E8;
 }
 
-[[nodiscard]] inline constexpr const char* qsa_storage_name(KvCacheStorage storage) noexcept {
-    switch (storage) {
+// One switch for both Ops and for the engine's admission check, so the three cannot drift.
+// Every implemented storage is admitted by default (the port's rk profiles were qualified one by
+// one); NINFER_QSA_SPARSE_GQA_QUANT_KV=0 pins a run to bf16, which reproduces the arm recorded
+// before the low-bit routes were enabled here. =1 keeps working and means the same as unset.
+[[nodiscard]] inline bool qsa_low_bit_kv_enabled() noexcept {
+    const char* value = std::getenv("NINFER_QSA_SPARSE_GQA_QUANT_KV");
+    return !(value != nullptr && std::strcmp(value, "0") == 0);
+}
+
+[[nodiscard]] inline constexpr const char* qsa_storage_name(KvCacheStorage storage) noexcept {    switch (storage) {
     case KvCacheStorage::BFloat16: return "bf16";
     case KvCacheStorage::Int8Group64: return "int8-g64";
     case KvCacheStorage::Fp8E4M3Row256: return "fp8-e4m3-row256";

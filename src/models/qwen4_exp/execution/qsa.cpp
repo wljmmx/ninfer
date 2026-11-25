@@ -44,14 +44,12 @@ QsaGeometry qsa_geometry(const qwen3_5::TextConfig& config) {
     return geometry;
 }
 
-// The Op family's implemented set is authoritative for "which storages exist"; the port's low-bit
-// gate is the second half. Both are read here rather than re-stated, so a route that starts
-// qualifying on this port shows up in the controller's choice automatically.
+// The Op family's implemented set is authoritative, and the low-bit switch lives in one place
+// (ops/softmax_attention/qsa/storage.h) so this check, qsa_prepare and qsa_sparse_gqa cannot drift.
 bool qsa_kv_storage_admitted(KvCacheStorage storage) noexcept {
     if (!ops::detail::qsa::qsa_storage_supported(storage)) { return false; }
     if (storage == KvCacheStorage::BFloat16) { return true; }
-    const char* value = std::getenv("NINFER_QSA_SPARSE_GQA_QUANT_KV");
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    return ops::detail::qsa::qsa_low_bit_kv_enabled();
 }
 
 const char* qsa_kv_storage_name(KvCacheStorage storage) noexcept {
