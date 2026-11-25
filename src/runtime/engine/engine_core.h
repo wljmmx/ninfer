@@ -4107,26 +4107,45 @@ private:
                     run_control_batch(controls);
                     executed = true;
                 }
-                // Control rows become decode-ready next cycle, after reserving their new unit.
-                auto decode = scheduler_.build_round_membership(slots_, max_concurrency_);
-                {
-                    RoundMembership selected;
+                // P0-7: when prefill work is waiting, a pass may take up to
+                // `decode_turns_per_prefill` decode turns before the prefill turn. With one turn the
+                // chunk owns the pass and a decode lane gets one token per chunk - measured 7.8 tok/s
+                // against 104 alone. The count is a mode property, so stable keeps the strict
+                // alternation it sells. A pass with no prefill waiting takes exactly one turn, so a
+                // pure decode load is unchanged.
+                // P0-7: the pass runs exactly one decode round. Repeating it inside one pass would
+                // re-dispatch a unit the previous turn settled (the Program refuses with "execution
+                // does not match its reserved unit | phase=decode round"), so the rate is shaped on
+                // the prefill side instead - see prefill_turn_allowed below.
+                constexpr std::uint32_t decode_turns = 1U;
+                for (std::uint32_t decode_turn = 0; decode_turn < decode_turns; ++decode_turn) {
+                    // Control rows become decode-ready next cycle, after reserving their new unit.
+                    auto decode = scheduler_.build_round_membership(slots_, max_concurrency_);
+                    {
+                        RoundMembership selected;
                     for (std::size_t row = 0; row < decode.size; ++row) {
                         if (!runnable_units_[decode.lanes[row]] ||
                             slots_[decode.lanes[row]]->cancelled.load(std::memory_order_acquire)) {
                             continue;
                         }
-                        if (std::find(controls.lane_span().begin(), controls.lane_span().end(),
-                                      decode.lanes[row]) != controls.lane_span().end()) {
+                        // A turn can finish a lane (output limit, stop token). The pass snapshot of
+                        // runnable_units_ still says yes, so re-admitting it would hand a decode
+                        // unit to a request whose pending no longer matches one - measured as
+                        // "execution does not match its reserved unit | phase=decode round".
+                        if (decode_turn > 0 && !slots_[decode.lanes[row]]->is_decode_ready()) {
                             continue;
                         }
-                        selected.lanes[selected.size]     = decode.lanes[row];
-                        selected.sequences[selected.size] = decode.sequences[row];
-                        selected.budgets[selected.size++] = decode.budgets[row];
+                            if (std::find(controls.lane_span().begin(), controls.lane_span().end(),
+                                          decode.lanes[row]) != controls.lane_span().end()) {
+                                continue;
+                            }
+                            selected.lanes[selected.size]     = decode.lanes[row];
+                            selected.sequences[selected.size] = decode.sequences[row];
+                            selected.budgets[selected.size++] = decode.budgets[row];
+                        }
+                        decode = selected;
                     }
-                    decode = selected;
-                }
-                if (!decode.empty()) {
+                    if (decode.empty()) { break; }
                     maybe_cycle_expert_pool();
                     set_host_work_class(HostWorkClass::Decode, decode.lane_span());
                     // v8 9.3: the serial rule is decided and verified on decode measurements
@@ -4334,6 +4353,34 @@ private:
                     std::fprintf(stderr, "[tx] ph=[%.0f %.0f %.0f %.0f]ms\n", tx_phases[0],
                                  tx_phases[1], tx_phases[2], tx_phases[3]);
                 }
+                // P0-7: rate-limit the prefill turn when a decode lane is ready for it. Every pass
+                // still runs its decode round with its own unit reservation; this only decides
+                // whether the prefill turn is allowed this pass, which is what stops a long chunk
+                // from owning every pass and starving the decode lane.
+                bool prefill_turn_allowed = true;
+                {
+                    const std::uint32_t turns =
+                        ninfer::controller_residency_policy(
+                            models::qwen3_5::execution::policy_controller().mode)
+                            .decode_turns_per_prefill;
+                    if (turns > 1) {
+                        bool decode_waiting = false;
+                        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                            if (slots_[lane] != nullptr && slots_[lane]->is_decode_ready()) {
+                                decode_waiting = true;
+                                break;
+                            }
+                        }
+                        if (decode_waiting) {
+                            prefill_turn_allowed = ++prefill_turn_credit_ >= turns;
+                            if (prefill_turn_allowed) { prefill_turn_credit_ = 0; }
+                        } else {
+                            prefill_turn_credit_ = 0;
+                        }
+                    } else {
+                        prefill_turn_credit_ = 0;
+                    }
+                }
                 bool hold_prefill = false;
                 if (prefill_hold_active()) {
                     // Hold while anything is still queued - not only while a bind can start right
@@ -4360,7 +4407,8 @@ private:
                 // the attempt on "not holding" meant the merge was only ever tried in the passes
                 // where the hold had already released the lanes to the single-lane turn - measured:
                 // zero [prefill-reject] lines in a whole burst, i.e. the pass was never attempted.
-                auto merged = prefill_merge_active() && !scheduler_.progress_owner()
+                auto merged = prefill_turn_allowed && prefill_merge_active() &&
+                                      !scheduler_.progress_owner()
                                   ? instance_.program->advance_prefill_batch()
                                   : std::nullopt;
                 if (merged) {
@@ -4379,7 +4427,7 @@ private:
                             snapshot_cancellations());
                     }
                     executed = true;
-                } else if (hold_prefill) {
+                } else if (hold_prefill || !prefill_turn_allowed) {
                     // A deliberate pass, not an idle one: the loop must not sleep waiting for work
                     // it just chose not to do.
                     executed = true;
@@ -4550,6 +4598,13 @@ private:
     // Consecutive passes that asked for the same flip; two is enough because the state it reacts to
     // lasts only a few passes per request burst.
     std::uint32_t prefill_merge_agree_ = 0;
+    // P0-7: passes since the last prefill turn, while decode is ready. A pass always runs its decode
+    // round; only every `decode_turns_per_prefill`-th pass also runs a prefill turn, so a long chunk
+    // stops owning every pass and starving the decode lane (measured 7.8 tok/s against 104 alone).
+    // Rate-limiting the prefill turn rather than repeating decode inside one pass keeps every pass's
+    // execution-unit reservation exactly as it was: repeating decode inside a pass re-dispatches a
+    // unit the previous turn already settled, which the Program refuses.
+    std::uint32_t prefill_turn_credit_ = 0;
     // Scheduling-pass clock and the last admission's stamp: the batching window that lets a burst
     // reach a dispatch together. Iterations of the scheduling loop, not milliseconds - the loop's
     // period varies with the work it does.

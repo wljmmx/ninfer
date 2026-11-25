@@ -187,6 +187,11 @@ struct ControllerResidencyPolicy {
     std::uint32_t device_state_images    = 2;
     bool          all_device_images      = false;
     PrefillDecodeOrder prefill_decode_order = PrefillDecodeOrder::MixedBatch;
+    // P0-7: passes per prefill turn while a decode lane is ready. Every pass runs its decode round
+    // with its own unit reservation; only every N-th pass also runs a prefill turn. One is the strict
+    // alternation that starves a decode lane down to a few tok/s while a long chunk owns the pass;
+    // larger values buy decode rate with prefill latency.
+    std::uint32_t decode_turns_per_prefill = 1;
 };
 
 [[nodiscard]] inline constexpr ControllerResidencyPolicy
@@ -194,14 +199,17 @@ controller_residency_policy(ControllerMode mode) noexcept {
     switch (mode) {
     case ControllerMode::Stable:
         return {.kv_host_tiering = false, .device_state_images = 0, .all_device_images = true,
-                .prefill_decode_order = PrefillDecodeOrder::SerialDecodeFirst};
+                .prefill_decode_order = PrefillDecodeOrder::SerialDecodeFirst,
+                .decode_turns_per_prefill = 1};
     case ControllerMode::Performance:
         return {.kv_host_tiering = true, .device_state_images = 4, .all_device_images = false,
-                .prefill_decode_order = PrefillDecodeOrder::MixedBatchAggressive};
+                .prefill_decode_order = PrefillDecodeOrder::MixedBatchAggressive,
+                .decode_turns_per_prefill = 8};
     case ControllerMode::Auto: break;
     }
     return {.kv_host_tiering = true, .device_state_images = 2, .all_device_images = false,
-            .prefill_decode_order = PrefillDecodeOrder::MixedBatch};
+            .prefill_decode_order = PrefillDecodeOrder::MixedBatch,
+            .decode_turns_per_prefill = 3};
 }
 
 } // namespace ninfer
