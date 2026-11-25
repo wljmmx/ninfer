@@ -422,38 +422,57 @@ P0-3 已证明车道数不是瓶颈（2 张镜像就是硬件饱和点），所�
 待确认：`--kv-dtype` 不指定时 Qwen4Exp 落到的默认值（perplexity 侧注释说默认 fp8）。放行后
 显式指定的低比特会被真正执行，不再静默降级——这一点需要在 serve 的默认值上确认一次。
 
-## 9. IQ3_XXS 权重格式（立项，未开始）
+## 9. Qwen4Exp 低比特权重（GGUF 混合量化，文件已核实，未接入）
 
-Qwen4Exp 后续要引入 IQ3_XXS 权重（约 3.06 bpw）。目标是解码 **≥85–97 tok/s**：85–97 是 strata **官方在单卡 3090 上**实现的数字，本机是单卡 4090、同环境，理应更高，所以 85–97 是**下限**而不是上限；比较时必须与 strata 同配置（上下文、常驻比例、单卡）。
-现状：全仓 grep `IQ3_XXS` / `iq3` **零命中**，加载器只有 q4_g64_fp16 一类编码，所以这不是“打开开关”，
-而是新增一种权重量化格式。
+Qwen4Exp 后续要用 R 盘上的低比特 GGUF。目标是解码 **≥85–97 tok/s**：85–97 是 strata **官方在单卡 3090 上**
+实现的数字，本机是单卡 4090、同环境，理应更高，所以 85–97 是**下限**而不是上限；比较时必须与 strata
+同配置（上下文、常驻比例、单卡）。
+
+**2026-11-26 核实（模型已下载）**：`R:\model\qwen4exp\IQ3_XXS\`
+`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-0000{1,2}-of-00002.gguf`，GGUF v3、`split.count=2`，
+两片 43.81 + 26.82 = **70.63 GB**（对比现有 `.ninfer` 的 115.4 GB，只有 1.63× 压缩）。
+
+**名字叫 IQ3_XXS，实际是 GSQ-RCO 混合量化**（分片 1 的 1,223 个 tensor）：
+
+| 类型 | 数量 | 类型 | 数量 |
+|---|---|---|---|
+| BF16 | 484 | Q4_K | 45 |
+| F32 | 292 | Q2_0 | 38 |
+| IQ3_S | 82 | IQ2_XS | 20 |
+| Q6_K | 71 | IQ2_S | 20 |
+| IQ4_XS | 67 | IQ2_XXS | 18 |
+| IQ4_NL | 58 | Q5_K | 15 |
+| — | — | **IQ3_XXS** | **12** |
+
+分片 2 只有 1 个 tensor：`per_layer_token_embd.weight [160, 320,001,536]`，IQ4_NL，26.82 GB——就是 Qwen4Exp
+的 PLE 表（与运行日志 `ple table 320001536 rows x 160` 一致）。
+
+所以“引入 IQ3_XXS”实际是**引入一个 GGUF 容器 + 十余种 GGML 量化类型 + PLE 表**，而不是一种码本。
 
 需要的工作：
 
-1. **格式与码本**：IQ3_XXS 的超块是 256 权重、8 个子块各 32；每块 4-bit scale 索引到码本、
-   3-bit 索引到 256 项码本、外加符号位。要先把码本与布局写进 `tensor-formats` 文档并加校验
-   （子块数 × 32 + scale + sign 的字节数必须与 artifact 对上）。
-2. **反量化 kernel**：权重侧要能在 expert streaming 的分块路径上就地反量化；不能整表展开
-   （115 GB 工件已经放不下）。
-3. **与 MoE 流式的配合**：expert 按需上传时上传的是 IQ3_XXS 原码，反量化在 device 侧做，
-   否则 host 侧解压会成为新瓶颈。
-4. **性能判据**：同条件（262k 上下文、fp8 KV、MTP7）解码 ≥85 tok/s，且相对 strata 的差距
-   要能被归因（是反量化额外带宽、还是 expert miss）。
+1. **GGUF 读取与转换**：`src/` 里没有任何 GGUF 解析（现有 artifact 是自有 `.ninfer` 容器）。
+   要么写 GGUF→`.ninfer` 转换器，要么给加载器加 GGUF 直读；两者都要覆盖上表的十余种类型。
+2. **类型覆盖**：BF16/F32/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/IQ3_S/IQ3_XXS/IQ2_XXS/IQ2_XS/IQ2_S/Q2_0。
+   其中 F32 的 292 个多为 norm/scale，可按 4 字节原样；IQ 系列要各自的码本与符号位解码。
+3. **PLE 表路径**：26.82 GB 的 IQ4_NL 表注定流式读取（现有 `ple/` 有磁盘读队列，但编码是
+   `q4_g64_fp16/row_split_k128_v1`，需要接受 IQ4_NL 行布局）。
+4. **与 expert streaming 配合**：上传原码、device 侧反量化，否则 host 解压成为新瓶颈。
+5. **判据**：同条件（262k、fp8 KV、MTP7）解码 ≥85–97 tok/s；当前 `q4_g64_fp16` 基线是 4.4 tok/s
+   （host-bound，见下），所以 85–97 需要 19–22 倍，1.63× 的压缩只贡献一部分，
+   **device 驻留比例必须显著上升**。
 
-前置：先量出当前 Qwen4Exp（q4_g64_fp16 权重）的解码 tok/s 作为本机基线，再谈 85–97 的比较口径。
-
-**2026-11-25 基线已量**（`tools/serve/q4exp_decode_baseline.ps1`，fp8 KV、262k、c=1、output 256）：
-`decode 4.4 tok/s`，`TTFT 9.5 s`，总 66.9 s。请求行给出的分解是决定性的：
+前置基线（`tools/serve/q4exp_decode_baseline.ps1`，fp8 KV、262k、c=1、output 256）：
+`decode 4.4 tok/s`，`TTFT 9.5 s`，总 66.9 s。请求行的分解是决定性的：
 
 ```
 phases boundary 19.1 ms | submit 1m 6.6s | devwait 251 ms | decodehost 57.2 s | decodewait 214 ms
 ```
 
-**这不是 GPU 慢，是 host-bound**：`devwait` 只有 251 ms，而 host 侧的 submit 66.6 s、decodehost 57.2 s。
-即专家池装不下的路由专家落到 CPU/流式路径（`HostRoutedFetch` / `host_routed_ffn`），
-GPU 大部分时间在等 host。按 227 ms/token 算，要达 85–97 tok/s 需要 **19–22 倍**。
+**这不是 GPU 慢，是 host-bound**：`devwait` 只有 251 ms，而 host 侧 submit 66.6 s、decodehost 57.2 s。
+专家池装不下的路由专家落到 CPU/流式路径（`HostRoutedFetch` / `host_routed_ffn`），GPU 大部分时间在等 host。
+所以格式再省也到不了 85 t/s，必须让 device 驻留的专家比例大幅上升，把 host 腿压到接近零。
 
-所以 IQ3_XXS 的意义不是“换一种更省的格式”这么简单：4.5 bit → 3.06 bit 只省约 1.5× 流量，
-**必须让 device 驻留的专家比例大幅上升，把 host 腿压到接近零**，否则格式再省也到不了 85 t/s。
-这件事要和 strata 的配置对齐（它 85–97 t/s 时有多少权重常驻、跑什么上下文、单卡还是多卡），
-| P0-7 prefill/decode 排序 | 已完成（prefill turn credit，三档可配） | 11-24 日志：5 s 窗口常只有一个 chunk 推进（205 tok/s），只有 decode 空档才出现 2.46k 的爆发，按分钟波动 6.6×。复现后看到本质：**一个 pass 只能整块跑 decode 或 prefill**，长 chunk 独占 pass 时 decode 只推进 1 token | 修法不是 pass 内连跑多轮 decode（第一轮结束 unit 已 settle，第二轮会被 Program 拒绝：`execution does not match its reserved unit`），而是**给 prefill turn 记账**：每个 pass 都跑一轮 decode（各自正常预留 unit），只有第 N 个 pass 才放行 prefill；N 由 `ControllerResidencyPolicy::decode_turns_per_prefill` 给出（stable=1 / auto=3 / performance=8） | `tools/serve/p07_prefill_decode_mix.ps1`（1 条 1,024-token decode + 1 条 19.5k prefill）：**N=1** prefill 8.4 s、decode 7.8 tok/s；**N=3** prefill **9.4 s（−12%）**、decode **20.6–38.0 tok/s（2.6–4.9×）**、总 decode 98.9 tok/s；**N=4** prefill 10.2 s（−21%）、decode 25.6–40.5。两向都 ≤20% → 选 auto=3 |
+R 盘同时有对照件：`Qwen3.8-Flash-Next-DFlash2-strata1-tuned-BF16.gguf`（1.13 GB）与
+`qwen3.8-flash-next-dflash2.strata1.q4_0-selq4.pack`（0.32 GB），以及各档 DFlash2 draft
+（Q4_K_M/Q5_K_M/Q6_K/Q8_0/BF16）。`.incomplete` 的三个分片属于 UD-Q4_K_XL，与 IQ3_XXS 无关。
