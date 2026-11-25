@@ -47,11 +47,12 @@ struct ClientOptions {
     // drain. The receive side needs the same, because a rejected payload produces no reply at all
     // and the only signal is this timeout.
     int send_timeout_ms{120000};
-    // The receive timeout bounds how long a caller can sit on a connection, and a restore runs on
-    // the scheduler thread. 120 s meant one unresponsive server could freeze that thread for two
-    // minutes per call; a 1.1 GB store moves in ~8.7 s at the measured 128 MiB/s, so 30 s still
-    // carries the largest payload and fails fast instead of stalling the engine.
-    int receive_timeout_ms{30000};
+    // The receive timeout covers a whole store/restore round trip. It must stay generous: a 1.35 GB
+    // record measured >30 s to acknowledge under load, and a short timeout turned healthy publishes
+    // into "receive failed: Resource temporarily unavailable". The scheduler-thread exposure this
+    // used to cause is gone for another reason - the backend no longer holds a lock across the
+    // round trip, so a restore no longer blocks admission behind a publish.
+    int receive_timeout_ms{120000};
     int linger_ms{0};
     int reconnect_ivl_ms{100};
 };

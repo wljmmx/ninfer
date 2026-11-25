@@ -270,6 +270,23 @@ public:
             if (outstanding_ >= max_outstanding_) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
+            // Capacity planning, not a stall: the queue is served in submission order, so this
+            // request's wait is every queued request plus its own prefill. When that work cannot
+            // drain inside the 15-minute ceiling the deadline logic enforces, admitting it only
+            // becomes a 503 after minutes of waiting (measured 2026-11-25: 16x88k tokens, 340 s
+            // of waiting, then 503 while the engine was healthy). Refuse it now as Overloaded.
+            {
+                double queued_seconds =
+                    static_cast<double>(prompt_summary.prompt_tokens) / kPrefillTokensPerSecond;
+                for (const auto& queued : pending_) {
+                    queued_seconds += static_cast<double>(queued->prompt_summary.prompt_tokens) /
+                                      kPrefillTokensPerSecond;
+                }
+                if (queued_seconds > kQueueDrainCeilingSeconds) {
+                    throw RequestError(RequestErrorKind::Overloaded,
+                                       "inference request queue is full");
+                }
+            }
             if (next_request_id_ == 0 || next_publication_order_ == 0) {
                 throw std::overflow_error("request identity space exhausted");
             }
@@ -1307,17 +1324,33 @@ private:
             if (finished.checkpoint) {
                 const auto publish_started = Clock::now();
                 worker_phase_             = "publish";
-                resources_.publish(*instance_.program, request->continuation_owner,
-                                   *finished.checkpoint, monotonic_ms());
-                // The finish-time checkpoint is the one a later request can actually match: it covers
-                // the whole prompt plus everything generated. Without this hand-off the record is
-                // retained for pause/replay only and the external cache never sees a byte, because
-                // publish_to_cache() used to be reachable from the active-capture path alone.
-                if (request->base_plan) {
-                    worker_phase_ = "publish to cache";
-                    resources_.publish_to_cache(*instance_.program, *request->base_plan,
-                                                *finished.checkpoint,
-                                                request->continuation_owner);
+                // A cache export that cannot be held is a LOST CACHE ENTRY, not a lost request.
+                // Letting it escape here failed the worker and turned every later request into a
+                // 500 (measured 2026-11-25: a 1.35 GB record under memory pressure reported
+                // "worker failed: bad allocation | phase=publish to cache", and the service
+                // answered 500 from then on).
+                try {
+                    resources_.publish(*instance_.program, request->continuation_owner,
+                                       *finished.checkpoint, monotonic_ms());
+                    // The finish-time checkpoint is the one a later request can actually match: it
+                    // covers the whole prompt plus everything generated. Without this hand-off the
+                    // record is retained for pause/replay only and the external cache never sees a
+                    // byte, because publish_to_cache() used to be reachable from the active-capture
+                    // path alone.
+                    if (request->base_plan) {
+                        worker_phase_ = "publish to cache";
+                        resources_.publish_to_cache(*instance_.program, *request->base_plan,
+                                                    *finished.checkpoint,
+                                                    request->continuation_owner);
+                    }
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr,
+                                 "[publish] cache export skipped: host allocation failed "
+                                 "(the request keeps its result)\n");
+                    std::fflush(stderr);
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[publish] cache export skipped: %s\n", error.what());
+                    std::fflush(stderr);
                 }
                 report_boundary_work(
                     "publish", request->log_id(),
@@ -1392,6 +1425,11 @@ private:
     // depth. The extension is bounded twice: at most kMaxQueueExtensions per request, and never past
     // the 15-minute ceiling the service itself uses.
     static constexpr std::uint32_t kMaxQueueExtensions = 4;
+    // Queued work is priced at the measured long-prefill rate (1.4-1.6k tok/s on this box; 1200
+    // is the conservative side, so a deadline never expires a request the engine is still working
+    // towards). The ceiling matches the 15-minute bound the deadline logic already enforces.
+    static constexpr double kPrefillTokensPerSecond   = 1200.0;
+    static constexpr double kQueueDrainCeilingSeconds = 900.0;
 
     // How recently a request must have finished for the queue to count as "moving". Five seconds is
     // several service windows on this box (a 400-token request at 4 lanes finishes in ~2 s), so a
@@ -1409,20 +1447,19 @@ private:
             (std::strcmp(flag, "0") == 0 || std::strcmp(flag, "off") == 0)) {
             return;
         }
-        // 1.4-1.6k tok/s measured on this box for a 163k prefill. A lane that is decoding instead
-        // of prefilling still owns its lane for a whole response, so it is charged a flat few
-        // seconds rather than a fraction of a budget this function cannot price.
-        constexpr double kPrefillTokensPerSecond = 1500.0;
-        constexpr double kDecodingLaneSeconds    = 5.0;
-        double ahead                             = 0.0;
+        // A lane that is decoding instead of prefilling still owns its lane for a whole response,
+        // so it is charged a flat few seconds rather than a fraction of a budget this function
+        // cannot price.
+        constexpr double kDecodingLaneSeconds = 5.0;
+        double lane_ahead                     = 0.0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& other = slots_[lane];
             if (!other || !other->sequence) { continue; }
             const std::uint32_t left = instance_.program->prefill_remaining(lane);
-            ahead += left != 0 ? static_cast<double>(left) / kPrefillTokensPerSecond
-                               : kDecodingLaneSeconds;
+            lane_ahead += left != 0 ? static_cast<double>(left) / kPrefillTokensPerSecond
+                                    : kDecodingLaneSeconds;
         }
-        if (ahead < 1.0) { return; }
+        if (lane_ahead < 1.0 && pending_.empty()) { return; }
         const bool probe = std::getenv("NINFER_QUEUE_PROBE") != nullptr;
         // A queue timeout has to mean "the engine is stuck", not "it was busy while you waited".
         // Measured on this box: eight 800-token requests need about 32 s of service, so the third
@@ -1437,13 +1474,22 @@ private:
             last_completion_ms_.load(std::memory_order_relaxed));
         const bool progressing =
             last_done_ms != 0 && now_ms >= last_done_ms && now_ms - last_done_ms < kProgressStallMs;
-        if (ahead < 1.0 && !progressing) { return; }
-        // 1.5x the remaining work, with a 30 s floor: a request that is about to be admitted must
-        // not be expired in the step before its lane frees up.
-        const auto extension = std::chrono::milliseconds(
-            std::max<long long>(30000, static_cast<long long>(ahead * 1500.0)));
+        if (lane_ahead < 1.0 && !progressing) { return; }
+        // A request's wait is the lanes' remaining work PLUS every request ahead of it in the
+        // queue. Charging only the lanes made the 10th of sixteen 88k-token requests believe it
+        // had 240 s ahead when it had nine whole prefills (~9 min), so it expired at 340 s with a
+        // 503 while the engine was making steady progress (2026-11-25).
+        double queued_ahead = 0.0;
         for (auto& request : pending_) {
+            const double ahead = lane_ahead + queued_ahead;
+            queued_ahead += static_cast<double>(request->prompt_summary.prompt_tokens) /
+                            kPrefillTokensPerSecond;
             if (request->queue_extensions >= kMaxQueueExtensions) { continue; }
+            if (ahead < 1.0) { continue; }
+            // 1.5x the remaining work, with a 30 s floor: a request that is about to be admitted
+            // must not be expired in the step before its lane frees up.
+            const auto extension = std::chrono::milliseconds(
+                std::max<long long>(30000, static_cast<long long>(ahead * 1500.0)));
             auto next = std::min(now + extension, request->submitted + std::chrono::minutes(15));
             if (progressing) {
                 // The queue is moving: never expire a request the engine is still working towards.

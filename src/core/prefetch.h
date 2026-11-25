@@ -17,7 +17,9 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -268,7 +270,23 @@ private:
                 jobs_.pop_front();
                 running_ = 1;
             }
-            if (job.run) { (void)job.run(); }
+            // A job that throws must not take the process with it: this is a std::thread function,
+            // and an escaping exception calls terminate(). Measured 2026-11-25 (0xC0000409,
+            // subcode 7 FAST_FAIL_FATAL_APP_EXIT): a cache publish copied a 1.35 GB
+            // CachedCheckpoint under memory pressure, bad_alloc escaped here, and the engine died
+            // mid-load with every in-flight request reset. The job's payload is a cache entry, not
+            // a client result, so losing it is the correct failure.
+            if (job.run) {
+                try {
+                    (void)job.run();
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[prefetch] job failed: %s\n", error.what());
+                    std::fflush(stderr);
+                } catch (...) {
+                    std::fprintf(stderr, "[prefetch] job failed: non-standard exception\n");
+                    std::fflush(stderr);
+                }
+            }
             // Cleared after the job returns, so "pending" cannot dip below one while the worker is
             // inside a fill and let the producer overshoot the cap by the width of that window.
             std::lock_guard lock(mutex_);

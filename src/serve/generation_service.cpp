@@ -717,7 +717,27 @@ public:
                 writes_.pop_front();
             }
             const auto started = std::chrono::steady_clock::now();
-            const bool written = publish_parts(job.tokens, job.checkpoint, job.first_chunk);
+            // The writer thread must never let an exception escape: an uncaught exception in a
+            // std::thread function calls terminate(), which is a whole-process fast-fail.
+            // Measured 2026-11-25 (0xC0000409, subcode 7 FAST_FAIL_FATAL_APP_EXIT): a 1.35 GB
+            // export under memory pressure threw bad_alloc inside publish_parts and took the
+            // engine down mid-load, turning every in-flight request into a reset connection.
+            // A store that cannot be held is a lost cache entry; the request that produced it
+            // has already completed.
+            bool written = false;
+            try {
+                written = publish_parts(job.tokens, job.checkpoint, job.first_chunk);
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr,
+                             "[lmcache] store skipped: host allocation failed (%zu token(s), "
+                             "%.1f MiB)\n",
+                             job.tokens.size(),
+                             static_cast<double>(job.checkpoint.kv_bytes.size()) / (1024.0 * 1024.0));
+                std::fflush(stderr);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[lmcache] store skipped: %s\n", error.what());
+                std::fflush(stderr);
+            }
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             if (const auto state_bytes = [&job] {
