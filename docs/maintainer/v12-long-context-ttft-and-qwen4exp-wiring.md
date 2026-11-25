@@ -226,3 +226,19 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
 - 2026-11-25：`tools/serve/replay_burst.ps1` 新增 `-UniquePrompts`（默认关，向后兼容）：给每条请求
   一个不同的开头句，长度不变。没有它时，车道数少于请求数会让后几条命中 100% 前缀缓存，
   把调度/pipeline 测试测成缓存测试。
+- 2026-11-25：**GPU 侧实测否掉“有空闲 GPU 在干等”**（`tools/serve/gpu_util_probe.ps1`，200 ms 一次
+  `nvidia-smi` 采样 + 同窗口 `throughput` 行）：
+
+  | 配置 | 请求 | TTFT/墙钟 | util.gpu | ≥90% 占比 | 显存带宽 | 功耗 | SM 时钟 |
+  |---|---|---|---|---|---|---|---|
+  | 2 张 | 1×23,036 | 8.9 / 9.9 s | p50 99 | 94.8% | 30.2% | 417 W | 2833 MHz |
+  | 2 张 | 4×23,045（unique） | 18.6 / 18.6 / 36.8 / 36.8 s | p50 99 | 94.8% | 30.2% | 417 W | 2833 MHz |
+  | 4 张 | 4×23,045（unique） | 36.6 / 36.5 / 36.2 / 36.3 s | p50 99 | 94.2% | 29.6% | 413 W | 2838 MHz |
+
+  三种配置 GPU 都接近满载（4090 TDP 450 W），显存带宽只到 30% —— prefill 是 **compute-bound**，
+  单条就已经把 SM 打满，加 lane 只是把同一份算力切给更多请求。请求日志的阶段分解也一致：
+  单条 `submit 2.7s / devwait 7.1s`，两条 `submit 5.1s / devwait 13.1s`（submit 是 host 侧串行提交，
+  与另一条 lane 的 GPU 计算重叠，未进入墙钟）。
+- 2026-11-25：**读日志的坑**：`throughput | ... | host 16.5% (828 ms)` 里的 `host` 是
+  CPU 侧活跃时间 / 窗口（`host_active_ns / interval`），不是 GPU 利用率；20% 表示 80% 时间在等 GPU，
+  不是“GPU 只用了 20%”。GPU 是否空闲只能用 `nvidia-smi` 采样判定。
