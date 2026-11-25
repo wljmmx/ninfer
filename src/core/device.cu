@@ -257,7 +257,17 @@ void CudaEventTimer::record_stop() { CUDA_CHECK(cudaEventRecord(stop_, stream_))
 
 float CudaEventTimer::elapsed_ms() const {
     float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_));
+    const cudaError_t sampled = cudaEventElapsedTime(&ms, start_, stop_);
+    if (sampled == cudaErrorNotReady) {
+        // The stop event has not completed yet: a sampling race in a timing path, not a device
+        // fault. CUDA_CHECK here aborted the whole engine under a 4x23k burst (2026-11-25,
+        // device.cu:260, after a run of "[prefill-reject] lane_count a=0 b=0"). Report the last
+        // good sample and clear the code so the next sample is meaningful.
+        (void)cudaGetLastError();
+        return last_ms_;
+    }
+    CUDA_CHECK(sampled);
+    last_ms_ = ms;
     return ms;
 }
 

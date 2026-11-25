@@ -104,8 +104,30 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
 - `ctest -R "expert_cache|resize|kv_tier"`；
 - 发布冒烟两份（`SMOKE.txt` / `SMOKE-UI.txt`）；
 - 故障回放：`powershell -NoProfile -File tools\serve\replay_burst.ps1`（退出码 0 才通过）。
-
 ## 4. 记录
+
+
+## 5. 2026-11-25 追加：burst 能把引擎打崩（已修并验证）
+
+`tools/serve/replay_burst.ps1` 在验证事务探针时暴露了一个比 TTFT 更严重的问题：**同一份请求能把
+serve 打死**。两次回放的现场一致——`[prefill-reject] lane_count a=0 b=0` 刷屏之后：
+
+```
+src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
+    failed: cudaErrorNotReady: device not ready
+```
+
+即一次计时采样读到 stop 事件尚未完成，`CUDA_CHECK` 把它升级为进程退出；此后每条请求都是 503。
+这与 2026-11-24 日志里“先 500、随后 36 条 503 到结束”的形态吻合：引擎不是拒绝，是已经死了。
+
+修法：`CudaEventTimer::elapsed_ms()` 只对 `cudaErrorNotReady` 降级——返回上一次有效采样并清错误码，
+其它错误仍走 `CUDA_CHECK`，不吞真实故障。
+
+验证：修复后连续两次 `replay_burst.ps1` 都 `PASS 4 burst request(s) + follow-up, no 5xx`
+（follow-up 216 ms / 232 ms，四条 23k 请求 18.5–19.7 s）；修复前同一脚本连续两次 FAIL
+（3/4 与 2/4 请求无应答）。`[prefill-reject] lane_count a=0 b=0` 仍会出现但不致命，记为观察项。
+
+
 
 - 2026-11-25：建立本文件。审计出 W1–W3 代码已就位、W4 卡在 `VmmPool` 把增长上限当已映射显存；
   修复为"构造时只映射 live 段"，进入验证。

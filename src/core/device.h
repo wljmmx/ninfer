@@ -105,6 +105,9 @@ public:
 private:
     cudaStream_t stream_ = nullptr;
     cudaEvent_t start_   = nullptr;
+    // Last successful sample, so a read taken while the stop event is still pending can answer with
+    // the previous value instead of aborting the process (see elapsed_ms in device.cu).
+    mutable float last_ms_ = 0.0f;
     cudaEvent_t stop_    = nullptr;
 };
 
