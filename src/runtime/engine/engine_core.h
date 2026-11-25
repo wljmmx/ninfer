@@ -4253,16 +4253,23 @@ private:
                 // a queued lane can still be bound is what puts two heads in the same pass; it is
                 // opt-in until it has been measured.
                 if (prefill_batch_report_ && prefill_batch_reports_ % 32 == 0) {
-                    // Why the queued lanes are not in lanes yet, one counter per refusal branch.
+                    // Why the queued lanes are not in lanes yet, one counter per refusal branch, plus
+                    // whether admission was even attempted while a request waited: a request that
+                    // waits through passes with no attempt is a scheduling gap, not a refusal.
+                    if (prefill_merge_waiting_ != 0 && admit_probe_calls_ == admit_probe_seen_) {
+                        ++admit_probe_idle_waiting_;
+                    }
+                    admit_probe_seen_ = admit_probe_calls_;
                     std::fprintf(stderr,
                                  "[admit] calls=%llu ok=%llu tx_busy=%llu no_lane=%llu "
-                                 "kv_wait=%llu phys_wait=%llu\n",
+                                 "kv_wait=%llu phys_wait=%llu idle_wait=%llu\n",
                                  static_cast<unsigned long long>(admit_probe_calls_),
                                  static_cast<unsigned long long>(admit_probe_ok_),
                                  static_cast<unsigned long long>(admit_probe_tx_busy_),
                                  static_cast<unsigned long long>(admit_probe_no_lane_),
                                  static_cast<unsigned long long>(admit_probe_kv_wait_),
-                                 static_cast<unsigned long long>(admit_probe_phys_wait_));
+                                 static_cast<unsigned long long>(admit_probe_phys_wait_),
+                                 static_cast<unsigned long long>(admit_probe_idle_waiting_));
                     std::fflush(stderr);
                 }
                 bool hold_prefill = false;
@@ -4514,6 +4521,9 @@ private:
     // inferring it from lane states.
     std::uint64_t admit_probe_kv_wait_   = 0;
     std::uint64_t admit_probe_phys_wait_ = 0;
+    // Passes that saw a waiting request and no admission attempt since the previous report.
+    std::uint64_t admit_probe_idle_waiting_ = 0;
+    std::uint64_t admit_probe_seen_         = 0;
     // Q67/S1: set by try_admit_one when a candidate was refused for capacity rather than ordering.
     bool admission_deferred_ = false;
     std::array<bool, kMaximumConcurrency> runnable_units_{};

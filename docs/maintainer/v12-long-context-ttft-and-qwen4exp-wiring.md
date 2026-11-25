@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 已定位根因：绑定串行化 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 结论不是 KV、不是显存、也不是车道不够：新增的准入探针（`NINFER_PREFILL_BATCH` 打开时打印）在 72 次准入里给出 `tx_busy=56, no_lane=0, kv_wait=0, phys_wait=0, ok=5`。也就是说每条新请求都在等 `Program::has_context_transaction()` 释放——上下文事务（KV 页转移 + 147 MiB 状态备份 + 绑定安装）一次只能有一个，23k prompt 的绑定因此把车道数压到 ~2。修法是把事务按 lane 分段、或把它缩短到只覆盖 KV 发布，而不是调 chunk/并发 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-3 预填充车道 | 已定位到事务，待计时 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 准入探针给出 `calls=103, ok=5, tx_busy=87, no_lane=0, kv_wait=0, phys_wait=0, idle_wait=0`。结论有三层：(1) 不是 KV、不是显存、不是车道不够；(2) **也不是准入被饿死**——`idle_wait=0` 说明有请求在等时每一轮都在尝试；(3) 排除结果是 `Program` 级上下文事务（Bind/Capture/Pause 共用 `context_transaction_`，一次只能有一个），在 burst 期间几乎全程被占。下一步：按 kind 记录事务的 open→commit 时长，判断是「单次太慢」还是「接连不断地开」，再决定是缩短临界区还是让 Capture 不阻塞新绑定 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -138,8 +138,11 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   (b) **P0-3 的约束含控制器**：`--max-concurrency 8` 时引擎告警“arena 只能容纳 4 条全长 lane”，
   且 `[ctl] engine prefill merge: on (controller)`；`NINFER_PREFILL_BATCH=all` 显示只有 2 条被绑定、
   其余 `waiting` 常驻。并发数量是引擎按 arena 现算的，下一步要在准入处打印“本次只绑 2 条”的原因位。
-- 2026-11-25：准入原因位落地（`[admit] calls/ok/tx_busy/no_lane/kv_wait/phys_wait`，随
-  `NINFER_PREFILL_BATCH` 打印）。4×23k 回放给出 `tx_busy=56/72`，其余三项为 0——**绑定被
-  `Program` 级上下文事务串行化**，每个绑定的 KV 转移 + 状态备份 + 安装一次只能有一个，
-  这是车道数停在 2 的原因，与 KV 容量无关。P0-3 的修法据此改为“事务分段/缩短”。
+- 2026-11-25：准入原因位落地（`[admit] calls/ok/tx_busy/no_lane/kv_wait/phys_wait/idle_wait`，随
+  `NINFER_PREFILL_BATCH` 打印）。4×23k 回放给出 `calls=103, ok=5, tx_busy=87`，其余为 0，
+  `idle_wait=0`——**不是准入被饿死**，而是有请求在等时每轮都在尝试、每轮都撞上开着的事务
+  （Bind/Capture/Pause 共用同一个 `context_transaction_`）。下一步按 kind 计时 open→commit。
+- 2026-11-25：踩到并记录一个已知坑的实例：改 `engine_core.h` 后 ninja 未重编（depfile 对头文件不可靠），
+  二进制停留在旧版本、探针字段没出现。删 `ninfer_engine.dir` 下的引擎 obj 强制重编后恢复正常。
+  以后改 `engine_core.h` 一律先清对应 obj。
 
