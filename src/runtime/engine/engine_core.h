@@ -3113,6 +3113,7 @@ private:
                     continue;
                 }
                 if (!lane) {
+                    if (prefill_batch_report_) { ++admit_probe_dec_no_lane_; }
                     retain_admission_source(request, choice, restoring);
                     deferred = true;
                     break;
@@ -3188,6 +3189,21 @@ private:
                         // smaller initial allocation is not a reason to discard this source.
                         if (reservation.capacity_possible &&
                             (!resident_empty() || (!restoring && !paused_.empty()))) {
+                            if (prefill_batch_report_) {
+                                ++admit_probe_dec_capacity_;
+                                // The shortage is the store's own arithmetic, not a scheduler guess:
+                                // it says which quantity is missing and by how much, which is the
+                                // difference between "really does not fit" and "fits but the pass
+                                // never asks again".
+                                if (admit_probe_dec_capacity_ <= 6) {
+                                    std::fprintf(stderr,
+                                                 "[admit] capacity short: state_slots=%u main_pages=%u "
+                                                 "backend_pages=%u host=%zu B\n",
+                                                 shortage.state_slots, shortage.main_kv_pages,
+                                                 shortage.backend_kv_pages, shortage.host_bytes);
+                                    std::fflush(stderr);
+                                }
+                            }
                             deferred = true;
                             break;
                         }
@@ -4271,6 +4287,9 @@ private:
                                  static_cast<unsigned long long>(admit_probe_kv_wait_),
                                  static_cast<unsigned long long>(admit_probe_phys_wait_),
                                  static_cast<unsigned long long>(admit_probe_idle_waiting_));
+                    std::fprintf(stderr, "[admit] decision: no_lane=%llu capacity=%llu\n",
+                                 static_cast<unsigned long long>(admit_probe_dec_no_lane_),
+                                 static_cast<unsigned long long>(admit_probe_dec_capacity_));
                     std::uint64_t tx_counts[4]{};
                     double tx_total[4]{};
                     double tx_worst[4]{};
@@ -4557,6 +4576,9 @@ private:
     std::uint64_t admit_probe_kv_wait_   = 0;
     std::uint64_t admit_probe_phys_wait_ = 0;
     // Passes that saw a waiting request and no admission attempt since the previous report.
+    // Why admissse admission is deferred inside the decision loop, split by the two branches that can do it.
+    std::uint64_t admit_probe_dec_no_lane_  = 0;
+    std::uint64_t admit_probe_dec_capacity_ = 0;
     std::uint64_t admit_probe_idle_waiting_ = 0;
     std::uint64_t admit_probe_seen_         = 0;
     // Q67/S1: set by try_admit_one when a candidate was refused for capacity rather than ordering.

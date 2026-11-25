@@ -190,3 +190,9 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
 - 2026-11-25：教训：两次用「按行号改」的方式编辑 `engine_core.h` 都把文件改坏（第二次在 270 行报
   `stopping_/failed_/outstanding_` 未声明）。已 `git checkout` 恢复并确认可编译。以后改这个头文件只用
   字符串锚点编辑，或在改完立即编译。
+- 2026-11-25：**“是否真的放不下”已有答案：不是 KV、不是显存，是一个状态镜像槽位。**
+  决策分支探针给出 `no_lane=0 capacity=6` 与
+  `[admit] capacity short: state_slots=1 main_pages=0 backend_pages=0 host=0 B`，
+  即缺的是 `state_store` 的 device 槽位（`reserve_destination()` 需要 `need_device=true`）。
+  下一步在该行补 `device_occupied/device_capacity`，判断是“槽位真的用完了”还是“分配器没有把已释放的槽位还回来”，
+  再决定是加 extra states 还是修释放路径。
