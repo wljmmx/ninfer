@@ -449,6 +449,17 @@ Qwen4Exp 后续要用 R 盘上的低比特 GGUF。目标是解码 **≥85–97 t
 
 所以“引入 IQ3_XXS”实际是**引入一个 GGUF 容器 + 十余种 GGML 量化类型 + PLE 表**，而不是一种码本。
 
+**2026-11-26 转换器已落地**：`tools/qwen4exp/convert_gguf_to_ninfer.py` 把两片 IQ3_XXS + dflash2
+打包成一个 v3 容器，**每个 tensor 原样字节、原样编码**（`format=ggml_<type>`、`layout=ggml_block_v1`，
+即对象的字节就是 GGML 块编码本身），不做任何反量化或重编码。产物
+`R:\model\qwen4exp\qwen4exp-iq3_xxs.ninfer`（+ `.part-0001` / `.part-0002`）：
+1,305 个对象（text 1,224 + dflash2 81）、payload **71.74 GiB**、三卷 29.57 / 14.23 / 27.95 GiB；
+25 个跨卷抽样对象的 sha256 全部对上，入口 `NINFER` 与两卷 `NINPRT` 的 `artifact_id` 一致、
+`part_index` 为 1/2。
+
+已知边界：引擎 reader 还不认识 `ggml_*` 这 13 个格式名（v3 注册表只有 11 种），所以这个容器
+目前**只能被转换器自校验，不能被引擎加载**。下一步是在 v3 注册表登记 `ggml_block_v1` 与这些
+格式名（对象已带 `bytes`，无需重算 encoded size），再给加载器加对应的 GGML 块解码。
 需要的工作：
 
 1. **GGUF 读取与转换**：`src/` 里没有任何 GGUF 解析（现有 artifact 是自有 `.ninfer` 容器）。
