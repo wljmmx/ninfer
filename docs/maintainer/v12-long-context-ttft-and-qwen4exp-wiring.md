@@ -73,9 +73,9 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 进行中（已定位约束层次） | `--max-concurrency 4`，但 `throughput` 行稳定报告 `running 2 (prefill 2) | waiting 2`；4 条 23k 请求分成两波，TTFT 17.0–20.6 s | 三组对照：chunk 1024 → 19.0–20.9 s；chunk 512 → 23.1–24.7 s；`--max-concurrency 8` → 18.6–19.7 s。**车道数始终是 2**，与 chunk、与 max-concurrency 都无关，因此不是合并矩形（`prefill_batch_fit`）也不是并发上限；`scheduler_.next_prefill` 每轮只推进一条，说明限制在**准入/绑定**（`waiting` 与 `materializing`）。下一步：给准入加计时与拒绝原因（绑定耗时、KV 页分配结果），而不是继续调参 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-3 预填充车道 | 进行中（探针已就位） | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 三组对照排除“合并矩形随 chunk 变”与“并发上限”：chunk 1024 → 19.0–20.9 s，chunk 512 → 23.1–24.7 s，`--max-concurrency 8` → 18.6–19.7 s，车道恒为 2。`NINFER_PREFILL_BATCH=all` 的每轮输出显示只有 l0/l1 两条被绑定、其余 `waiting=2` 常驻；启动期 `[ctl] engine prefill merge: on (controller)`，并且 `--max-concurrency 8` 时引擎明确告警“arena 只能容纳 4 条全长 lane，超出部分排队”——**并发是引擎按 KV arena 现算的，不是写死**。下一步：在准入处加“本次为何只绑 2 条”的原因位（arena 页数 / 状态镜像 / merge 窗口），用同一条回放验证 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
-| P0-5 前缀缓存 0% | 已关闭 | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天启动日志写的是 `checkpoint cache | off`；本轮开启后，两条同 prompt 请求命中 `cache 23,083 (100.0%, checkpoint)` | 不是缺陷 |
+| P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
 
 ### P1：长上下文
@@ -132,3 +132,8 @@ PagedAttention 重做（已是核心）、FPGA。理由见 v12 建立时的评�
   TTFT 分别 19.0–20.9 s / 23.1–24.7 s / 18.6–19.7 s。排除「合并矩形」与「并发上限」两种解释；
   约束落在准入与绑定（`waiting` 与 `materializing` 同时出现）。下一步不是调参，而是给准入加
   计时与拒绝原因探针。
+- 2026-11-25：更正两条。(a) **P0-5 撤销**：昨天启动日志是 `checkpoint cache | attached`，四条请求是
+  四段不同对话，0% 命中属正常；`checkpoint cache` 由 `NINFER_LMCACHE_RESTORE` 控制，不是 CLI 参数。
+  (b) **P0-3 的约束含控制器**：`--max-concurrency 8` 时引擎告警“arena 只能容纳 4 条全长 lane”，
+  且 `[ctl] engine prefill merge: on (controller)`；`NINFER_PREFILL_BATCH=all` 显示只有 2 条被绑定、
+  其余 `waiting` 常驻。并发数量是引擎按 arena 现算的，下一步要在准入处打印“本次只绑 2 条”的原因位。
