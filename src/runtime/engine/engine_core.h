@@ -43,6 +43,10 @@
 #include <variant>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace ninfer::runtime {
 
 template <class Instance>
@@ -1180,6 +1184,25 @@ private:
     //
     // The refusal that remains - `request_tokens > capacity_tokens` - is the one no lane in front of
     // it can fix, and refuse_kv_residency() is the message for it.
+    // Physical-memory headroom for admission. Everything else in the admission path prices
+    // TOKENS, but a request's KV lands in host memory first, and spending the last of it makes a
+    // CUDA call inside the prefill fail - which cuda_check turns into a process-wide fast-fail
+    // (0xC0000409 measured 2026-11-25: twelve 88k-token requests, host-kv at 13.9 GiB beside a
+    // 16 GiB host context, no free physical memory). A resident lane gives its bytes back when it
+    // finishes, so this waits rather than refuses; the queue deadline, which now includes the
+    // queued work, bounds the wait.
+    static constexpr std::uint64_t kHostAdmissionReserveBytes = 4ULL * 1024 * 1024 * 1024;
+
+    [[nodiscard]] static std::uint64_t available_physical_bytes() noexcept {
+#ifdef _WIN32
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status) != 0) { return status.ullAvailPhys; }
+#endif
+        // Unknown must not refuse: a platform without the query keeps its previous behaviour.
+        return UINT64_MAX;
+    }
+
     void note_kv_residency_wait(const std::shared_ptr<Request>& request,
                                 std::uint32_t prompt_tokens, std::uint32_t request_tokens,
                                 const models::qwen3_5::Program::KvResidencyBudget& budget) {
@@ -3013,6 +3036,15 @@ private:
                             // offered again at the next admission generation, which the completing
                             // lane arms. Marking the scan deferred is what keeps this pass from
                             // re-arming itself: the retry must ride on a real capacity event.
+                            note_kv_residency_wait(request, prompt_tokens, request_tokens, budget);
+                            admission_deferred_ = true;
+                            continue;
+                        }
+                        // The token arithmetic above is the contract with the KV pool, not with the
+                        // box. When physical memory is nearly gone the next prefill's CUDA call
+                        // fails and cuda_check aborts the process, so the newcomer waits for a
+                        // resident lane to release its bytes.
+                        if (available_physical_bytes() < kHostAdmissionReserveBytes) {
                             note_kv_residency_wait(request, prompt_tokens, request_tokens, budget);
                             admission_deferred_ = true;
                             continue;
