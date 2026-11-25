@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 重新定性：崩溃修复后事务不再是限制，剩调度策略 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) \| waiting 2`，4 条 23k 请求分两波 | 崩溃修复后复测：`[tx] bind n=5 avg=4.1 max=8.4`、`ph=[0 0 1 0]ms`、`open=0 age=2ms`——**绑定只要 4 ms，之前的 6.6 s 是崩溃途中留下的假象**。但 `running 2` 依旧：两条真做 prefill（各 2.66k tok/s），另两条 `queue 18.4s` 后命中 `cache 23,083 (100%)`，`engine-wall` 仅 69–201 ms。限制在调度器一次放行的 prefill 车道数（`prefill_hold_active()` / merge 窗口），不是事务、不是 KV、不是显存 | 4 条 23k 并发 TTFT ≤10 s；先把放行策略改成可配并实测 |
+| P0-3 预填充车道 | 已定位：`auto` 的 2 张状态镜像是正确默认，不是准入缺陷 | 车道数由 `controller_residency_policy(auto).device_state_images = 2` 决定（`planning/startup.h` 的 `device_state_image_slots()` 取 `min(policy, logical_slots)`，`NINFER_STATE_IMAGE_DEVICE_SLOTS` 仍可覆盖；`performance` 才是 4）。2 条 lane 占满 2 张 device image 后，第 3/4 条 bind 被拒、只能等前两条完成，且错过后无法插队（`[prefill-reject] mid_capture`）。崩溃修复后事务不是限制（`[tx] bind avg=4.1ms`） | 同二进制 A/B（`replay_burst.ps1` 4×23k，唯一变量 `NINFER_STATE_IMAGE_DEVICE_SLOTS`）：**2 张** → `running 2 \| waiting 2`，队头 18.6 s、队尾 37.0 s；**4 张** → `running 4 (prefill 4)`，全员 36.4 s。两臂总 prefill 吞吐都锁定在 2.04–3.08k tok/s，墙钟严格 = 总 token / 吞吐。4 张多花 294 MiB state image（307,908,608→615,817,216 B）并挤掉 295 个 device KV 页（3,646→3,351，19.5%→18.0%），无吞吐收益 | 原判据“4×23k ≤10 s”在当前吞吐下不可达（需 ≥2.3× prefill 吞吐）；改为：车道策略保持 `auto=2`，TTFT 的优化目标改为 prefill 吞吐 |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -196,3 +196,33 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
   即缺的是 `state_store` 的 device 槽位（`reserve_destination()` 需要 `need_device=true`）。
   下一步在该行补 `device_occupied/device_capacity`，判断是“槽位真的用完了”还是“分配器没有把已释放的槽位还回来”，
   再决定是加 extra states 还是修释放路径。
+- 2026-11-25：**上面那条的答案：既不是用完了也不是没还，是控制器按模式只给 2 张。**
+  `core/controller_mode.h` 的 `controller_residency_policy(Auto)` 返回
+  `{kv_host_tiering=true, device_state_images=2}`（`Performance` 才是 4，`Stable` 用 `all_device_images`）；
+  `planning/startup.h` 的 `device_state_image_slots()` 取 `min(policy, logical_slots)`，
+  `NINFER_STATE_IMAGE_DEVICE_SLOTS` 仍优先。启动日志 `[kv-plan] state_images=307,908,608`
+  = 2 × `state_image_bytes` 153,954,304，印证物理张数就是 2。所以 2 条 lane 占满后第 3/4 条被拒，
+  是策略在生效，不是释放路径泄漏。
+- 2026-11-25：**同二进制 A/B（唯一变量 `NINFER_STATE_IMAGE_DEVICE_SLOTS`）证明放开到 4 只有代价**：
+
+  | 指标 | 2 张 | 4 张 |
+  |---|---|---|
+  | burst 墙钟（4×23,090 tok，`max_tokens=64`） | 19.3 / 19.2 / 20.8 / 20.8 s | 36.8 / 36.4 / 36.5 / 36.4 s |
+  | 同上改用 `-UniquePrompts`（无共享前缀） | 18.6 / 18.6 / 37.0 / 36.9 s（两波） | 全员 36.4 s（一波即全量，与前一行等价） |
+  | 车道 | `running 2 (prefill 2) \| waiting 2` | `running 4 (prefill 4)` |
+  | 总 prefill 吞吐 | 2.05–3.08k tok/s | 2.04–3.07k tok/s |
+  | state image | 294 MiB（`anchor_slots=2`） | 587 MiB（`anchor_slots=4`） |
+  | device KV 驻留 | 3,646 页 / 3,631.8 MiB（19.5%） | 3,351 页 / 3,337.9 MiB（18.0%） |
+  | KV logical 容量 | 18,725 页组 | 18,620 页组 |
+
+  墙钟严格等于“总 token ÷ ≈2.5k tok/s”：2 张是两波（队头 18.6 s、队尾 37 s），4 张把两波并成一波
+  （全员 36.4 s）。**车道数只改变排队怎么分，不改变吞吐**;4 张还多占 294 MiB state image 并把 device KV
+  挤小 295 页。结论：`auto=2` 是正确默认，P0-3 不再算待修缺陷。
+- 2026-11-25：由此 P0-3 的判据“4×23k TTFT ≤10 s”不成立：按 2.5k tok/s，4 条 23k 的理论下限
+  就是 92k ÷ 2.5k ≈ 37 s。TTFT 的优化目标改为 **prefill 吞吐**（需 ≥2.3× 才可能进 10 s），不是车道数。
+- 2026-11-25：日志口径坑：`device_state_slots 4 [default]` 打印的是**逻辑槽位**
+  （`model_instance.cpp` 把它规范化为 `value_or(concurrency)`），不是物理张数；物理张数只能从
+  `[kv-plan] state_images=<bytes>` ÷ `state_image_bytes` 读出。
+- 2026-11-25：`tools/serve/replay_burst.ps1` 新增 `-UniquePrompts`（默认关，向后兼容）：给每条请求
+  一个不同的开头句，长度不变。没有它时，车道数少于请求数会让后几条命中 100% 前缀缓存，
+  把调度/pipeline 测试测成缓存测试。

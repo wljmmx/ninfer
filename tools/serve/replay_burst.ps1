@@ -14,6 +14,10 @@
 #
 # -MaxTokens 0 omits the field so the server's --default-max-tokens applies; that is the A/B for
 # "is the queue dominated by the output reservation".
+#
+# -UniquePrompts gives every request a distinct opening sentence. Without it all four prompts are
+# byte-identical, so with fewer lanes than requests the later lanes finish on a 100% prefix hit and
+# the run measures the cache instead of the prefill throughput it was meant to measure.
 param(
     [int]$Requests = 4,
     [int]$PromptRepeat = 1500,
@@ -25,7 +29,8 @@ param(
     [int]$PrefillChunk = 1024,
     [int]$Concurrency = 4,
     [int]$MaxContext = 262144,
-    [int]$ReadySeconds = 300
+    [int]$ReadySeconds = 300,
+    [switch]$UniquePrompts
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,22 +82,28 @@ for ($t = 0; $t -lt 54; $t++) {
         }
     }
 }
-$body = @{
-    model = $ModelId
-    messages = @(
-        @{ role = 'system'; content = 'You are a careful assistant. Answer with one short sentence.' },
-        @{ role = 'user';   content = $filler }
-    )
-    tools = $tools
-    temperature = 0
+$payloads = @()
+for ($k = 1; $k -le $Requests; $k++) {
+    # The opening sentence is the only difference, which is enough to deny a shared prefix while
+    # keeping the length (and therefore the prefill work) the same as the identical-payload arm.
+    $userContent = if ($UniquePrompts) { "Request $k of the northern quay survey. $filler" } else { $filler }
+    $body = @{
+        model = $ModelId
+        messages = @(
+            @{ role = 'system'; content = 'You are a careful assistant. Answer with one short sentence.' },
+            @{ role = 'user';   content = $userContent }
+        )
+        tools = $tools
+        temperature = 0
+    }
+    if ($MaxTokens -gt 0) { $body['max_tokens'] = $MaxTokens }
+    $payloads += ($body | ConvertTo-Json -Depth 12 -Compress)
 }
-if ($MaxTokens -gt 0) { $body['max_tokens'] = $MaxTokens }
-$payload = $body | ConvertTo-Json -Depth 12 -Compress
 $uri = "http://127.0.0.1:$Port/v1/chat/completions"
 
 $jobs = @()
 for ($k = 1; $k -le $Requests; $k++) {
-    $jobs += Start-Job -ArgumentList $uri,$payload,$k -ScriptBlock {
+    $jobs += Start-Job -ArgumentList $uri,$payloads[$k - 1],$k -ScriptBlock {
         param($u, $b, $id)
         $sw = [Diagnostics.Stopwatch]::StartNew()
         try {

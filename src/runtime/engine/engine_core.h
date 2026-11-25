@@ -3196,11 +3196,19 @@ private:
                                 // difference between "really does not fit" and "fits but the pass
                                 // never asks again".
                                 if (admit_probe_dec_capacity_ <= 6) {
+                                    // The store's own occupancy next to its shortage: "the slots are
+                                    // all held" and "a released slot never came back" read the same
+                                    // from the shortage alone.
+                                    const auto usage = instance_.program->physical_usage();
                                     std::fprintf(stderr,
                                                  "[admit] capacity short: state_slots=%u main_pages=%u "
-                                                 "backend_pages=%u host=%zu B\n",
+                                                 "backend_pages=%u host=%zu B | held state %u/%u "
+                                                 "kv %u/%u\n",
                                                  shortage.state_slots, shortage.main_kv_pages,
-                                                 shortage.backend_kv_pages, shortage.host_bytes);
+                                                 shortage.backend_kv_pages, shortage.host_bytes,
+                                                 usage.occupied.state_slots, usage.capacity.state_slots,
+                                                 usage.occupied.main_kv_pages,
+                                                 usage.capacity.main_kv_pages);
                                     std::fflush(stderr);
                                 }
                             }
