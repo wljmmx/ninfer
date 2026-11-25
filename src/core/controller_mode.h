@@ -157,6 +157,28 @@ inline void set_controller_mode_runtime(ControllerMode mode) {
 //
 // The environment switches still win when they are set (reproducing a recorded arm is a contract of
 // its own), but no default depends on them any more.
+// How a pass chooses between the two kinds of work (P0-7). The three modes do not share one answer:
+// a deployment that refuses tiering sells predictability, and a burst-oriented one can afford to
+// reshape the pass. Keeping this next to the residency policy is what stops a future env switch from
+// contradicting the controller.
+enum class PrefillDecodeOrder : std::uint8_t {
+    // One pass runs either decode or prefill; the other kind waits its turn. Today's behaviour.
+    SerialDecodeFirst,
+    // Decode rows and a prefill chunk share one rectangle, so neither starves the other.
+    MixedBatch,
+    // Mixed, plus the wider quota a burst-oriented deployment can afford.
+    MixedBatchAggressive,
+};
+
+[[nodiscard]] inline constexpr const char* prefill_decode_order_name(PrefillDecodeOrder order) noexcept {
+    switch (order) {
+    case PrefillDecodeOrder::SerialDecodeFirst: return "serial-decode-first";
+    case PrefillDecodeOrder::MixedBatch: return "mixed-batch";
+    case PrefillDecodeOrder::MixedBatchAggressive: return "mixed-batch-aggressive";
+    }
+    return "unknown";
+}
+
 struct ControllerResidencyPolicy {
     bool          kv_host_tiering        = true;
     // Physical Device StateImages. `all_device_images` means "one per logical slot", which is what a
@@ -164,18 +186,22 @@ struct ControllerResidencyPolicy {
     // Host replica, i.e. tiering by another name.
     std::uint32_t device_state_images    = 2;
     bool          all_device_images      = false;
+    PrefillDecodeOrder prefill_decode_order = PrefillDecodeOrder::MixedBatch;
 };
 
 [[nodiscard]] inline constexpr ControllerResidencyPolicy
 controller_residency_policy(ControllerMode mode) noexcept {
     switch (mode) {
     case ControllerMode::Stable:
-        return {.kv_host_tiering = false, .device_state_images = 0, .all_device_images = true};
+        return {.kv_host_tiering = false, .device_state_images = 0, .all_device_images = true,
+                .prefill_decode_order = PrefillDecodeOrder::SerialDecodeFirst};
     case ControllerMode::Performance:
-        return {.kv_host_tiering = true, .device_state_images = 4, .all_device_images = false};
+        return {.kv_host_tiering = true, .device_state_images = 4, .all_device_images = false,
+                .prefill_decode_order = PrefillDecodeOrder::MixedBatchAggressive};
     case ControllerMode::Auto: break;
     }
-    return {.kv_host_tiering = true, .device_state_images = 2, .all_device_images = false};
+    return {.kv_host_tiering = true, .device_state_images = 2, .all_device_images = false,
+            .prefill_decode_order = PrefillDecodeOrder::MixedBatch};
 }
 
 } // namespace ninfer

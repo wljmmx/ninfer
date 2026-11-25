@@ -160,6 +160,12 @@ struct Program {
         return blocks.size() - 1;
     }
 
+    // resource_manager.h's recovery path asks the program these three. The fixture models no fork,
+    // so nothing shares pages with anything and no group retires anything.
+    [[nodiscard]] std::vector<Handle> checkpoints_sharing_pages(Handle) const { return {}; }
+    void debug_checkpoint_table(const char*) const {}
+    [[nodiscard]] std::uint32_t retire_checkpoint_group(std::span<const Handle>) { return 0; }
+
     Handle add(Key tokens, std::vector<std::size_t> host_blocks = {},
                Role role = Role::SharedPrefix) {
         const Handle handle{static_cast<std::uint32_t>(contents.size())};
