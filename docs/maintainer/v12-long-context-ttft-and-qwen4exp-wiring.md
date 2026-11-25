@@ -347,6 +347,12 @@ P0-3 已证明车道数不是瓶颈（2 张镜像就是硬件饱和点），所�
 实现上，`controller_residency_policy()` 已经是三档的单一来源，把排序方式也挂到同一个结构里
 （新增一个 `prefill_decode_order` 枚举），调度循环按它分支，避免再出现“环境变量与控制器各说一套”。
 
+**已落地（2026-11-25）**：`core/controller_mode.h` 新增 `PrefillDecodeOrder`
+（`SerialDecodeFirst` / `MixedBatch` / `MixedBatchAggressive`）并挂在
+`ControllerResidencyPolicy::prefill_decode_order` 上，三档分别是 serial / mixed / mixed-aggressive。
+**调度循环尚未按它分支**——当前仍是一个 pass 跑一类，所以行为没有变化，这一项只保证配置就位、
+可被打印和测试。下一步是让 `auto` 的 `MixedBatch` 真正生效（见 §6.2 的实施顺序）。
+
 
 
 ## 7. 记录（W3 / W4 结果）
@@ -435,3 +441,19 @@ Qwen4Exp 后续要引入 IQ3_XXS 权重（约 3.06 bpw），目标是解码 **85
    要能被归因（是反量化额外带宽、还是 expert miss）。
 
 前置：先量出当前 Qwen4Exp（q4_g64_fp16 权重）的解码 tok/s 作为本机基线，再谈 85–97 的比较口径。
+
+**2026-11-25 基线已量**（`tools/serve/q4exp_decode_baseline.ps1`，fp8 KV、262k、c=1、output 256）：
+`decode 4.4 tok/s`，`TTFT 9.5 s`，总 66.9 s。请求行给出的分解是决定性的：
+
+```
+phases boundary 19.1 ms | submit 1m 6.6s | devwait 251 ms | decodehost 57.2 s | decodewait 214 ms
+```
+
+**这不是 GPU 慢，是 host-bound**：`devwait` 只有 251 ms，而 host 侧的 submit 66.6 s、decodehost 57.2 s。
+即专家池装不下的路由专家落到 CPU/流式路径（`HostRoutedFetch` / `host_routed_ffn`），
+GPU 大部分时间在等 host。按 227 ms/token 算，要达 85–97 tok/s 需要 **19–22 倍**。
+
+所以 IQ3_XXS 的意义不是“换一种更省的格式”这么简单：4.5 bit → 3.06 bit 只省约 1.5× 流量，
+**必须让 device 驻留的专家比例大幅上升，把 host 腿压到接近零**，否则格式再省也到不了 85 t/s。
+这件事要和 strata 的配置对齐（它 85–97 t/s 时有多少权重常驻、跑什么上下文、单卡还是多卡），
+否则“达到 85–97”没有可比口径。
