@@ -182,3 +182,11 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
   `ph=[0 0 1 0]ms`、`open=0 age=2ms`。真正的原因是调度器一次只放行 2 条 prefill：两条跑满 2.66k tok/s，
   另两条 queue 18.4 s 后靠 checkpoint 命中在 69–201 ms 内完成。P0-3 改为“放行策略可配并实测”，
   不再动 KV 绑定事务。
+- 2026-11-25：准入分支探针把队头被挡的位置收敛到 `admission_deferred_`（一轮 burst 里 `deferred=68`，
+  `owner/held/arm_no_lane/arm_tx/arm_paced` 全为 0）。该标志只有两处会置位：决策循环里 lane 被抢走
+  （`if (!lane)`）与 `reservation.capacity_possible` 但当前无可用容量。也就是说：**不是没被唤醒、不是缺车道、
+  不是事务，而是 KV 预留这一刻判不出容量**。下一步给这两处各加一个计数（决策无 lane / 容量不可行）即可区分，
+  然后才能决定是等一个容量事件还是改预留口径。
+- 2026-11-25：教训：两次用「按行号改」的方式编辑 `engine_core.h` 都把文件改坏（第二次在 270 行报
+  `stopping_/failed_/outstanding_` 未声明）。已 `git checkout` 恢复并确认可编译。以后改这个头文件只用
+  字符串锚点编辑，或在改完立即编译。
