@@ -47,7 +47,11 @@ struct ClientOptions {
     // drain. The receive side needs the same, because a rejected payload produces no reply at all
     // and the only signal is this timeout.
     int send_timeout_ms{120000};
-    int receive_timeout_ms{120000};
+    // The receive timeout bounds how long a caller can sit on a connection, and a restore runs on
+    // the scheduler thread. 120 s meant one unresponsive server could freeze that thread for two
+    // minutes per call; a 1.1 GB store moves in ~8.7 s at the measured 128 MiB/s, so 30 s still
+    // carries the largest payload and fails fast instead of stalling the engine.
+    int receive_timeout_ms{30000};
     int linger_ms{0};
     int reconnect_ivl_ms{100};
 };

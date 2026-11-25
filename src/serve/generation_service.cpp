@@ -297,7 +297,10 @@ public:
         // Device copies) without saying how much of it is the cache.
         log_process_memory("restore-begin");
         const auto fetch_started = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> guard(bridge_mutex_);
+        // No backend-wide lock. Pool::acquire() leases one connection to this call for the whole
+        // round trip, so a restore here and a publish on the writer thread use different sockets.
+        // The lock that used to sit here covered the entire ZMQ trip: an 8.7 s publish blocked
+        // every admission restore behind it (2026-11-25, [hang] phase=resources finish).
         ++fetches_;
         // Streaming first: the header carries the state image and one chunk (156 MB), never the run.
         // The import path then hands its reserved extent back through `fill`, so the 2.5 GB never
@@ -402,7 +405,8 @@ public:
                                  dest.size(), kv_total, tail.size());
                     std::fflush(stderr);
                 }
-                std::lock_guard<std::mutex> fill_guard(bridge_mutex_);
+                // Same reasoning as restore_prefix: the fill runs on the caller's thread with its
+                // own leased connection, so it does not take the backend lock.
                 if (kv_total + tail.size() > dest.size()) {
                     if (error != nullptr) { *error = "destination is smaller than the record"; }
                     return false;
@@ -935,7 +939,9 @@ public:
                 valid_tokens, tail, chunk_bytes_total);
         }
 
-        std::lock_guard<std::mutex> guard(bridge_mutex_);
+        // No backend-wide lock: publish_parts runs on the writer thread and Bridge::publish leases
+        // its own connection. Taking the backend lock here serialised the restore path behind an
+        // 8.7 s upload.
         // Slice on a chunk boundary: `complete` is a whole number of chunks, and `first_chunk` counts
         // them, so the span stays aligned and the indices handed to the server are its own.
         const std::size_t begin_byte = std::min(complete, first_chunk * chunk_bytes_total);
@@ -991,12 +997,11 @@ private:
     ninfer::core::lmcache::PrefixRegistry registry_;
     // 13.4: write replay. Inert unless NINFER_LMCACHE_WAL_DIR names a directory.
     ninfer::core::lmcache::CheckpointWriteAheadLog wal_;
-    // Q64 2d-2h, step 1: one lock for the bridge, because it owns a ZMQ socket and a socket is not
-    // thread-safe. Publishing moves to a writer thread in step 2; that is only safe if every user of
-    // the bridge - the restore on the request path and the publish on either - takes this first.
-    // Today both callers are on one thread, so this changes nothing observable, which is exactly why
-    // it is landing ahead of the thread rather than with it.
-    std::mutex bridge_mutex_;
+    // No backend-wide lock. The step-1 reasoning ("a socket is not thread-safe, so every user takes
+    // this") stopped holding once publishing moved to the writer thread: the lock then covered an
+    // entire ZMQ round trip, and a 1.1 GB upload held it for 8.7 s while admission restores queued
+    // behind it - the scheduler took no pass for 20 s. Bridge serialises per call instead
+    // (Pool::acquire leases one connection; the error slot is per thread).
     // 2d-2h: the writer and its queue. Every field below is inert unless NINFER_LMCACHE_ASYNC_WRITE
     // was set at the first store; with the switch off the thread is never created and the queue never
     // holds anything, so the synchronous path is the one that was measured.

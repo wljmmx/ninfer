@@ -777,7 +777,12 @@ private:
     Pool pool_;
     BridgeConfig config_{};
     std::int64_t instance_id_{0};
-    std::string error_;
+    // One error slot per thread. Every caller writes it and reads it on the same thread, so it
+    // never needed to be shared - and sharing it was the only reason the serve backend held a
+    // mutex across whole ZMQ round trips. Measured 2026-11-25: a 1.1 GB publish held that mutex
+    // for 8.7 s while every admission restore queued behind it, and the scheduler took no pass
+    // for 20 s ("[hang] phase=resources finish | waiting=13").
+    inline static thread_local std::string error_;
 };
 
 }  // namespace ninfer::core::lmcache
