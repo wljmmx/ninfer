@@ -64,8 +64,8 @@
 | W1 三 bank 专家流 | 已完成（W4 端到端已证明） | `ExpertStream` 有 split 形态，但需要模型侧构造并绑定 | `parameters.cpp:682` 已按 gate/up/down 三个 `ExpertMatrixBankDesc` 构造；`model_instance.cpp` 已按 `runs[i].split` 调 `attach_split()` 绑三个 bank | W4 的 115 GB 工件跑出 PPL，三 bank 路径实际执行 |
 | W2 PLE / HC 注入 | 已完成（W4 端到端已证明） | `run_layers` 需要 PLE 表与四流残差 | `text.cpp` 已接 `PleStepWindow`（3 处）与 HC 残差折叠 | 同上 |
 | W3 QSA 执行 | 已完成（原判“sparse 执行未落地”已作废） | QSA 的 KV 页、索引计划与稀疏执行 | `qwen4_exp/execution/qsa_layer.cpp:101` 的 `qsa_mix` 走完整链路：`qsa_prepare` → `qsa_indexer` → `qsa_sparse_gqa` → `qsa_tail_extract`；kernel 在 `ops/softmax_attention/qsa/`（`sparse_gqa_kernel.cuh`、`sparse_gqa_prefill.cuh`、`sparse_gqa_launch.cu`）。`text.cpp:2775` 中 `indexed && !qsa_dense_arm()` 走 `qsa_mix`，即**默认就是稀疏路径**，只有 `NINFER_QSA_FORCE_FULL` 退回 dense | 支持 width×batch 矩形（merged prefill / decode / 单 lane 三种形状）；W4 的 65 窗 PPL 就是这条路径 |
-| W3a QSA 低比特 KV | 进行中：低比特已能跑，rk4v4-e8 精度不达标；fp8 在测 | QSA 的 KV 量化仍被 env 门控，默认降级 bf16 | `model_instance.cpp:1723` 的 `resolve_kv_storage`：`qsa_kv_storage_admitted()` 不通过就把存储改 `BFloat16` 并打印；只有 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1` 才启用低比特路由。所以 W4 用 `--kv-dtype rk4v4-e8` 跑出来的 PPL 实际是 **bf16 KV** | 同语料同窗口（33,322 token、65 窗、sha256 `777E71E9…`）开 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1`：bf16 **13.486344** → rk4v4-e8 **13.934833（+3.33%）**，2985 s，exit 0。**未过 ≤+0.5%**，但 +3.33% 与 27B 稠密的 +3.39% 几乎相同，说明是 4-bit 的固定代价、不是 QSA 引入。按判据改测 fp8（27B 上 +0.024%） |
-| W3b QSA 与 dense 参考臂对照 | 未开始（依赖 W4 基线） | 稀疏选块是否改变了同一层的数值 | `NINFER_QSA_FORCE_FULL` 是同一种子的 dense 臂，可做逐窗对照 | 两臂 PPL 差与逐层 attention dump 差都有解释；作为 W3a 的前置参考 |
+| W3a QSA 低比特 KV | 已完成（精度；容量待验） | QSA 的 KV 量化仍被 env 门控，默认降级 bf16 | `model_instance.cpp:1723` 的 `resolve_kv_storage`：`qsa_kv_storage_admitted()` 不通过就把存储改 `BFloat16` 并打印；只有 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1` 才启用低比特路由。所以 W4 用 `--kv-dtype rk4v4-e8` 跑出来的 PPL 实际是 **bf16 KV** | 同语料同窗口（33,322 token、65 窗、sha256 `777E71E9…`）开 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1`：bf16 **13.486344**；**fp8 13.467359（−0.014%，通过）**；rk4v4-e8 13.934833（+3.33%，与 27B 稠密的 +3.39% 一致，是 4-bit 固定代价）。结论：QSA 应配 fp8，不配 rk4v4-e8。262k 上下文的容量核算尚未做 |
+| W3b QSA 与 dense 参考臂对照 | 进行中 | 稀疏选块是否改变了同一层的数值 | `NINFER_QSA_FORCE_FULL` 是同一种子的 dense 臂，可做逐窗对照 | 同语料同窗口的 bf16 两臂 PPL 与逐层 attention dump 差都要有解释；作为 W3a 的前置参考 |
 | W4 端到端跑通 115 GB 工件 | 已完成（含 65 窗精度基线） | 依次卡在 `vmm_pool` OOM、`cudaErrorStreamCaptureUnsupported` | 三层修复：池只映射 live 段；`ExpertCache::all_experts_resident()` 取代份额判据；prefill 栈捕获增加 `layer_stack_capturable()` 开关（`layer_capture.h`，引擎在池建立后写入）；另在 `ffn.cpp` 的 per-bank 图缓存上加 `fully_resident()` 守卫 | 完整 65 窗（`--context 1024 --stride 512`、33,322 token、语料 sha256 `777E71E97A6113A3…`、**bf16 KV**——`rk4v4-e8` 会被 W3a 的门降级）：**overall PPL 13.486344**，11.0 tok/s，50 min 40 s；窗口 1 PPL 12.7070。旧记的 14.59/16.02 是另一份语料的 2 窗，不可比。这是 Qwen4Exp 第一个可复现的精度基线 |
 | W4a 容量计划与已加载权重 | 已关闭（环境） | 自动池曾 `cuMemCreate` OOM | 停掉占 10,924 MiB 的常驻 serve 后，`gpu=18000 (22500 MiB) host_cache=5058 unslotted=55728 of 73728`，池正常建立 | 无规划缺陷 |
 | W4b split 层与图捕获 | 已完成 | 捕获里执行 split 的 host 取数 → `ffn.cpp:372` 断言 | 三个入口分别加守卫：`model_instance` 的整步图用 `all_experts_resident()`；`ffn.cpp` 的 per-bank 图用 `stream->fully_resident()`；`text.cpp` 的 prefill 栈图用 `layer_stack_capturable()` | 同一份工件不再崩；预填充按普通路径执行 |
@@ -343,7 +343,17 @@ P0-3 已证明车道数不是瓶颈（2 张镜像就是硬件饱和点），所�
   `777E71E97A6113A3…`），`--context 1024 --stride 512`，**bf16 KV**（`rk4v4-e8` 被 W3a 的门降级）：
   `overall PPL 13.486344`，11.0 tok/s，50 min 40 s，窗口 1 = 12.7070。旧记录的 14.59 / 16.02 是
   另一份语料的 2 窗，不可与本次比较。
-- 2026-11-25：**W3a 第一档（rk4v4-e8）= +3.33%，未过判据**。同语料同窗口、开
-  `NINFER_QSA_SPARSE_GQA_QUANT_KV=1`：13.486344 → 13.934833（2985 s，exit 0）。这个损失与 27B
-  稠密的 +3.39% 几乎一样，说明它来自 4-bit 建码而不是 QSA 的选块。按 ≤+0.5% 的判据应换 fp8，
-  正在同条件测量。
+- 2026-11-25：**W3a 完成（精度）**。同语料同窗口、开 `NINFER_QSA_SPARSE_GQA_QUANT_KV=1`：
+
+  | dtype | PPL | Δ vs bf16 | 耗时 |
+  |---|---|---|---|
+  | bf16 | 13.486344 | — | 50m40s |
+  | **fp8** | **13.467359** | **−0.014%** | 50m08s |
+  | rk4v4-e8 | 13.934833 | +3.33% | 49m45s |
+
+  fp8 通过 ≤+0.5% 判据（甚至略低于 bf16，属量化噪声）；rk4v4-e8 的 +3.33% 与 27B 稠密的
+  +3.39% 一致，说明是 4-bit 建码的固定代价、不是 QSA 的选块。**结论：Qwen4Exp 的 QSA 配 fp8，
+  不配 rk4v4-e8**。262k 上下文的容量核算还没做（fp8 每元素 1 字节，bf16 是 2 字节，理论上翻倍）。
+- 2026-11-25：**W3b 已启动**：`NINFER_QSA_FORCE_FULL=1` + bf16，同语料同窗口，用于把
+  “稀疏选块”与“dense 全注意力”在数值上分开。这是 W3a 结论的前提（若两臂差得离谱，
+  fp8 的 −0.014% 就只是两臂共有的偏差）。
