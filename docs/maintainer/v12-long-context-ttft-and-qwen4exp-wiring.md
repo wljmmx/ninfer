@@ -78,6 +78,7 @@
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
+| P0-7 prefill/decode 排序 | 已复现，未修（台账补录：此前只以 §1.3 现象存在，从未立项） | 11-24 日志：5 s 窗口常只有一个 chunk 推进（1,024 tok / 5 s = 205 tok/s），只有 decode 空档才出现 12,288 tok / 5 s 的爆发，按分钟波动 6.6×。复现后看到本质：**一个 pass 只能整块跑 decode 或 prefill，另一方整轮等待**，方向取决于谁先占住 | 代码顺序固定为 **control → decode → prefill**（`engine_core.h:4102–4139` 先跑 control/decode，`:4152–4386` 才跑 merge 或单 lane prefill），没有时间片、没有优先级旋钮；`pacing_ready_to_arm`、有界 hold、`--max-concurrency 2` 三组实验均无效果且已回退，回退后没有作为工作项留痕 | `tools/serve/p07_prefill_decode_mix.ps1`（2 张镜像、1 条长 decode + 1 条 19.5k prefill，互不抢 lane）：prefill 2.74k tok/s（单独 2.66k，几乎不受影响），decode 从 104 tok/s 掉到 **7.8 tok/s**（prefill 期间），prefill 结束后回到 73.1；反向（11-24）是 prefill 掉到 205 tok/s。判据：两向互相影响 ≤20%，或明确接受串行并写清理由 |
 
 ### P1：长上下文
 
@@ -278,3 +279,19 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
   rk4v4-e8 的 3.39% 与 4k 的 3.33% 一致，说明它是固定的量化损失，不随上下文长度放大。
 - 2026-11-25：一并修掉文档内部矛盾：§1.1 引用的“27B −18%”与 P1-1 复测冲突，已改为
   “27B 5.5% / 35B −94%”；§1.2 的“95% 在排队”补注“排队期间 GPU 满载”。
+- 2026-11-25：**补录 P0-7（prefill/decode 排序）。这一项此前只以 §1.3 的现象存在，
+  从未进过工作项表，是台账的漏项**（pacing / 有界 hold 的实验回退后没有留痕，所以清单里看不见）。
+  复现（`tools/serve/p07_prefill_decode_mix.ps1`，2 张镜像、1 条 1,024-token decode + 1 条 19.5k prefill）：
+
+  | 场景 | prefill | decode |
+  |---|---|---|
+  | 单独 prefill 19.5k | 2.74k tok/s | — |
+  | 单独 decode | — | 104 tok/s |
+  | 并行 5 s 窗口 | 1.04k / 2.45k tok/s | 30.2 → **7.8** tok/s |
+  | prefill 结束后 | — | 73.1 tok/s |
+
+  prefill 几乎不受影响（2.74k vs 单独 2.66k），**decode 被压到 7.8 tok/s（−92%）**。
+  与 11-24 的“prefill 掉到 205 tok/s”合起来看，机制是同一个：一个 pass 只能整块跑
+  decode 或 prefill，另一方整轮等待，谁先占住谁赢。修法不是调 pacing，而是让两类 row
+  进同一个 batch pass（执行层已有多行 batch，缺的是 decode row + prefill row 混合）。
+  这一项与 W3 同级工作量，排期需单独确认。
