@@ -20,7 +20,12 @@ namespace ninfer {
 // `mapped()`.
 class VmmPool {
 public:
-    VmmPool(Device device, std::size_t capacity_bytes, std::size_t segment_bytes);
+    // `capacity_bytes` is the address-space reservation and the growth ceiling; `mapped_bytes` is
+    // how much of it starts backed by physical memory (default: all of it). A pool that will be
+    // grown later should pass the live size here: reserving gigabytes of address space and mapping
+    // them in one go is what turns a "growth ceiling" into an out-of-memory at startup.
+    VmmPool(Device device, std::size_t capacity_bytes, std::size_t segment_bytes,
+            std::size_t mapped_bytes = static_cast<std::size_t>(-1));
     ~VmmPool();
 
     VmmPool(const VmmPool&)            = delete;

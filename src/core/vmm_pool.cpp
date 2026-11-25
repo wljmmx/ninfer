@@ -35,7 +35,8 @@ void* as_opaque(CUmemGenericAllocationHandle handle) {
 
 } // namespace
 
-VmmPool::VmmPool(Device device, std::size_t capacity_bytes, std::size_t segment_bytes)
+VmmPool::VmmPool(Device device, std::size_t capacity_bytes, std::size_t segment_bytes,
+                 std::size_t mapped_bytes)
     : device_(device), segment_(segment_bytes) {
     if (capacity_bytes == 0 || segment_bytes == 0) {
         throw std::invalid_argument("vmm_pool requires a nonzero capacity and segment");
@@ -67,8 +68,13 @@ VmmPool::VmmPool(Device device, std::size_t capacity_bytes, std::size_t segment_
           "cuMemAddressReserve");
 
     handles_.assign(capacity_ / segment_, nullptr);
-    map_range(0, capacity_);
-    mapped_ = capacity_;
+    // Map only what the caller asked for; the rest of the reservation stays address space until
+    // acquire() backs it. Rounding down keeps `mapped()` a whole number of segments.
+    const std::size_t initial =
+        mapped_bytes >= capacity_bytes ? capacity_bytes
+                                       : mapped_bytes / segment_ * segment_;
+    if (initial != 0) { map_range(0, initial); }
+    mapped_ = initial;
 }
 
 VmmPool::~VmmPool() { destroy(); }

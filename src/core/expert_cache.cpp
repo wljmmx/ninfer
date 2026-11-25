@@ -339,7 +339,16 @@ std::vector<std::uint64_t> bank_generation;
                                           req.config.capacity_limit_bytes);
         const auto reserved = static_cast<std::size_t>(
             (limit_bytes + kSegmentBytes - 1) / kSegmentBytes * kSegmentBytes);
-        pool = std::make_unique<VmmPool>(Device::cuda(ordinal), reserved, kSegmentBytes);
+        // port (sm_89): the reservation is address space, the growth ceiling is not memory. Reserve
+        // the ceiling and back only the live capacity; resize() acquires the rest when the
+        // controller actually grows the pool. Mapping the whole ceiling is what killed the 115 GB
+        // Qwen4Exp artifact: a 17.5 GiB pool plus 3.2 GiB of dense weights plus KV died in
+        // cuMemCreate while the weights were still on the card.
+        const auto live_target = static_cast<std::size_t>(std::min<std::uint64_t>(
+            reserved, align_up(std::max<std::uint64_t>(req.config.capacity_bytes, kSegmentBytes),
+                               kSegmentBytes)));
+        pool = std::make_unique<VmmPool>(Device::cuda(ordinal), reserved, kSegmentBytes,
+                                         live_target);
         slot_of.resize(banks.size());
         resident_count.assign(banks.size(), 0);
         ring_slots.resize(banks.size());
