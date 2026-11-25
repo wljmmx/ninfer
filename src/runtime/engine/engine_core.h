@@ -4302,6 +4302,10 @@ private:
                                  tx_open_kind, tx_age_ms,
                                  static_cast<unsigned long long>(tx_opens),
                                  static_cast<unsigned long long>(tx_replaces));
+                    double tx_phases[8]{};
+                    instance_.program->context_transaction_phases(tx_phases);
+                    std::fprintf(stderr, "[tx] ph=[%.0f %.0f %.0f %.0f]ms\n", tx_phases[0],
+                                 tx_phases[1], tx_phases[2], tx_phases[3]);
                 }
                 bool hold_prefill = false;
                 if (prefill_hold_active()) {

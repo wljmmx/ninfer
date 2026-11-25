@@ -73,7 +73,7 @@
 |---|---|---|---|---|
 | P0-1 KV 句柄失效 | 已完成 | 日志里 2 条 `500 stale handle` 打崩了后续全部请求 | `tools/serve/replay_burst.ps1`：同形状 4 并发 × 23,090 token + 54 tools | 4/4 返回 200，0×500、0×503 |
 | P0-2 失败后不恢复 | 已完成 | 一次 KV 错误后 admission 永久拒绝 | 同一脚本的 follow-up：burst 之后立刻发一条小请求 | 200，468 ms 墙钟（引擎内 TTFT 117 ms） |
-| P0-3 预填充车道 | 根因已定位：单次 Bind 事务持锁 6.6 s | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) | waiting 2`，4 条 23k 请求分两波 | 事务开启状态探针（`[tx] open=<kind> age=<ms> opens=<n> replaces=<n>`）在一轮 burst 里给出：`replaces=0`（不存在替换/泄漏）、`opens≈380`（每轮 prefill chunk 都开一次 Capture）、以及 **`open=0 age=6635ms`——一次 Bind 事务持续 6.6 秒**。Bind 在事务里做完整个 prompt 的 KV 页预留（361 页 × 4 lane 量级）、147 MiB 状态镜像与转移；期间所有其它绑定被拒，于是两条 lane 各花 ~6.6 s 绑定、再一起 prefill，正好对应 17–19 s 的 TTFT 与“恒为 2 条”。修法有两个方向：(a) 把 KV 预留从绑定事务里挪到按 chunk 增量申请；(b) 允许不同 lane 并发绑定（地址空间不冲突时）。两者都动 KV 绑定这条最敏感的路径，需单独一轮带门禁 | 4 条 23k 并发 TTFT ≤10 s，且 decode 不劣化 >10% |
+| P0-3 预填充车道 | 重新定性：崩溃修复后事务不再是限制，剩调度策略 | `--max-concurrency 4` 时 `throughput` 稳定报 `running 2 (prefill 2) \| waiting 2`，4 条 23k 请求分两波 | 崩溃修复后复测：`[tx] bind n=5 avg=4.1 max=8.4`、`ph=[0 0 1 0]ms`、`open=0 age=2ms`——**绑定只要 4 ms，之前的 6.6 s 是崩溃途中留下的假象**。但 `running 2` 依旧：两条真做 prefill（各 2.66k tok/s），另两条 `queue 18.4s` 后命中 `cache 23,083 (100%)`，`engine-wall` 仅 69–201 ms。限制在调度器一次放行的 prefill 车道数（`prefill_hold_active()` / merge 窗口），不是事务、不是 KV、不是显存 | 4 条 23k 并发 TTFT ≤10 s；先把放行策略改成可配并实测 |
 | P0-4 prepare 61.5 s | 未复现 | 昨天 req#2 的 prepare 是 61.5 s | 本轮 4 条同规模请求的 prepare 为 19.6–204 ms | 保持观察；若再现再拆段 |
 | P0-5 前缀缓存 0% | 已撤销（前提不成立） | 昨天四条成功请求 `cache 0 (0.0%)` | 昨天的启动日志实际是 `checkpoint cache | attached`（不是 off）；四条请求是 72/14/3/11 条消息的四段不同对话，本就没有可复用前缀。今天我用四条**完全相同**的 prompt 回放，才出现 `cache 23,083 (100.0%, checkpoint)`。另：`checkpoint cache` 指 LMCache 外部缓存，由 `NINFER_LMCACHE_RESTORE` 决定，不是 CLI 参数，前台面板不可见 | 无缺陷可修 |
 | P0-6 KV 预留按实际输出 | 已关闭（假设不成立） | 疑 `--default-max-tokens 32768` 按最大输出预留导致并发下降 | 同一 burst 跑 `-MaxTokens 64` 与 `-MaxTokens 0`（服务端默认 32768）两组：19.3/19.1/20.9/19.0 s 对 19.1/19.6/20.6/19.0 s，无差异 | KV 预留不是本轮 TTFT 的主因；问题在 P0-3 的车道数 |
@@ -178,3 +178,7 @@ src/core/device.cu:260: CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_))
   期间所有其它绑定被拒。两条 lane 各绑一次（≈13 s）再一起 prefill，正好是 17–19 s 的 TTFT。
   修法：把 KV 预留移出事务（按 chunk 增量申请），或允许不同 lane 并发绑定。
 
+- 2026-11-25：崩溃修复后复测，P0-3 的 6.6 s 被证明是**崩溃途中的假象**：`[tx] bind n=5 avg=4.1 max=8.4`、
+  `ph=[0 0 1 0]ms`、`open=0 age=2ms`。真正的原因是调度器一次只放行 2 条 prefill：两条跑满 2.66k tok/s，
+  另两条 queue 18.4 s 后靠 checkpoint 命中在 69–201 ms 内完成。P0-3 改为“放行策略可配并实测”，
+  不再动 KV 绑定事务。

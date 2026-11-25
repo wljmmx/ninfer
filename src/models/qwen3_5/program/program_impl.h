@@ -459,8 +459,23 @@ public:
         // closes) and it also resets the span, so the pair has to be counted separately.
         if (context_transaction_) { ++transaction_replaces_; }
         ++transaction_opens_;
-        transaction_opened_ = std::chrono::steady_clock::now();
-        transaction_kind_   = static_cast<int>(kind);
+        transaction_opened_  = std::chrono::steady_clock::now();
+        transaction_mark_at_ = *transaction_opened_;
+        transaction_kind_    = static_cast<int>(kind);
+    }
+    // Phase i is the span since the previous mark (or since open for i == 1): 1 reservations,
+    // 2 source-ready handshake, 3 state transfer setup, 4 the rest. Milliseconds, accumulated.
+    void note_transaction_mark(int phase) {
+        if (!transaction_opened_) { return; }
+        const auto now = std::chrono::steady_clock::now();
+        if (phase >= 1 && phase <= 8) {
+            transaction_phase_ms_[phase - 1] +=
+                std::chrono::duration<double, std::milli>(now - transaction_mark_at_).count();
+        }
+        transaction_mark_at_ = now;
+    }
+    [[nodiscard]] const double* transaction_phase_ms() const noexcept {
+        return transaction_phase_ms_;
     }
     void note_transaction_close() {
         if (!transaction_opened_) { return; }
@@ -714,6 +729,8 @@ public:
     std::array<TransactionTiming, 4> transaction_timing_{};
     std::uint64_t transaction_opens_    = 0;
     std::uint64_t transaction_replaces_ = 0;
+    double transaction_phase_ms_[8]{};
+    std::chrono::steady_clock::time_point transaction_mark_at_{};
     std::optional<std::chrono::steady_clock::time_point> transaction_opened_;
     int transaction_kind_ = 0;
     CudaCompletionEvent context_source_ready_;

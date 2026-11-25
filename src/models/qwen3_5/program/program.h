@@ -700,6 +700,9 @@ public:
     // What is open right now (kind or -1), how long it has been open, and the open/replace counters.
     void context_transaction_state(int& kind, double& age_ms, std::uint64_t& opens,
                                    std::uint64_t& replaces) const noexcept;
+    // Binding phases, milliseconds accumulated: 0 reservations, 1 source-ready handshake,
+    // 2 state transfer setup.
+    void context_transaction_phases(double out[8]) const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;

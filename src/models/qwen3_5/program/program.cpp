@@ -427,6 +427,11 @@ void Program::context_transaction_state(int& kind, double& age_ms, std::uint64_t
     impl_->transaction_state(kind, age_ms, opens, replaces);
 }
 
+void Program::context_transaction_phases(double out[8]) const noexcept {
+    const auto* phases = impl_->transaction_phase_ms();
+    for (int i = 0; i < 8; ++i) { out[i] = phases[i]; }
+}
+
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
                                          runtime::TokenMaskProvider* m) {
     return impl_->advance_prefill(h, t, m);

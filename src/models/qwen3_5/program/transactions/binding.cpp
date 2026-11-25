@@ -448,8 +448,10 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                                     : state_store->reserve_destination();
         if (!tx.reserved_state) { throw std::logic_error("binding lost its state capacity"); }
         if (tx.tier) { tx.tier->state.reset(); }
+        note_transaction_mark(1);
         context_source_ready_.record(device.stream);
         context_source_ready_.wait(device.transfer_stream);
+        note_transaction_mark(2);
         if (tx.backup_state) {
             auto backup = state_store->reserve_device_to_host(checkpoint(*source).state);
             if (!backup) {
@@ -476,6 +478,7 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             stop_context_transfer_timer(runtime::ContextResourceClass::State);
             ++tx.operations.state_restores;
         }
+        note_transaction_mark(3);
         enqueue_context_transfers(tx);
         request.lifecycle = Lifecycle::Binding;
         return result;
