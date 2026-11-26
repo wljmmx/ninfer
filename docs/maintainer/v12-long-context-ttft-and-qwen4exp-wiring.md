@@ -1237,3 +1237,57 @@ CPU 半边确实排除残差加法（`out_cpu` 是 FP32 项），与设备半边
 与内核输出逐值比较；哪一步先偏就很清楚（norm 还是 A/B 行序）。
 
 回归：`ctest -R 'ggml|moe|mix|gated'` **18/18**。
+
+### 2026-11-26 HC 数值缺陷收敛：两处打包表示缺陷已修，上一轮的“逐层 cos≈0”是探针索引假象
+
+**结论先行**：`cos≈0` 不是模型层的问题，是 **dump 文件命名错位**。`hc_mix_into` 每个 block 被调两次
+（attention 与 MoE 两个 correction），而计数器 `block = (block+1) % 48` 让 block 0 的 attention dump
+与 block N 的 MoE dump 落到同一个文件名；再加上 prefill chunk 与 decode step 共用文件名，比较的两端
+根本不是一个 pass/stage。修法是 `verify_dump_step()`（stem 处归零）把 pass 号、step 号、token 宽度写进
+文件名；同一次 mix 的两个 dump 共用 step。修完后：
+
+| 检查 | 结果 |
+|---|---|
+| stem 的 `normalized`（引擎 dump）vs Python FP64 复算 | **cos 1.0000** |
+| block 0 mix 输出（引擎 dump）vs Python 复算（用同一份 dump 的 normalized） | **cos 0.9999（NEW）/ 1.0000（REF）** |
+| block 0 post-attention（step 1）NEW vs REF | **cos 0.988**（此前误报 −0.12） |
+| step 3..9（block 1..4） | 0.93–0.96 |
+
+**两处真正的打包缺陷（都已修，并对参考工件逐项验证）**
+
+1. **折叠范数**：llama.cpp 把 unit-offset gamma 折成 `1 + w` 落盘，引擎的 `unit_offset` norm 自己再加 1，
+   所以容器必须存 `w = (1+w) − 1`。原转换器直接拷贝 → 每条残差增益按 `2 + w` 生效（约 2 倍）。
+   影响的不止 HC：`attn_q_norm`、`attn_k_norm`、`indexer.{q,k}_norm`、`ple_norm_{key,query,conv}`、
+   `output_hc_norm` 全是折叠值。修完后 **148 条范数与参考工件逐位相同**（含 `std` 到 6 位相同、首元素差恰为 1.000）；
+   `ssm_norm`（`gdn/norm`）**不折叠**，参考件与 GGUF 逐位相同。
+
+2. **GDN value-head 头序**：`linear_num_value_heads(48) != linear_num_key_heads(16)` 时 llama.cpp 把 V 头轴写成
+   **tiled**（`[key_head, head_in_group, head_dim]` 转置），引擎按 **grouped** 索引
+   （`grouped_from_tiled`：`t(g) = (g % per_key)*key_heads + g // per_key`）。原容器直接拷贝 → 每个 GDN 层
+   V 头错位（量级正常、方向全错，正是“输出退化成格式符”的来源）。现在按原生转换器 `_gdn` 同样重排 7 处：
+   `attn_qkv` 的 V 行、`attn_gate`(z) 行、`a|b` control 行、`A_log`、`dt_bias`、conv 的 V 通道、out_proj 的列。
+   - 行重排走整行搬移，**GGML 编码原样保留**；`A_log`(`-exp` 存储→取对数)、conv 转置、out_proj 列重排是值变换；
+   - out_proj 的列重排在量化行内部，保留编码不可能，改为**重编码 `q5_g64_fp16`**（与参考件该张量的格式一致，
+     5 bit 步长细于其来源的 IQ4_XS），并披露这一处。
+   - 验证（vs 参考工件）：`A_log`、`dt_bias`、`a/b` control、conv **完全相等**；q/k/v/z/out_proj 0.981–0.995。
+
+**新的对照工具（`.temp/kv/`，可复用）**：`compare_params.py`（逐参数 cos，0–5 层 120 个参数全过，仅 7 个
+0.91–0.986 属量化差）、`compare_big.py`（输出头/词表/PLE/专家分块比对：`output_head` 0.9975、
+`ple/key|value` 0.9987、`experts/gate|up` 0.937–0.938 属 IQ2 量化级）、`gdn_verify_py.py`（7 处重排逐项）。
+
+**当前状态**：容器 `R:\model\qwen4exp\qwen4exp-iq3_xxs-v4.ninfer`（1177 对象 / 71.73 GiB / 3 卷）可加载、
+可生成、`exit=0`；`--verify` 375 采样（148 折叠范数 + 108 行重排）0 不符。**但文本仍退化**
+（`"**\n\n**"` 类），参考件同 prompt 正常回答。所有可比对的权重都与参考件在量化级一致，故剩余问题在
+**运行期路径**而非打包，优先级：
+
+1. routed expert bank（`[experts*rows, cols]`）的行顺序/专家寻址——小张量扫描只覆盖 ≤6M 元素，专家库未逐块验证；
+2. PLE 表行寻址（hash→row）与 `ple_hash_controls` 的一致性；
+3. QSA/indexer 层（3,7,…,47）的 index 预算与 sparse 分支；
+4. `ninfer-perplexity.exe` 的 PLE 分支（PPL 门禁仍不可用）。
+
+**说明**：本轮探针只改 dump 命名，运行路径无数值改动；上一轮据此得出的“所有层 cos≈0、缺陷在第 0 层一进来
+就偏”**作废**，两处真缺陷分别是范数折叠与 GDN 头序。
+
+回归：`ctest -R 'ggml|moe|mix|gated'` 未复跑（本轮未动算子）。构建：`apps\ninfer.exe` 已重建；
+`tests/runtime/test_resource_manager.cpp` 仍是既有落后桩，全量构建仅该目标失败。
+
