@@ -675,3 +675,17 @@ GGUF 的 `ffn_gate_exps` 是 3D `[512, 640, 2560]`，而 binder 通过 `banked` 
 （`first_row/rows`），或者把 3D 对象拆成 512 个 2D 对象。
 
 三层结构保持不变：专家银行仍然是**一个对象 + 行区间**，由 `ExpertCache` 按驻留策略取用。
+
+**2026-11-26 专家银行与合并张量的形状对齐**：
+
+1. **专家银行 3D→2D**：GGUF 的 `ffn_*_exps` 是 `[512, 640, 2560]`，模型要求
+   `[experts × rows, columns]` = `[327680, 2560]`。GGML 是连续布局，所以这是视图改写（字节不变），
+   与参考工件一致（`weight/000293 [327680, 2560]`）。
+2. **合并张量保持为一个对象**：`attn_qkv`（GDN）与 `attn_q`（full attention）不能拆成独立对象——
+   `GDN control` 和 attention 的行视图都要求**同一 parent**，用元素范围引用。现在 binding 写成
+   `{"parts":[{"object": <merged>, "range":[start*cols, end*cols]}]}`，与参考工件同形。
+
+剩余（当前卡点）：`GDN control: this geometry requires a combined parent`。
+`prepare_gdn_control_proj_weights` 要求 `a_projection`/`b_projection` 连续（`concatenate_rows`），
+即 GGUF 的 `ssm_alpha` + `ssm_beta` 必须合成一个 `[96, 2560]` 对象、用 parts 切两段
+（参考工件正是如此）。转换器需要新增“多来源合并成一个对象”的写入路径。

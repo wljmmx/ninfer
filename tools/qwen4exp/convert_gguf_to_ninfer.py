@@ -150,6 +150,10 @@ def collect(source: Source, component: str) -> list:
         if t.name.endswith("ffn_gate_inp_shexp.weight") and len(shape_c) == 1:
             # The gate vector is a one-row matrix in the model's parameter shape.
             shape_c = [1, shape_c[0]]
+        if len(shape_c) == 3 and "_exps" in t.name:
+            # An expert bank is one [experts x rows, columns] matrix in the model's shape; GGML
+            # stores it as [experts, rows, columns] contiguously, so this is a view, not a copy.
+            shape_c = [shape_c[0] * shape_c[1], shape_c[2]]
         objs.append(Obj(id=f"{component}.{t.name}", kind="tensor", shape=shape_c,
                         fmt=fmt, layout=layout, f32_to_bf16=cast, transpose=transpose,
                         f16_to_bf16=f16_cast,
@@ -521,19 +525,20 @@ def expand_text(objs: list, layer_types: list, ple_layer_id: int = 1) -> tuple:
             layer = int(num)
             full = str(layer_types[layer]).lower() not in ("linear_attention", "gdn", "mamba")
             if rest in MERGED:
+                # The merged tensor stays ONE object: the GDN control and the attention row views
+                # require a single parent and address their slices by element range, exactly as the
+                # reference artifact does. Splitting into separate objects breaks that contract.
                 rows = obj.shape[0]
-                row_bytes = obj.bytes // rows
+                cols = obj.shape[1]
                 start = 0
                 pieces = MERGED[rest]
                 for i, (piece, ratio) in enumerate(pieces):
                     n = rows - start if i == len(pieces) - 1 else int(rows * ratio)
-                    child = Obj(id=f"{obj.id}/{piece}", kind="tensor",
-                                shape=[n, obj.shape[1]], fmt=obj.fmt, layout=obj.layout,
-                                src=obj.src, src_offset=obj.src_offset + start * row_bytes,
-                                bytes=n * row_bytes)
-                    out.append(child)
-                    bindings[f"text/layers/{layer}/{piece}"] = {"object": child.id}
+                    bindings[f"text/layers/{layer}/{piece}"] = {
+                        "parts": [{"object": obj.id,
+                                   "range": [start * cols, (start + n) * cols]}]}
                     start += n
+                out.append(obj)
                 continue
             suffix = dict(COMMON_LAYER, **(FULL_LAYER if full else GDN_LAYER)).get(rest)
             out.append(obj)
