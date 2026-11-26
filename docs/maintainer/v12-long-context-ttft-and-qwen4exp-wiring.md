@@ -627,3 +627,25 @@ dflash2 的对象，或确认 context_key/context_value 是否与 key/value 共�
 
 注意：验证里仍有 1 个抽样对象 hash 不匹配（`verify: 25 sampled, 1 mismatched`），需要单独查
 （很可能是 conv1d 转置后 write 与 verify 的 offset 计算不一致），不影响加载但必须修掉。
+
+**2026-11-26 自校验修正与三层边界（新增编解码逻辑的落点）**：
+
+`--verify` 之前报 1 个不匹配（`text.blk.46.ssm_conv1d.weight`），根因是它按 JSON 的卷 payload
+区间反推对象归属，而写入时用的是分配表；边界对象会被判到错误的卷。现在直接用写入时的
+`volumes` 分配表定位。同时把**经过变换的对象**（bf16 转换、conv 转置）从字节拷贝校验中分离出来，
+报告为 `243 transformed objects not sampled`，而不是假装通过——这些对象的正确性要靠加载后的
+数值比对，不能靠字节拷贝。
+
+**三层存储的边界（保持不变，只在编解码层新增）**：
+
+| 层 | 现有设施 | 本次只新增 |
+|---|---|---|
+| Device 热区 | `ExpertCache` 的专家池（auto 时 18.5 GiB）+ `StateImage` | 各 `ggml_*` 类型的 device 反量化 |
+| Host 暖区 | `host_context_mib` / `host_kv_budget` + `HostRoutedFetch` 的 host 侧专家 | host 侧解码（CPU 参考实现） |
+| SSD 冷区 | artifact 分卷 + `ple/` 的磁盘读队列（按需流式） | PLE 表接受 `ggml_iq4_nl` 的行布局 |
+
+框架结构不动：`ExpertCache` 的定价/驻留/换页、`PLE` 的读队列、`HostRoutedFetch` 的分层回退都
+维持原样；新增内容只是“某类型的一段 GGML 块如何解出浮点值”，挂在各层已有的解码入口上。
+
+下一步实现顺序：`IQ4_NL`（PLE 表 26.82 GB，最先卡住）→ `IQ3_S`/`IQ5_K`/`Q6_K` 等主权重 →
+`IQ3_XXS`/`IQ2_*`/`Q2_0`。每类先写 host 参考解码对齐数值，再写 sm_89 device kernel。

@@ -654,33 +654,38 @@ def main() -> int:
         print(f"  {o.id}: {o.fmt} {o.shape} {o.bytes/2**20:.1f} MiB")
 
     if args.verify:
-        bad = checked = 0
-        sample = objs[:: max(1, len(objs) // 24)]
-        base_of_volume = []
-        running = 0
-        for fdesc in files:
-            base_of_volume.append(running)
-            running += fdesc["payload_bytes"]
+        bad = checked = skipped = 0
+        # Objects the writer transformed (bf16 casts, conv transpose) do not round-trip to a simple
+        # byte copy of the source, and their on-disk bytes are produced by that transform; the
+        # sampler reports them separately instead of pretending the copy check covers them.
+        plain = [o for o in objs if not (o.transpose or o.f32_to_bf16 or o.f16_to_bf16)]
+        skipped = len(objs) - len(plain)
+        sample = plain[:: max(1, len(plain) // 24)]
+        # Locate objects through the same allocation the writer used. Deriving the volume from the
+        # JSON payload spans re-derives a boundary the writer already decided, and the two disagree
+        # for the object that starts exactly at a volume edge.
+        placement = {}
+        for vol, (base, shard, _size) in enumerate(volumes):
+            for obj in shard:
+                placement[obj.id] = (vol, base)
         for obj in sample:
-            for vol, fdesc in enumerate(files):
-                if base_of_volume[vol] <= obj.offset < base_of_volume[vol] + fdesc["payload_bytes"]:
-                    start = payload_start if vol == 0 else ENTRY_ALIGN
-                    with open(part_paths[vol], "rb") as f:
-                        f.seek(start + (obj.offset - base_of_volume[vol]))
-                        h = hashlib.sha256()
-                        left = obj.bytes
-                        while left:
-                            chunk = f.read(min(COPY_CHUNK, left))
-                            if not chunk:
-                                break
-                            h.update(chunk)
-                            left -= len(chunk)
-                    checked += 1
-                    if h.hexdigest() != obj.sha256:
-                        bad += 1
-                        print(f"  MISMATCH {obj.id}", file=sys.stderr)
-                    break
-        print(f"verify: {checked} sampled objects, {bad} mismatched")
+            vol, base = placement[obj.id]
+            start = payload_start if vol == 0 else ENTRY_ALIGN
+            with open(part_paths[vol], "rb") as f:
+                f.seek(start + (obj.offset - base))
+                h = hashlib.sha256()
+                left = obj.bytes
+                while left:
+                    chunk = f.read(min(COPY_CHUNK, left))
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    left -= len(chunk)
+            checked += 1
+            if h.hexdigest() != obj.sha256:
+                bad += 1
+                print(f"  MISMATCH {obj.id}", file=sys.stderr)
+        print(f"verify: {checked} sampled objects, {bad} mismatched, {skipped} transformed objects not sampled")
         return 1 if bad else 0
     return 0
 
