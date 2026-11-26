@@ -892,3 +892,31 @@ MoE 最难的部分是“三银行寻址 + 路由聚合”的正确性，先把�
 仍未接线到 `ops::routed_swiglu`：那需要 `ExpertImplementation::GgmlBlock` 的 `Plan`（token 切片、
 allocation boundaries）、`ExpertSubsetKind` 四种子集的语义、共享专家项与 `MoeEpilogue`，
 以及 `ShapePolicy` 的一条 h2560_i640_e512_k10 条目。内核核心既然已对拍，剩下的就是把这层壳接上。
+
+**2026-11-26 崩溃性质定性：收尾路径上的堆损坏（未修，已排除两个误解）**：
+
+用两次真实验证把“失败后静默崩溃”逼到了可定性：
+
+1. 在 `construct_model` 的 `catch` 里 `throw;` 之前加一条 `fprintf(stderr, ...)` + `fflush`，
+   程序立刻**变成干净退出**：`exit=1`，日志依次是
+   `warning: startup attempt failed | finalizing target` → `error: routed SwiGLU: unsupported
+   Qwen4Exp weight profile`，连跑 3 次稳定。把 `engine.cpp` 的改动回退、只留这一条 fprintf，仍然稳定。
+2. 只把 `engine.cpp` 侧换成 `try/catch` 打印（不加 model_instance 的 fprintf）也曾稳定，但
+   **单靠一条 fprintf 就能改变行为**，说明问题不在“哪个 throw 点”，而在**异常展开期间**的
+   内存状态：一个对象的析构读到了已释放/被复用的内存，是否崩取决于此前的分配序列。
+   这正是 0xC0000005 与 0xC0000374 在同一次构建里交替出现的原因。
+
+因此**没有提交那条 fprintf**（它是掩盖而非修复，符合“拒绝 workaround”的纪律）。定性结论：
+崩溃在 `construct_model` 之上/之下的展开路径（`ModelInstance` 及其缓存成员的析构最可疑，
+它是为 streamed tier 建好后、在规划阶段失败被拆掉的对象）。
+
+修法优先级（下次按此顺序）：
+
+1. **最彻底**：把 MoE 接完（见上节），这条失败路径不再被触发；
+2. 若要先修体验：让 `construct_model_once` 在抛异常时**先拆掉已挂载的 expert/context cache**
+   （显式 detach），再让异常继续；或在建 `ModelInstance` **之前**做一次“编码可运行性”预检
+   （此时没有重对象存活，展开不会碰已释放的缓存）；
+3. 诊断工具：MSVC debug heap（`_CrtSetDbgFlag` + `_CRTDBG_CHECK_ALWAYS_DF`）或 Application Verifier
+   跑一次，可直接定位释放后使用的分配点。
+
+模型加载仍停在 `routed SwiGLU: unsupported Qwen4Exp weight profile`（专家的 ggml 编码）。
