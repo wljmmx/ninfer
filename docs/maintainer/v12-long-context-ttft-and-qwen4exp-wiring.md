@@ -738,3 +738,41 @@ exit = 0xC0000005
 
 下一步：按台账既定顺序写 host 参考解码（对齐 gguf-py `dequantize`）→ sm_89 device 解码 →
 routed MoE 新增 GGML profile + Linear 的 `ggml_*` 分发，最后才是 decode 速率。
+
+**2026-11-26 两类解码器落地（host 参考 + sm_89 device），11/11 与 gguf-py 逐值一致**：
+
+按既定顺序先写 **host 参考**、再写 **device**，两者分开手写（单一实现只能证明它与自己一致），
+用真实块对拍：
+
+- `src/core/ggml_codebook.inc`：8 张码表（`kmask_iq2xs`、`ksigns_iq2xs`、`iq2xxs_grid`、
+  `iq2xs_grid`、`iq2s_grid`、`iq3xxs_grid`、`iq3s_grid`、`kvalues_iq4nl`）由
+  `tools/qwen4exp/emit_ggml_codebooks.py` 从 **llama.cpp 自己的 `ggml-common.h`** 解析生成，
+  不手工转录。同一份 .inc 以宏方式实例化两次：host（`inline constexpr`）与 device
+  （`static __device__ const`），分处 `ninfer::core` 与 `ninfer::ops::detail::ggml` 两个命名空间，
+  所以一个 TU 可以同时持有两套表。
+- `src/core/ggml_dequant.h`：11 种编码的 host 标量解码（Q4_K/Q5_K/Q6_K/Q2_0/IQ4_NL/IQ4_XS/
+  IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S），外加按 `decode_ggml(data, elements, block, type_bytes, fn, out)`
+  的整块遍历入口。
+- `src/ops/linear/ggml/ggml_block_decode.cuh`：device 同构实现，`__device__ __forceinline__`，
+  码表在 device 常量内存里。
+- `tests/core/test_ggml_dequant.cpp` + `tests/core/ggml_dequant_fixture.h`：fixture 由
+  `tools/qwen4exp/emit_ggml_dequant_fixture.py` 从**真实 GGUF 张量**取每种编码的前 2 个块，
+  期望值由 **gguf-py 独立实现**给出（Q4_K←`blk.2.ffn_gate_shexp`、Q5_K←`output`、
+  Q6_K←`blk.1.attn_gate`、Q2_0←`blk.1.ffn_down_exps`、IQ4_NL←`blk.0.ffn_down_exps`、
+  IQ4_XS←`blk.0.attn_qkv`、IQ2_XXS←`blk.1.ffn_gate_exps`、IQ2_XS←`blk.0.ffn_gate_exps`、
+  IQ2_S←`blk.12.ffn_gate_exps`、IQ3_XXS←`blk.35.ffn_gate_exps`、IQ3_S←`token_embd`）。
+- `tests/ops/test_ggml_block_decode.cu`：同一批块在 GPU 上解码，与 host 结果比对。
+
+实测：`ninfer_ggml_dequant_test` 11/11 通过；`ninfer_ggml_block_decode_test` 11/11 通过
+（`ctest` 各 0.01 s / 0.13 s）。过程中抓到一个**真 bug**：IQ3_S 的高位平面按 32 值组推进，
+每对（64 值）消耗 2 字节，首版漏了每对的 2 字节偏移，第 166 号元素起全错；对拍直接定位到元素下标。
+另外 device 测试暴露了一个流序问题：`DeviceBuffer::copy_to_host` 走 legacy default stream，
+与 `DeviceContext` 的 non-blocking stream 不排序，必须显式 `cudaStreamSynchronize` 再拷回——
+否则内核没跑完就取结果（表现为“部分元素为 0”）。
+
+边界：这两个解码器**尚未接入任何计算算子**。Linear / routed MoE 仍然没有 `ggml_*` 分发
+（台账上一节记录的前沿：`linear_workspace_capacity_bytes(ggml_iq3_s, …)` 无路径），
+所以模型仍不能运行、仍无 tok/s 数据。下一步是把 device 解码挂到两条消费路径上：
+decode 阶段用 warp-per-row 的 GEMV（块内联解码，权重保持编码态，不落 BF16 副本），
+prefill 阶段把 K 瓦片解到 shared 后接现有 BF16 MMA；MoE 侧需要新增 GGML profile
+（`routed SwiGLU` 目前只认 Q4_G64/Q5_G64/Q6_G64、NVFP4、FP8 三种 profile）。

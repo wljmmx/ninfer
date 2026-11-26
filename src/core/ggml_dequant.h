@@ -21,7 +21,11 @@ namespace ninfer::core {
 
 // The codebooks are included *inside* the namespace so they stay out of the global one; the file is
 // generated (tools/qwen4exp/emit_ggml_codebooks.py) and carries no namespace of its own.
+#define NINFER_GGML_TABLE(type, name, count) inline constexpr type name[count] = {
+#define NINFER_GGML_TABLE_END() };
 #include "core/ggml_codebook.inc"
+#undef NINFER_GGML_TABLE
+#undef NINFER_GGML_TABLE_END
 
 // GGML's super-block size for the K-quants and the i-quants.
 inline constexpr std::size_t kGgmlQkK   = 256;

@@ -34,6 +34,12 @@ ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
 
+# The Device GGML block decoders against the Host reference (itself pinned to gguf-py on the same
+# real blocks), so the two written-out implementations have to agree.
+ninfer_add_op_test(ninfer_ggml_block_decode_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_block_decode.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
