@@ -983,3 +983,29 @@ PLE 程序初始化回归**，与本次 ggml 工作无关。
 `capacity - consumed`）。`ProgramImpl` 构造体（`program_impl.cpp:106` 起）与 PLE 窗口/前缀标识
 （`prefix_identity.cpp` 的 `resize(tokens)`）是首选两处；建议在构造函数里按段打印 count 与差值符号，
 一次构建即可定位。
+
+**2026-11-26 PLE 回归再收窄一层：失败在 `PleTextStage` 构造内部**：
+
+用 `NINFER_PLE_TIMING=1` 跑 v5_e2：**没有**出现 `[ple-t] stage built` 这一行，说明失败发生在
+`make_ple_stage()` 调用内、`PleTextStage` 尚未构造完成：
+
+```
+[ple] table text/layers/1/ple/table: encoding q4_g64_fp16/row_split_k128_v1, 320001536 rows x 160, supported
+warning: startup attempt failed | initializing runtime | 501 ms
+error: vector too long
+```
+
+即调用链 `make_ple_stage` → `PleTextStage` 构造（`ple_layer.cpp:382`）→ `PleGpuPreparation`
+（`ple/gpu.cpp:33`，`slots`/`outputs` 由 `options.windows` 定长）→ `PlePrepareService` →
+`RowReader`（`row_reader.cpp:148`，由 `owners/rows_per_owner/io_depth/cache_bytes` 定长，
+另有 `targets/rows/fragments/pages` 由 `capacity()` 夹取）。
+
+下一步只需在 `RowReader::RowReader` 前打印那四个参数，并在 `PleTextStage` 构造的每个成员
+（`layers_`、`max_positions` 相关缓冲）前后各打一条，即可定位是哪个容器拿到了非法的
+`size_t`（`length_error` 必然是“负数转 size_t”或“定位计数溢出”）。
+
+过程中的一次失误已纠正并留档：给 `RowReader` 加探针时，`edit` 的锚点误匹配到
+`~RowReader() = default;` / `RowReader::begin(...)` 两处定义，导致链接失败；发现后按原样恢复，
+并把整个文件 `git checkout` 回 HEAD，工作区保持干净（当前行为仍是上面日志所示的 `vector too long`）。
+期间一度看到的 `error: text: PLE requires the request's EOS id` 在干净重建后**不可复现**，
+按“构建中间态产物”记录，不计为第二个缺陷。
