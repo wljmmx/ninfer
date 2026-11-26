@@ -1078,3 +1078,39 @@ error: text/layers/0 prefill columns=51: routed_swiglu CPU: invalid weight geome
 （子集判据、BF16 中间舍入、系数尾）。
 
 回归：`ctest -R 'ggml|moe'` **13/13** 通过（含 `ninfer_ggml_experts_test`、`ninfer_moe_qwen4exp_split_test`）。
+
+**2026-11-26 端到端跑通：`qwen4exp-iq3_xxs.ninfer` 能生成 token（exit=0）**：
+
+补齐 CPU 半边后，模型完整跑完一次请求：
+
+```
+engine ready | Qwen3.8-Flash-Next GSQ-RCO | total 4.6s | weights 3.83 GiB
+[ple] table text/layers/1/ple/table: encoding ggml_iq4_nl/ggml_block_v1, 320001536 rows x 160, supported
+[host] arena mapped bytes=20584595456 ... device_accessible=1
+summary     prefill speed             2.3 tok/s
+summary     decode speed              0.9 tok/s
+summary     throughput (overall)      0.1 tok/s
+exit=0
+```
+
+CPU 半边新增 `ops/moe/routed_swiglu/cpu/ggml.cpp`：`GgmlLayer<TopK,I,H>` 模板给出
+`capacity`/`launch`，逐专家用 `WeightBankView::plane(Codes, e)` 取编码行、用
+`core/ggml_dequant.h` 的 host 解码器解出，SiLU 乘积按 BF16 舍入（与设备半边一致），
+系数尾累加进 FP32 输出。dispatch 侧三处配合：
+
+1. `cpu/dispatch.cpp`：`shape_dispatch` 增加 ggml 条目（H=2560/I=640/E=512/K=10、layout=GgmlBlock）；
+2. `cpu/entry.cpp` 的 `bank()` 增加 ggml 分支：只校验 region/format/行宽（GGML 没有独立尺度平面、
+   也没有 group，不能套用 bit-packed 家族的 `group_size==64` 那组条件）；
+3. `cpu/entry.cpp` 的 split 分派：`split_form && !is_ggml_block(gate_up_type)` 才走 `split_launch`
+   （那是 Q4/Q6 位宽专用内核，`code_bits()` 会拒绝其他格式），ggml 走 shape policy，
+   并就地校验 gate/up/down 三个独立银行。
+
+**当前性能是未调的标量实现**（设备侧 `lane_dot` 逐行、CPU 侧纯标量），所以 2.3 / 0.9 tok/s
+只说明“正确性通路成立”，不代表路线上限。目标仍是 strata 单卡 3090 的 85–97 tok/s（对 4090 是下限）。
+
+回归：`ctest -R 'ggml|moe'` **13/13** 通过。
+
+下一步顺序：① 先用**小段文本做数值抽查**（PPL 全量语料在 0.9 tok/s 下要跑十几小时，不现实），
+确认与参考工件的输出方向一致；② 设备侧 decode 换成 **Q8_1 + DP4A**（strata/llama.cpp 的 `vec_dot`），
+prefill 换成“K 瓦片解码进 shared + BF16 MMA”；③ CPU 半边向量化（AVX2/AVX512-BF16）；
+④ 共享专家（`ffn_gate_shexp|ffn_up_shexp` → `[2I,H]` 合并 + dense SwiGLU 的 ggml 分支）。
