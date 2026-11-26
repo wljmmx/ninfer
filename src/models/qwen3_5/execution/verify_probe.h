@@ -67,4 +67,39 @@ inline void verify_column_probe(const char* label, const Tensor& tensor, std::in
     std::fflush(stderr);
 }
 
+// Dumps one tensor's columns to <NINFER_VERIFY_DUMP>/<layer>-<label>.bin.
+//
+// The column probe answers "did this collapse"; this answers "is this the number it should be", which
+// needs the values off the Device. Diagnostic only, and only when the variable names a directory: one
+// transfer per column and one file per (layer, label), never inside a captured pass.
+inline void verify_dump(const char* label, const Tensor& tensor, std::int32_t elements,
+                        std::int32_t column_stride_bytes, std::int32_t width, int layer,
+                        cudaStream_t stream) {
+    static const char* const dir = std::getenv("NINFER_VERIFY_DUMP");
+    if (dir == nullptr || *dir == '\0' || width <= 0 || elements <= 0 || tensor.data == nullptr) {
+        return;
+    }
+    const std::size_t element_bytes = tensor.dtype == DType::BF16 ? 2 : 4;
+    std::vector<std::uint8_t> host(static_cast<std::size_t>(elements) * element_bytes *
+                                   static_cast<std::size_t>(width));
+    for (std::int32_t column = 0; column < width; ++column) {
+        const auto status = core::copy_bytes_status(
+            host.data() + static_cast<std::size_t>(column) * elements * element_bytes,
+            static_cast<const std::uint8_t*>(tensor.data) +
+                static_cast<std::size_t>(column) * static_cast<std::size_t>(column_stride_bytes),
+            static_cast<std::size_t>(elements) * element_bytes, core::TransferDirection::DeviceToHost,
+            stream);
+        if (status != cudaSuccess) { return; }
+    }
+    const std::string path =
+        std::string(dir) + "/" + std::to_string(layer) + "-" + label + ".bin";
+    if (FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(host.data(), 1, host.size(), file);
+        std::fclose(file);
+        std::fprintf(stderr, "[dump] %s elements=%d width=%d bytes=%zu\n", path.c_str(), elements,
+                     width, host.size());
+        std::fflush(stderr);
+    }
+}
+
 } // namespace ninfer::models::qwen3_5::execution

@@ -29,6 +29,10 @@ void TextContext::hc_stem(Tensor& embedding, std::int32_t tokens) {
     }
     const auto roots = workspace::text_hc_roots(work_, config_, tokens);
     hc_              = roots;
+    // The four-stream stem is the first place the artifact's embedding meets the model, so a dump
+    // here is the cheapest check of the gather (ids, dtype, row width) against the GGUF's own decode.
+    verify_dump("stem-embedding", embedding, dimension(config_.hidden_size),
+                static_cast<std::int32_t>(embedding.nb[1]), tokens, 0, ctx_.stream);
     const auto width = dimension(config_.hidden_size), streams = dimension(hc.count);
     Tensor weight    = parameters_.text.layers.front().input_norm.view({width, streams});
     Tensor residual  = hc_.residual.view({width, streams, tokens});
@@ -46,6 +50,12 @@ void TextContext::hc_mix_into(const HcParameters& weights, std::int32_t tokens) 
     nan_probe_tensor("hc-normed", hc_.normalized, 400, ctx_.stream);
     hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
            ctx_.execution_view());
+    {
+        static thread_local int block = 0;
+        verify_dump("hc-input", hc_.input, dimension(config_.hidden_size),
+                    static_cast<std::int32_t>(hc_.input.nb[1]), tokens, block, ctx_.stream);
+        block = (block + 1) % 48;
+    }
     nan_probe_tensor("hc-mix-out", hc_.input, 200, ctx_.stream);
 }
 
@@ -60,6 +70,15 @@ void TextContext::hc_combine(const Tensor& product, const Tensor& norm_weight,
     // The residual aliases itself in place, which the Op admits exactly.
     ops::hc_combine_norm(residual, product, hc_.injection, weight, config_.rms_norm_eps, residual,
                          normed, ctx_.execution_view());
+    // `normed` is the next block's input, so a per-layer dump of it walks the whole stack: the first
+    // layer whose column cosine against a known-good artifact collapses is where a numeric defect
+    // starts, which no single-op test can say.
+    {
+        static thread_local int block = 0;
+        verify_dump("layer-normed", normed, dimension(config_.hidden_size),
+                    static_cast<std::int32_t>(normed.nb[1]), tokens, block, ctx_.stream);
+        block = (block + 1) % 48;
+    }
 }
 
 void TextContext::hc_tap_publish(std::size_t layer, std::int32_t tokens) {
