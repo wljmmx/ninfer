@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cuda_bf16.h>
+
 namespace ninfer::ops::detail::ggml {
 
 #define NINFER_GGML_TABLE(type, name, count) static __device__ const type name[count] = {
@@ -320,6 +322,43 @@ __device__ inline void decode_iq3_s(const std::uint8_t* block, float* out) {
             s += 4;
         }
     }
+}
+
+// One 32-value group of one block, written as BF16 values. The whole block is decoded first and the
+// group sliced out: a gathered row touches every block once, so the redundancy across a block's eight
+// groups costs less than carrying a second, group-only transcription of all eleven decoders would.
+inline constexpr int kMaxBlockElements = 256;
+
+template <int TYPE>
+__device__ __forceinline__ void decode_group(const std::uint8_t* block, int group_in_block,
+                                             __nv_bfloat16* out) {
+    float values[kMaxBlockElements];
+    if constexpr (TYPE == 0) {
+        decode_q4_k(block, values);
+    } else if constexpr (TYPE == 1) {
+        decode_q5_k(block, values);
+    } else if constexpr (TYPE == 2) {
+        decode_q6_k(block, values);
+    } else if constexpr (TYPE == 3) {
+        decode_q2_0(block, values);
+    } else if constexpr (TYPE == 4) {
+        decode_iq4_nl(block, values);
+    } else if constexpr (TYPE == 5) {
+        decode_iq4_xs(block, values);
+    } else if constexpr (TYPE == 6) {
+        decode_iq2_xxs(block, values);
+    } else if constexpr (TYPE == 7) {
+        decode_iq2_xs(block, values);
+    } else if constexpr (TYPE == 8) {
+        decode_iq2_s(block, values);
+    } else if constexpr (TYPE == 9) {
+        decode_iq3_xxs(block, values);
+    } else if constexpr (TYPE == 10) {
+        decode_iq3_s(block, values);
+    }
+    const float* src = values + 32 * group_in_block;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) out[j] = __float2bfloat16(src[j]);
 }
 
 } // namespace ninfer::ops::detail::ggml

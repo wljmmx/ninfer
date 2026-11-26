@@ -830,3 +830,32 @@ DP4A 版作为后续替换（同接缝、同数值基准）。
 因此上面第 1/2 项的缺口目前看不到参数名。修法：把“编码是否有计算路径”的校验放在进入
 layout builder **之前**（一次遍历所有将被算子消费的权重），或让 `WorkspaceLayoutBuilder::scope()`
 的析构在异常路径上不触碰已被移走的状态。
+
+**2026-11-26 词表取行打通；MoE 的结构与失败路径核实**：
+
+`embedding()` 之前只认 BF16/Q6/Q8/FP8，本工件的 `token_embd` 是 IQ3_S，所以取行也不通。现在：
+
+- `src/ops/linear/ggml/ggml_embedding.cu`：一个 CTA 一个输出行、一线程一个 32 值组，
+  `decode_group<TYPE>` 把该块整块解出后切出本组并写 BF16（**不落全表反量化副本**）；
+- `wrapper/embedding.cpp` 增加 11 种 `ggml_*` 分支；
+- `tests/ops/test_ggml_embedding.cu`：4 行表、id={2,0,3}、每行载荷按行号旋转（错行偏移不可能通过），
+  与 host 解码逐值比对 —— **11/11 通过**。
+
+MoE 现状（核实，非推测）：`RoutedSwiGLUProfile` 的能力由 `shape_dispatch` 的两个实现族决定
+（`ExpertImplementation::GroupwiseInt` 与 `BlockScaled`），策略表 7 条
+（`q4_q5/q4_q6/q8 × h2048_i512_e256_k8`、`q4_q5/q4_q6/nvfp4/fp8 × h2560_i640_e512_k10`），
+`validate_expert_profile` 只放行 Q4|Q5、Q5|Q6（分组）或 NVFP4/FP8（块缩放）或 Q8/Q8。
+本工件专家是 IQ2_XS/IQ2_XXS/IQ3_S/IQ2_S/IQ3_XXS（gate/up）+ IQ4_NL/Q2_0（down），
+所以需要**第三种实现**（`ExpertImplementation::GgmlBlock`）：自带 `Plan`（token 切片、
+allocation boundaries）、token/grouped 两套 SwiGLU kernel（专家行内联解码）、
+以及 `ShapePolicy` 的一条 h2560_i640_e512_k10 条目。这是剩余工作量最大的一块。
+
+**失败路径的两个实测结论**（为下一次省时间）：
+
+1. `WorkspaceLayoutBuilder::Scope::~Scope()` 只是 `cursor_ = saved_cursor_`（`layout.cpp:92`），
+   **不是**异常期间崩溃的原因；
+2. 崩溃发生在 `warning: startup attempt failed | finalizing target` **之后**，即引擎的“失败后重试/收尾”
+   路径；把拒绝提前到 `Parameters` 构造里（`routed_moe()`）则崩溃更早出现（连 PLE 行都不打印），
+   说明该上下文的异常同样会走到这条不稳定的收尾路径。退出码在 0xC0000005 与 0xC0000374
+   之间变化，符合“收尾路径上的内存错误”而不是单一 throw 点。
+   因此**下一步应先修这条失败路径**（或让 MoE 一次性支持到位），否则每个不支持的编码都只表现为崩溃。

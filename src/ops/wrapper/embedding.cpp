@@ -4,6 +4,7 @@
 #include "ops/common/numeric/math.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
+#include "ops/linear/ggml/ggml_embedding.h"
 #include "core/weight_view.h"
 
 #include <cstdint>
@@ -231,6 +232,23 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_fp8_launch(ids, table, out, stream);
+        break;
+    // GGML block tables: the gather decodes the selected rows' blocks, so the table keeps its own
+    // encoding (see ops/linear/ggml/ggml_embedding.cu).
+    case QType::GGML_Q4_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q6_K:
+    case QType::GGML_Q2_0:
+    case QType::GGML_IQ4_NL:
+    case QType::GGML_IQ4_XS:
+    case QType::GGML_IQ2_XXS:
+    case QType::GGML_IQ2_XS:
+    case QType::GGML_IQ2_S:
+    case QType::GGML_IQ3_XXS:
+    case QType::GGML_IQ3_S:
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::ggml::launch_embedding_gather(ids, table, out, stream);
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

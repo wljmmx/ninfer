@@ -46,6 +46,11 @@ ninfer_add_op_test(ninfer_ggml_linear_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cu"
   LIBRARIES ninfer_ops)
 
+# The GGML embedding gather: a decoded table row, checked against the Host decode of the same bytes.
+ninfer_add_op_test(ninfer_ggml_embedding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_embedding.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
