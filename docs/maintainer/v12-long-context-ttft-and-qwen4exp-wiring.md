@@ -506,3 +506,29 @@ R 盘同时有对照件：`Qwen3.8-Flash-Next-DFlash2-strata1-tuned-BF16.gguf`�
 4. 即容器 framing、对象范围、13 个格式名、config、resources 全部被 reader/binder 接受，
    只剩 **bindings**：现有工件 1,874 条（含 `parts` 把多个小参数切在同一对象的不同 range），
    需要按 binder 的逻辑参数表把 GGUF 张量名映射过去。这是下一项，不是容器问题。
+
+**2026-11-26 bindings 映射已确定（未实现）**：GGUF 张量名与逻辑参数名的对应关系已按第 0 层
+逐项核对（该层是 GDN 层，26 个 GGUF 张量对应 27 条逻辑参数）。结论：
+
+| GGUF | 逻辑 | 备注 |
+|---|---|---|
+| `token_embd.weight` | `text/token_embedding` | 1:1 |
+| `output.weight` | `text/output_head` | 1:1 |
+| `output_hc_{norm,down,up}.weight` | `text/final_hc/{norm,down,up}` | 1:1 |
+| `blk.N.hc_attn_{norm,down,up,inject}` | `layers/N/attention_hc/*` | 1:1 |
+| `blk.N.hc_ffn_{norm,down,up,inject}` | `layers/N/moe_hc/*` | 1:1 |
+| `blk.N.ssm_{a,alpha,beta,conv1d,dt.bias,norm,out}` | `layers/N/gdn/{a_log,a_projection,b_projection,convolution,dt_bias,norm,output}` | `ssm_conv1d` 形状 `[10240,4]`，逻辑是 `[4,10240]`，需转置语义 |
+| **`blk.N.attn_qkv.weight`** | `gdn/query` + `gdn/key` + `gdn/value` | **合并张量**：10240 = 2048+2048+6144，按行切分 |
+| `blk.N.attn_gate.weight` | `gdn/z` | 1:1 |
+| `blk.N.ffn_gate_inp.weight` | `moe/router` | 1:1 |
+| `blk.N.ffn_gate_inp_shexp.weight` | `moe/shared_score` | `[2560]` vs 逻辑 `[1,2560]` |
+| `blk.N.ffn_{gate,up,down}_exps.weight` | `moe/experts/{gate,up,down}` | 3D，1:1 |
+| `blk.N.ffn_{gate,up,down}_shexp.weight` | `moe/shared/{gate,up,down}` | 1:1 |
+| `blk.N.indexer.{q,k}_{proj,norm}.weight` | `attention/{index_query,index_key,...}` | 仅 IndexedAttention 层 |
+| `blk.N.attn_{q,k,v,output,gate,q_norm,k_norm}.weight` | `attention/{query,key,value,output,output_gate,query_norm,key_norm}` | 仅 full-attention 层 |
+| `blk.N.ple_*` | `layers/N/ple/*` | PLE 层 |
+
+现有工件的 1,874 条里有一部分用 `parts` 把多个小参数切在同一对象（如 `attention_hc/down` 与
+`inject` 共享一个 bf16 对象）。新容器每个 GGUF 张量本来就是独立对象，所以**不需要 parts**：
+只需要在转换器里把 `attn_qkv` 这类合并张量**按行切成独立对象**（row_bytes = n_bytes / rows），
+其余一一对应即可生成 binds。这是下一项的具体工作。
