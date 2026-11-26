@@ -588,3 +588,17 @@ error: dflash2/layers/0/attention/context_key@dflash2/context_input: missing par
 即 **text 组件的容器、绑定、uses 已全部被接受**，剩余是 dflash2 自己的打包约定：现有工件把
 `attn_k` 等多段（key / context_key）切在同一对象的不同 range 里，新容器需要按同样规则切分
 dflash2 的对象，或确认 context_key/context_value 是否与 key/value 共享同一数据。
+
+**2026-11-26 dflash2 别名与 norm 精度（当前最后一个结构问题）**：
+
+1. dflash2 的 `attention/context_key` 与 `attention/key` 在参考工件里指向**完全相同的 range**
+   （`[10485760,13107200)`），`context_value` 与 `value` 同理 —— 它们是别名，不是第二份数据。
+   转换器已按别名生成（同一 object 引用），不再需要额外切分。
+2. 错误链现在停在：`text/final_norm: representation does not match its mathematical value type`。
+   来源是 `artifact/binder.cpp:53` 的 `exact_format` 检查：`final_correction` 要求 **BF16**，
+   而 GGUF 的 `output_hc_norm.weight` 是 **F32**（`hc_attn_norm`、`hc_ffn_norm`、`ssm_norm`、
+   `ple_norm_*` 也都是 F32）。
+
+这不是量化格式问题，而是**非量化参数的精度约定**：GGUF 把 norm 存成 F32，ninfer 的数学要求 BF16。
+两条路：转换器对这类 norm 做 F32→BF16（元素级转换，不是重新量化），或让 binder 接受 F32 norm。
+下一位接手时应先确认 `final_correction` 是否允许 F32，再决定是转换还是放宽。

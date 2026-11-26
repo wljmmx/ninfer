@@ -427,6 +427,13 @@ def expand_dflash(objs: list, component: str) -> tuple:
         suffix = DFLASH_TOP.get(name)
         if suffix:
             bindings[f"{component}/{suffix}"] = {"object": obj.id}
+    # context_key/context_value are the same tensors as key/value (the reference artifact binds both
+    # names to one identical range, not to a second copy), so they are aliases, not extra data.
+    for source, alias in (("/attention/key", "/attention/context_key"),
+                          ("/attention/value", "/attention/context_value")):
+        for key, value in list(bindings.items()):
+            if key.endswith(source):
+                bindings[key[: -len(source)] + alias] = dict(value)
     return objs, bindings
 
 
