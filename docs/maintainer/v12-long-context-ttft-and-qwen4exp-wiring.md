@@ -1165,3 +1165,20 @@ CPU 半边确实排除残差加法（`out_cpu` 是 FP32 项），与设备半边
 4. HC 与 PLE 的残差路径：Qwen4Exp 独有，没有参考工件等价物，必须自建参考。
 
 纪律：在 1–4 任一环节给出“与 host 一致”的证据前，不再做性能改动（当前 2.3/0.9 tok/s 只是标量实现的产物）。
+
+**2026-11-26 `infer-perplexity` 对 PLE 模型是坏的（两个工件同点崩溃）**：
+
+想用 PPL 做强判据（同模型不同量化，PPL 应接近），实测：
+
+| 命令 | 结果 |
+|---|---|
+| `infer-perplexity <v5_e2 参考工件> --text q4exp_corpus_small.txt --context 256 --stride 200` | `0xC0000005`，停在 `[ple] table … supported` 与 `[kv-plan]` 之后 |
+| 同上换成本容器 `qwen4exp-iq3_xxs.ninfer` | `0xC0000005`，停在**同一点** |
+
+两个工件、同一条命令、同一位置 → **是 `infer-perplexity` 自己的 PLE 路径坏了**，不是容器问题
+（`infer.exe` 对两个工件都能正常加载与生成）。这也说明台账里的 PPL 门禁值（7.359779 / e95cacb864d8b1ab）
+来自**非 PLE** 的 35B 模型——PLE 模型从未走过这条工具链。
+
+因此数值核对不能依赖 CLI，必须走**树内算子级工装**（与 `test_ggml_*` 同一方法）。附带一项待修：
+`infer-perplexity` 的 PLE 分支（与 `infer.exe` 的差异点：是否传入 `PleTableBinding`/`ple_eos`，
+以及 options 的 PLE 相关默认值）。
