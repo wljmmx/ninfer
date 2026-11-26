@@ -25,6 +25,20 @@ constexpr std::array kFormats = {
               std::string_view{"fp8_e4m3fn_block128x128_bf16"}},
     std::pair{QType::FP8_E4M3FN_BLOCK64X64_BF16,
               std::string_view{"fp8_e4m3fn_block64x64_bf16"}},
+    // port (sm_89): GGML block encodings, carried verbatim from GGUF. BF16/F32/INT32 GGML tensors
+    // use the names above; these are the ones with no native equivalent.
+    std::pair{QType::GGML_F16, std::string_view{"ggml_f16"}},
+    std::pair{QType::GGML_Q4_K, std::string_view{"ggml_q4_k"}},
+    std::pair{QType::GGML_Q5_K, std::string_view{"ggml_q5_k"}},
+    std::pair{QType::GGML_Q6_K, std::string_view{"ggml_q6_k"}},
+    std::pair{QType::GGML_IQ4_NL, std::string_view{"ggml_iq4_nl"}},
+    std::pair{QType::GGML_IQ4_XS, std::string_view{"ggml_iq4_xs"}},
+    std::pair{QType::GGML_IQ3_S, std::string_view{"ggml_iq3_s"}},
+    std::pair{QType::GGML_IQ3_XXS, std::string_view{"ggml_iq3_xxs"}},
+    std::pair{QType::GGML_IQ2_XXS, std::string_view{"ggml_iq2_xxs"}},
+    std::pair{QType::GGML_IQ2_XS, std::string_view{"ggml_iq2_xs"}},
+    std::pair{QType::GGML_IQ2_S, std::string_view{"ggml_iq2_s"}},
+    std::pair{QType::GGML_Q2_0, std::string_view{"ggml_q2_0"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},
@@ -36,6 +50,7 @@ constexpr std::array kLayouts = {
               std::string_view{"batched_block_scale_k16_m128x4_v1"}},
     std::pair{QuantLayout::BlockScaleM128K128, std::string_view{"block_scale_m128_k128_v1"}},
     std::pair{QuantLayout::BlockScaleM64K64, std::string_view{"block_scale_m64_k64_v1"}},
+    std::pair{QuantLayout::GgmlBlock, std::string_view{"ggml_block_v1"}},
 };
 
 } // namespace

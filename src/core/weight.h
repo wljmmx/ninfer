@@ -22,6 +22,21 @@ enum class QType : std::uint16_t {
     FP8_E4M3FN_BLOCK128X128_BF16 = 10,
     // port (sm_89) T116: the 64x64 block form, appended so no existing dense numbering moves.
     FP8_E4M3FN_BLOCK64X64_BF16   = 11,
+    // port (sm_89): GGML block encodings carried verbatim from GGUF artifacts. The object bytes are
+    // the GGML block layout for the shape; decoding them is a per-type kernel concern. BF16/F32/INT32
+    // GGML tensors map onto the existing QType values and do not need an entry here.
+    GGML_F16      = 12,
+    GGML_Q4_K     = 13,
+    GGML_Q5_K     = 14,
+    GGML_Q6_K     = 15,
+    GGML_IQ4_NL   = 16,
+    GGML_IQ4_XS   = 17,
+    GGML_IQ3_S    = 18,
+    GGML_IQ3_XXS  = 19,
+    GGML_IQ2_XXS  = 20,
+    GGML_IQ2_XS   = 21,
+    GGML_IQ2_S    = 22,
+    GGML_Q2_0     = 23,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -35,6 +50,9 @@ enum class QuantLayout : std::uint16_t {
     BlockScaleM128K128         = 6,
     // port (sm_89) T116: one 64x64 scale tile per 64x64 block of the matrix.
     BlockScaleM64K64           = 7,
+    // port (sm_89): a GGML type block stream, unchanged - the object's bytes are exactly the tensor
+    // data a GGUF file holds for that type and shape, so no planes or padding are implied here.
+    GgmlBlock                  = 8,
 };
 
 struct Weight {

@@ -487,3 +487,22 @@ phases boundary 19.1 ms | submit 1m 6.6s | devwait 251 ms | decodehost 57.2 s | 
 R 盘同时有对照件：`Qwen3.8-Flash-Next-DFlash2-strata1-tuned-BF16.gguf`（1.13 GB）与
 `qwen3.8-flash-next-dflash2.strata1.q4_0-selq4.pack`（0.32 GB），以及各档 DFlash2 draft
 （Q4_K_M/Q5_K_M/Q6_K/Q8_0/BF16）。`.incomplete` 的三个分片属于 UD-Q4_K_XL，与 IQ3_XXS 无关。
+
+**2026-11-26 接入进度（QType 扩展 → 容器可读 → 卡在 bindings）**：
+
+1. `core/weight.h` 追加 `QType::GGML_*`（12 个，编号从 12 起，不动现有稠密编号）与
+   `QuantLayout::GgmlBlock`；`artifact/formats.cpp` 注册 12 个 `ggml_<type>` 名称与
+   `ggml_block_v1`。BF16/F32/INT32 的 GGUF 张量与原生格式字节一致，转换器直接映射为
+   `bf16`/`fp32`/`int32` + `contiguous_le_v1`，不需要解码器。
+2. 转换器新增 `--config-from` / `--resources-from`：text config（30+ 字段：layer_types、hc_*、
+   indexer_*、linear_*）与资源（tokenizer.json 12.8 MB、tokenizer_config、chat_template、
+   generation_config、`ple_hash_controls` 280 B）从同模型的现有工件复制，不重复实现。
+3. 用引擎打开新容器的错误链，逐层通过：
+   `unknown tensor format` → `object overlaps/exceeds payload`（256 对齐间隙未计入卷 payload）→
+   `unsupported architecture/config pair`（arch 应为 `Qwen4ExpForCausalLM` / `qwen4_exp_text`）→
+   `missing tie_word_embeddings`（改用 `--config-from` 复制整套 config）→
+   `missing resource tokenizer.json`（`--resources-from`）→
+   **`missing logical parameter text/token_embedding`**。
+4. 即容器 framing、对象范围、13 个格式名、config、resources 全部被 reader/binder 接受，
+   只剩 **bindings**：现有工件 1,874 条（含 `parts` 把多个小参数切在同一对象的不同 range），
+   需要按 binder 的逻辑参数表把 GGUF 张量名映射过去。这是下一项，不是容器问题。

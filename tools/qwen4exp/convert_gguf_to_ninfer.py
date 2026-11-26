@@ -72,6 +72,22 @@ def ggml_format_name(tensor_type: int) -> str:
     return "ggml_" + gguf.GGMLQuantizationType(tensor_type).name.lower()
 
 
+# GGML types whose payload is byte-identical to a native ninfer format: the raw words in C order.
+# Mapping them lets the existing loader read those tensors instead of needing a GGML decoder.
+NATIVE_EQUIVALENT = {
+    "BF16": ("bf16", "contiguous_le_v1"),
+    "F32": ("fp32", "contiguous_le_v1"),
+    "I32": ("int32", "contiguous_le_v1"),
+}
+
+
+def describe_format(tensor_type: int) -> tuple:
+    name = gguf.GGMLQuantizationType(tensor_type).name
+    if name in NATIVE_EQUIVALENT:
+        return NATIVE_EQUIVALENT[name]
+    return ggml_format_name(tensor_type), "ggml_block_v1"
+
+
 def plain(value):
     """numpy scalar/array -> JSON-safe Python value."""
     if isinstance(value, (str, bool, int, float)):
@@ -99,8 +115,9 @@ def collect(source: Source, component: str) -> list:
     objs = []
     for t in source.reader.tensors:
         shape_c = [int(x) for x in reversed(list(t.shape))]  # GGML ne is column-major
+        fmt, layout = describe_format(t.tensor_type)
         objs.append(Obj(id=f"{component}.{t.name}", kind="tensor", shape=shape_c,
-                        fmt=ggml_format_name(t.tensor_type), layout="ggml_block_v1",
+                        fmt=fmt, layout=layout,
                         src=source, src_offset=int(t.data_offset), bytes=int(t.n_bytes)))
     return objs
 
@@ -116,8 +133,10 @@ def text_config(metadata: dict) -> dict:
         return default
 
     cfg = {
-        "architectures": ["Qwen3_5Text"],
-        "model_type": "qwen3_5",
+        # The binder keys off this pair (src/models/qwen3_5/config.*); the GGUF artifact is a
+        # Qwen3.8-Flash-Next target, which this repo names Qwen4Exp.
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "model_type": "qwen4_exp_text",
         "hidden_size": num("qwen3_5.hidden_size", "embedding_length"),
         "num_hidden_layers": num("qwen3_5.block_count"),
         "num_attention_heads": num("qwen3_5.attention.head_count"),
@@ -152,8 +171,11 @@ def plan(objs: list, shard_bytes: int):
         obj.offset = align_up(offset, OBJECT_ALIGN)
         offset = obj.offset + obj.bytes
         if used and used + obj.bytes > shard_bytes:
+            # The next volume starts where this one actually ends (last object's end, alignment gap
+            # included), because the logical payload is one continuous space.
+            base_next = current[-1].offset + current[-1].bytes
             shards.append((base, current))
-            base += sum(o.bytes for o in current)
+            base = base_next
             current = []
             used = 0
         current.append(obj)
@@ -184,8 +206,8 @@ def copy_range(src: Source, offset: int, length: int, dst, hasher) -> None:
             left -= len(chunk)
 
 
-def write_shard(path: str, shard: list, base: int, index: int, artifact_id: bytes,
-                payload_start: int, blob: bytes) -> None:
+def write_shard(path: str, shard: list, base: int, final_size: int, index: int,
+                artifact_id: bytes, payload_start: int, blob: bytes) -> None:
     written = 0
     with open(path, "wb") as f:
         if index == 0:
@@ -208,6 +230,60 @@ def write_shard(path: str, shard: list, base: int, index: int, artifact_id: byte
             copy_range(obj.src, obj.src_offset, obj.bytes, f, h)
             obj.sha256 = h.hexdigest()
             written += obj.bytes
+        # The volume's declared payload covers the trailing alignment gap, and the reader checks the
+        # file length against it, so the tail must be written out.
+        if written < final_size:
+            f.write(b"\x00" * (final_size - written))
+
+
+def load_component_config(path: str, component: str = "text") -> dict:
+    """Reuse a known-good component config from another artifact of the same model.
+
+    The text config carries ~30 fields (layer_types, hc_*, indexer_*, linear_*), and every one of
+    them is a property of the model rather than of the encoding, so the packed file should take them
+    from the artifact that already loads rather than re-derive them from GGUF metadata.
+    """
+    with open(path, "rb") as f:
+        if f.read(8) != ENTRY_MAGIC:
+            raise ValueError(f"{path} is not a v3 entry")
+        (json_bytes,) = struct.unpack("<Q", f.read(8))
+        f.read(16)
+        directory = json.loads(f.read(json_bytes).decode())
+    return directory["components"][component]["config"]
+
+
+def load_resources(path: str) -> dict:
+    """Resource objects (tokenizer, templates, PLE hash controls) from an artifact of the same model.
+
+    They are small, model-versioned blobs that GGUF does not carry; copying them keeps the packed
+    file loadable without a second converter for tokenizer formats.
+    """
+    with open(path, "rb") as f:
+        if f.read(8) != ENTRY_MAGIC:
+            raise ValueError(f"{path} is not a v3 entry")
+        (json_bytes,) = struct.unpack("<Q", f.read(8))
+        f.read(16)
+        directory = json.loads(f.read(json_bytes).decode())
+    payload_start = align_up(HEADER + json_bytes, ENTRY_ALIGN)
+    bases = [0]
+    for fdesc in directory["files"][1:]:
+        bases.append(bases[-1] + fdesc["payload_bytes"])
+    by_id = {o["id"]: o for o in directory["objects"]}
+    out: dict = {}
+    for comp, rec in directory["components"].items():
+        for name, rid in (rec.get("resources") or {}).items():
+            o = by_id[rid]
+            vol = 0
+            for i, b in enumerate(bases):
+                if b <= o["offset"] < b + directory["files"][i]["payload_bytes"]:
+                    vol = i
+                    break
+            start = payload_start if vol == 0 else ENTRY_ALIGN
+            out.setdefault(comp, {})[name] = Obj(
+                id=f"resource/{comp}/{name}", kind="resource", shape=None, fmt=None, layout=None,
+                src=Source(path, None), src_offset=start + (o["offset"] - bases[vol]),
+                bytes=o["bytes"])
+    return out
 
 
 def main() -> int:
@@ -217,6 +293,10 @@ def main() -> int:
     ap.add_argument("--mtp", nargs="*", default=[])
     ap.add_argument("--out", required=True)
     ap.add_argument("--shard-gb", type=int, default=30)
+    ap.add_argument("--config-from", default="",
+                    help="artifact to copy the text component config from (same model)")
+    ap.add_argument("--resources-from", default="",
+                    help="artifact to copy component resources (tokenizer/templates/PLE) from")
     ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()
 
@@ -230,13 +310,23 @@ def main() -> int:
     objs = []
     for path in args.text:
         objs += collect(source(path), "text")
-    components = {"text": {"config": text_config(read_metadata(source(args.text[0])))}}
+    if args.config_from:
+        text_cfg = load_component_config(args.config_from)
+    else:
+        text_cfg = text_config(read_metadata(source(args.text[0])))
+    components = {"text": {"config": text_cfg}}
     for flag, comp, arc in (("dflash2", "dflash2", "Qwen3_8DFlash2"),
                             ("mtp", "mtp", "Qwen3_5MTP")):
         for i, path in enumerate(getattr(args, flag)):
             name = comp if i == 0 else f"{comp}{i}"
             objs += collect(source(path), name)
             components[name] = {"config": {"architectures": [arc]}, "target": "text"}
+    if args.resources_from:
+        for comp, mapping in load_resources(args.resources_from).items():
+            if comp not in components:
+                continue
+            components[comp]["resources"] = {name: o.id for name, o in mapping.items()}
+            objs += list(mapping.values())
 
     if not objs:
         print("no tensors collected", file=sys.stderr)
@@ -245,9 +335,14 @@ def main() -> int:
     shards, payload_bytes = plan(objs, args.shard_gb << 30)
     entry_name = os.path.basename(args.out)
     files = []
-    for i, (_base, shard) in enumerate(shards):
+    volumes = []
+    for i, (base, shard) in enumerate(shards):
+        # Declared size spans up to the last object's end, alignment gap included: the reader checks
+        # object ranges against this total, and a sum of object bytes is short by the gaps.
+        end = shard[-1].offset + shard[-1].bytes
         files.append({"path": None if i == 0 else f"{entry_name}.part-{i:04d}",
-                      "payload_bytes": sum(o.bytes for o in shard)})
+                      "payload_bytes": end - base})
+        volumes.append((base, shard, end - base))
 
     artifact_id = uuid.uuid4().bytes
     directory = {
@@ -272,8 +367,8 @@ def main() -> int:
     part_paths = [args.out] + [os.path.join(out_dir, f["path"]) for f in files[1:]]
 
     # The part_index in each continuation header is its files[] index.
-    for index, (base, shard) in enumerate(shards):
-        write_shard(part_paths[index], shard, base, index, artifact_id,
+    for index, (base, shard, final_size) in enumerate(volumes):
+        write_shard(part_paths[index], shard, base, final_size, index, artifact_id,
                     payload_start if index == 0 else 0, blob if index == 0 else b"")
 
     total = sum(os.path.getsize(p) for p in part_paths)
