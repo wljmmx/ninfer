@@ -959,3 +959,27 @@ error: vector too long
 
 回归：`ctest -R 'moe|swiglu'` 11/11 通过（含 `ninfer_moe_qwen4exp_split_test` 47.9 s），
 `ctest -R ggml` 5/5 通过。
+
+**2026-11-26 `vector too long` 隔离：与 ggml 无关，落在 PLE 模型的程序初始化**：
+
+四次实验把范围收窄到可执行的程度（全部实测）：
+
+| 实验 | 结果 |
+|---|---|
+| `qwen4exp-iq3_xxs`（PLE），`--max-context 2048` | `vector too long`（`initializing runtime`）|
+| 同上，`--max-context 4096`（KV 32→64 页，页数确实翻倍）| **同一条错误、同位置** → 不是容量/页数驱动 |
+| `qwen3_8_flash_next_v5_e2`（PLE，原生 q4/q5 工件，与 ggml 无关）| **同一条错误** → 不是 ggml 侧 |
+| `qwen3_8_flash_next_v5_e2` + `--no-cuda-graph` | **同一条错误** → 不是图捕获 |
+| `qwen3_8_27b_v3`（**非 PLE**，27B 稠密）| **exit=0，正常启动**（graph capture 48.0 MiB、planned 16.4 GiB）|
+
+结论：当前树能跑非 PLE 模型；两个 **PLE 模型**都在 `ProgramInitialize` 阶段因
+`std::length_error`（"vector too long"）失败。而 `R:\ninfer-release-20261119\ninfer.exe`（11-24 构建）
+在 v5_e2 上能走过这一阶段（失败在后面另一处：`ffn.cpp:372` 图捕获期间的 `cudaStreamSynchronize`，
+即 `[graph] skipped: layer needs host fetch` 这条修复之前的老问题）。因此这是**11-24 之后引入的
+PLE 程序初始化回归**，与本次 ggml 工作无关。
+
+定位方向（下次直接做）：`length_error` 需要 count > max_size，实际都是**负数被转成 size_t**。PLE 的
+程序初始化里按窗口/表行/槽位算长度的地方，找可能为负的差值（例如 `window - live`、`rows - used`、
+`capacity - consumed`）。`ProgramImpl` 构造体（`program_impl.cpp:106` 起）与 PLE 窗口/前缀标识
+（`prefix_identity.cpp` 的 `resize(tokens)`）是首选两处；建议在构造函数里按段打印 count 与差值符号，
+一次构建即可定位。
