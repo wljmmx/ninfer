@@ -51,6 +51,12 @@ ninfer_add_op_test(ninfer_ggml_embedding_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_embedding.cu"
   LIBRARIES ninfer_ops)
 
+# The GGML routed-SwiGLU core: three-bank addressing, the BF16 SiLU product and the coefficient
+# epilogue, checked against a host reference per encoding combination.
+ninfer_add_op_test(ninfer_ggml_experts_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_experts.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)

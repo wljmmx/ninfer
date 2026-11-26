@@ -859,3 +859,36 @@ allocation boundaries）、token/grouped 两套 SwiGLU kernel（专家行内联�
    说明该上下文的异常同样会走到这条不稳定的收尾路径。退出码在 0xC0000005 与 0xC0000374
    之间变化，符合“收尾路径上的内存错误”而不是单一 throw 点。
    因此**下一步应先修这条失败路径**（或让 MoE 一次性支持到位），否则每个不支持的编码都只表现为崩溃。
+
+**2026-11-26 专家 SwiGLU 内核核心落地（可对拍，尚未接线）**：
+
+MoE 最难的部分是“三银行寻址 + 路由聚合”的正确性，先把它做成独立单元：
+
+- `src/ops/moe/ggml/ggml_experts.cu`：**一 CTA 一 token**，按路由串行（不用原子、与路由顺序无关），
+  线程各自拥有整行做 down 点积；gate/up 行内联解码（`lane_dot<TYPE>`，单 lane 遍历整行 32 值组），
+  SiLU 乘积**舍入到 BF16** 后再作为 down 的激活（与原生族的设备 epilogue 一致），
+  最后按 `coef` 累加写 `out[H,T]`。工作区由 `routed_swiglu_workspace_bytes(top_k, I)` 定价、
+  经 `WorkspaceArena` 注入，Op 内部不做隐藏分配。
+- `src/ops/linear/ggml/ggml_gemv.cuh` 新增 `lane_dot<TYPE>`（单 lane 整行点积），供专家行复用同一套 `dot32`。
+- `tests/ops/test_ggml_experts.cu`：覆盖本工件真实出现的两种组合 **IQ3_S/IQ3_S/IQ4_NL** 与
+  **IQ2_XXS/IQ2_XXS/Q2_0**，experts=4、top_k=2、T=2、H=512、I=256，与 host 参考（double、
+  同样的 BF16 中间舍入）逐值比对 —— 两种组合均通过。
+
+测试本身抓到一个**测量错误**：第一版按字节旋转构造行载荷，会把块内的 `d` 指数打乱成任意值，
+于是“参考值”和“内核值”都是非物理的大数（2^30 量级）——这不是内核错，而是载荷不再是任何量化器
+能产出的块流。改为**整块平铺**（每行只换起始块）后两种组合立刻通过。这条要记住：检验 kernel 时
+载荷必须是合法块流，否则差异反映的是构造而不是实现。
+
+当前 ggml 家族的验证状态（`ctest -R ggml`，5/5）：
+
+| 测试 | 覆盖 |
+|---|---|
+| `ninfer_ggml_dequant_test` | host 参考 vs gguf-py，11 种编码 |
+| `ninfer_ggml_block_decode_test` | device 解码 vs host，11 种 |
+| `ninfer_ggml_linear_test` | Linear GEMV（K=两块、N=3、两列）vs host，11 种 |
+| `ninfer_ggml_embedding_test` | 词表取行 vs host，11 种 |
+| `ninfer_ggml_experts_test` | 三银行 routed SwiGLU vs host，2 种组合 |
+
+仍未接线到 `ops::routed_swiglu`：那需要 `ExpertImplementation::GgmlBlock` 的 `Plan`（token 切片、
+allocation boundaries）、`ExpertSubsetKind` 四种子集的语义、共享专家项与 `MoeEpilogue`，
+以及 `ShapePolicy` 的一条 h2560_i640_e512_k10 条目。内核核心既然已对拍，剩下的就是把这层壳接上。

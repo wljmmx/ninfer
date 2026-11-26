@@ -216,6 +216,21 @@ __device__ __forceinline__ float dot32(const std::uint8_t* block, int group_in_b
     return acc;
 }
 
+// One row's dot, computed by a single lane over every group. Used where a lane owns a whole row (the
+// expert matvecs: 32 lanes then cover 32 different experts' rows at once).
+template <int TYPE>
+__device__ __forceinline__ float lane_dot(const std::uint8_t* row, const __nv_bfloat16* x, int k,
+                                          int groups_per_block, int type_bytes) {
+    const int groups = k / 32;
+    float acc        = 0.0f;
+    for (int group = 0; group < groups; ++group) {
+        const std::uint8_t* block =
+            row + std::size_t(group / groups_per_block) * std::size_t(type_bytes);
+        acc += dot32<TYPE>(block, group % groups_per_block, x + std::size_t(group) * 32);
+    }
+    return acc;
+}
+
 // One output row of one column, reduced across the warp. `weight` is the row's first encoded block.
 template <int TYPE>
 __device__ __forceinline__ float gemv_row(const std::uint8_t* weight, const __nv_bfloat16* x, int k,
