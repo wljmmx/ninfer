@@ -33,6 +33,12 @@ ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../t
 
 ninfer_add_test(ninfer_shape_class_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_shape_class.cpp")
 
+# The GGML block decoders against gguf-py: the fixture carries real blocks from the packed Qwen4Exp
+# artifact plus an independent implementation's values (tools/qwen4exp/emit_ggml_dequant_fixture.py).
+ninfer_add_test(ninfer_ggml_dequant_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../core/test_ggml_dequant.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tensor.cpp"
   LIBRARIES ninfer_core)
 
