@@ -1009,3 +1009,34 @@ error: vector too long
 并把整个文件 `git checkout` 回 HEAD，工作区保持干净（当前行为仍是上面日志所示的 `vector too long`）。
 期间一度看到的 `error: text: PLE requires the request's EOS id` 在干净重建后**不可复现**，
 按“构建中间态产物”记录，不计为第二个缺陷。
+
+**2026-11-26 模型已能加载并跑到第 0 层执行；`vector too long` 是陈旧目标文件造成的假故障**：
+
+回退所有探针、干净重建后重跑，前沿从“PLE 构造崩溃”直接跳到**真实执行**：
+
+```
+error: text/layers/0 prefill columns=51: routed_swiglu: the GGML expert path implements the full
+expert set only; the masked subsets are not wired yet
+```
+
+即：PLE stage 正常构造（探针版本打印过 `max_tokens=1024 max_batch=8 slots=8 max_positions=1024
+windows=2 io_depth=128 cache=64MiB`、`layers built (48)`、`gpu preparation built`、`stage constructed`），
+`ProgramInitialize` 通过，**第 0 层 prefill 51 列已经进入算子执行**，停在我自己写的拒绝分支上。
+
+关于 `vector too long`：它在“给 `row_reader.cpp` 加探针→误删两处定义→链接失败→恢复→`git checkout` 回到
+HEAD→重编”这一串之后**不再复现**（同一命令、干净重建、多次运行）。因此它不是可复现的缺陷，而是
+**陈旧/混合目标文件**造成的假故障——本仓 depfile 不跟头文件的老问题又一次以“看起来像崩溃”的形式出现。
+教训：出现无法解释的启动期失败时，先 `--clean-first` 或删对应 obj 再判因（本次即属此类）。
+台账此前记录的 `vector too long` 结论作废，PLE 侧两个旧现象（EOS 拒绝）也归入同一类构建态假象。
+
+**执行层剩余（按出现顺序，均已定位到函数）**：
+
+1. `routed_swiglu` 的 GGML 分支需要**子集语义**：split 路径传 `MaskZeros`（`moe_cpu::participates`：
+   `mask[expert]==0` 参与），内核要接 `ExpertSubsetKind` + `mask`，不参与的 route 贡献 0；
+2. **epilogue 模式**：`MoeEpilogue::Write` 覆盖、`AddResidual` 累加（我的内核目前只覆盖写）；
+3. **银行视图 → 行寻址**：`CudaSwiGLUExperts.gate/up`（`ExpertMatrixDeviceView`）给出 `codes` +
+   `code_stride` + `offsets[e]`，行宽 = `code_stride / I`（down 为 `/ H`）；
+4. **host 腿**：`host_flags[e]` 非零时该专家在映射的 host 内存（`host_codes`/`host_offsets`），
+   本模型 `unslotted=44574 of 73728` 说明大量 route 走这条腿，必须实现；
+5. **共享专家项**：`ScaledSwiGLUTerm`（需要转换器把 `ffn_gate_shexp|ffn_up_shexp` 合并成 `[2I,H]`，
+   并给 dense SwiGLU 一个 GGML 分支）。
