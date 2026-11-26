@@ -739,7 +739,12 @@ def main() -> int:
         # sampler reports them separately instead of pretending the copy check covers them.
         plain = [o for o in objs if not (o.transpose or o.f32_to_bf16 or o.f16_to_bf16)]
         skipped = len(objs) - len(plain)
-        sample = plain[:: max(1, len(plain) // 24)]
+        # The merged parents (gdn control, ple key|value, hc down|inject) are the objects this tool
+        # authors rather than copies, so every one of them is checked, not just the periodic sample:
+        # their byte order is a convention the engine depends on and nothing else verifies it.
+        merged = [o for o in plain if o.segments]
+        stride = max(1, len(plain) // 24)
+        sample = merged + [o for i, o in enumerate(plain) if i % stride == 0 and not o.segments]
         # Locate objects through the same allocation the writer used. Deriving the volume from the
         # JSON payload spans re-derives a boundary the writer already decided, and the two disagree
         # for the object that starts exactly at a volume edge.
