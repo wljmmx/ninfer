@@ -45,6 +45,53 @@ std::uint64_t word_bytes(QType format) {
     }
 }
 
+// GGML block stream: (elements per block, encoded bytes per block). These are the upstream
+// GGML_QUANT_SIZES values for the types the container can carry; a GGML tensor's payload is exactly
+// elements / block of these, with no separate scale plane (each type's scale lives inside the block).
+struct GgmlBlockBytes {
+    std::uint64_t block;
+    std::uint64_t type_bytes;
+};
+
+GgmlBlockBytes ggml_block_bytes(QType format) {
+    switch (format) {
+    case QType::GGML_F16: return {1, 2};
+    case QType::GGML_Q4_K: return {256, 144};
+    case QType::GGML_Q5_K: return {256, 176};
+    case QType::GGML_Q6_K: return {256, 210};
+    case QType::GGML_IQ4_NL: return {32, 18};
+    case QType::GGML_IQ4_XS: return {256, 136};
+    case QType::GGML_IQ3_S: return {256, 110};
+    case QType::GGML_IQ3_XXS: return {256, 98};
+    case QType::GGML_IQ2_XXS: return {256, 66};
+    case QType::GGML_IQ2_XS: return {256, 74};
+    case QType::GGML_IQ2_S: return {256, 82};
+    case QType::GGML_Q2_0: return {64, 18};
+    default:
+        throw std::invalid_argument("weight is not a GGML block type");
+    }
+}
+
+bool is_ggml_block(QType format) noexcept {
+    switch (format) {
+    case QType::GGML_F16:
+    case QType::GGML_Q4_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q6_K:
+    case QType::GGML_IQ4_NL:
+    case QType::GGML_IQ4_XS:
+    case QType::GGML_IQ3_S:
+    case QType::GGML_IQ3_XXS:
+    case QType::GGML_IQ2_XXS:
+    case QType::GGML_IQ2_XS:
+    case QType::GGML_IQ2_S:
+    case QType::GGML_Q2_0:
+        return true;
+    default:
+        return false;
+    }
+}
+
 DType direct_dtype(QType format) {
     switch (format) {
     case QType::BF16:
@@ -97,6 +144,29 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         if (shape.size() == 2) {
             out.padded_columns     = shape[1];
             out.code_bytes_per_row = mul(shape[1], word_bytes(format));
+        }
+        return out;
+    }
+    if (layout == QuantLayout::GgmlBlock) {
+        // port (sm_89): a GGUF tensor carries its encoding verbatim, so the geometry is just the
+        // block stream. Rank is not constrained here (norms are rank 1, expert banks rank 3), and
+        // there is no separate scale plane to place - every GGML type keeps its scales inside the
+        // block. Decoding is the consumer's job, per type.
+        if (!is_ggml_block(format)) {
+            throw std::invalid_argument("GgmlBlock layout requires a GGML block format");
+        }
+        const auto blocks = ggml_block_bytes(format);
+        if (out.elements % blocks.block) {
+            throw std::invalid_argument("GGML block layout requires elements % block == 0");
+        }
+        out.code_bytes = mul(out.elements / blocks.block, blocks.type_bytes);
+        out.bytes      = out.code_bytes;
+        if (shape.size() >= 2) {
+            out.padded_columns = shape.back();
+            out.matrix_rows    = shape[shape.size() - 2];
+            if (out.padded_columns % blocks.block == 0) {
+                out.code_bytes_per_row = mul(out.padded_columns / blocks.block, blocks.type_bytes);
+            }
         }
         return out;
     }

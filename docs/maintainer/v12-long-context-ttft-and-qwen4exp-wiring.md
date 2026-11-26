@@ -568,3 +568,23 @@ error: text.token_embd.weight: unknown quantized weight layout
 实现顺序建议：先在 `weight_view.cpp` 加 `GgmlBlock` 分支（`code_bytes = elements × type_bytes / block`，
 无独立 scale 平面），让加载通过；再按类型补 host 参考解码（对齐数值），最后写 sm_89 device 反量化
 （`__nv_bfloat16`、DP4A、`__ldg`，CUDA 13.4 工具链）。
+
+**2026-11-26 加载链再前进三层（GgmlBlock 视图 → uses → 文本绑定 → dflash2）**：
+
+1. `weight_view.cpp` 加 `GgmlBlock` 分支：`code_bytes = elements / block × type_bytes`，无独立 scale
+   平面，rank 不受限（norm 是 rank 1、expert bank 是 rank 3）。GGML 块参数表（12 种）已写入代码。
+   改完后 `text.token_embd.weight`（IQ3_S）不再报“未知布局”。
+2. 转换器新增 `--uses-from`（1262 条 `{parameter,input,activation_policy}`，与编码无关，从同模型工件复制），
+   并按实际组件过滤（不声明未打包组件的许可）。
+3. 合并张量的 binding 名补上层族前缀（`gdn/query` / `attention/query`），并补 PLE 层映射
+   （`ple_conv1d→ple/convolution` 等）与 dflash2 顶层/层内映射。
+
+错误链现在停在：
+
+```
+error: dflash2/layers/0/attention/context_key@dflash2/context_input: missing parameter
+```
+
+即 **text 组件的容器、绑定、uses 已全部被接受**，剩余是 dflash2 自己的打包约定：现有工件把
+`attn_k` 等多段（key / context_key）切在同一对象的不同 range 里，新容器需要按同样规则切分
+dflash2 的对象，或确认 context_key/context_value 是否与 key/value 共享同一数据。

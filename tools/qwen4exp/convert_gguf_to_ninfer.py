@@ -305,6 +305,13 @@ COMMON_LAYER = {
     "ffn_gate_shexp.weight": "moe/shared/gate",
     "ffn_up_shexp.weight": "moe/shared/up",
     "ffn_down_shexp.weight": "moe/shared/down",
+    # PLE blocks (only the layers the config names carry them).
+    "ple_conv1d.weight": "ple/convolution",
+    "ple_key.weight": "ple/key",
+    "ple_value.weight": "ple/value",
+    "ple_norm_conv.weight": "ple/norm_conv",
+    "ple_norm_key.weight": "ple/norm_key",
+    "ple_norm_query.weight": "ple/norm_query",
 }
 GDN_LAYER = {
     "ssm_a": "gdn/a_log",
@@ -327,11 +334,13 @@ FULL_LAYER = {
     "indexer.q_norm.weight": "attention/index_query_norm",
     "indexer.k_norm.weight": "attention/index_key_norm",
 }
-# Merged GGUF tensors, cut by rows. Ratios follow the element counts the reference artifact uses
+# Merged GGUF tensors, cut by rows. The logical suffix carries the layer family because that is how
+# the binder names them (gdn/query on a linear-attention layer, attention/query on a full one).
+# Ratios follow the element counts the reference artifact uses
 # (GDN: 2048/2048/6144 of 10240; full attention: 6144/6144 of 12288).
 MERGED = {
-    "attn_qkv.weight": (("query", 0.2), ("key", 0.2), ("value", 0.6)),
-    "attn_q.weight": (("query", 0.5), ("output_gate", 0.5)),
+    "attn_qkv.weight": (("gdn/query", 0.2), ("gdn/key", 0.2), ("gdn/value", 0.6)),
+    "attn_q.weight": (("attention/query", 0.5), ("attention/output_gate", 0.5)),
 }
 
 
@@ -347,6 +356,78 @@ def split_rows(obj: Obj, pieces) -> list:
                        src_offset=obj.src_offset + start * row_bytes, bytes=n * row_bytes))
         start += n
     return out
+
+
+def load_uses(path: str) -> list:
+    """The computation-permission table (parameter x input x activation policy).
+
+    It is a property of the model's math, not of the encoding, so the packed file takes it from the
+    same-model artifact instead of restating it.
+    """
+    with open(path, "rb") as f:
+        if f.read(8) != ENTRY_MAGIC:
+            raise ValueError(f"{path} is not a v3 entry")
+        (json_bytes,) = struct.unpack("<Q", f.read(8))
+        f.read(16)
+        return json.loads(f.read(json_bytes).decode())["uses"]
+
+
+def filter_uses(uses: list, components: dict) -> list:
+    """Keep only entries whose parameter and input belong to a component this artifact carries.
+
+    The reference table covers every optional component (vision/mtp/dflash2); an artifact that packs
+    text only must not declare permissions for a component it does not provide.
+    """
+    out = []
+    for u in uses:
+        if u["parameter"].split("/")[0] in components and u["input"].split("/")[0] in components:
+            out.append(u)
+    return out
+
+
+DFLASH_TOP = {
+    "selector_hidden.weight": "candidate_selector/hidden_projection",
+    "selector_predecessor.weight": "candidate_selector/predecessor_codebook",
+    "selector_successor.weight": "candidate_selector/successor_codebook",
+    "fc.weight": "feature_projection",
+    "enc.output_norm.weight": "context_norm",
+    "output_norm.weight": "final_norm",
+}
+DFLASH_LAYER = {
+    "attn_conv_base": "attention_conv/base_kernel",
+    "attn_conv_proj.weight": "attention_conv/kernel_projection",
+    "attn_norm.weight": "input_norm",
+    "ffn_norm.weight": "post_attention_norm",
+    "ffn_conv_base": "mlp_conv/base_kernel",
+    "ffn_conv_proj.weight": "mlp_conv/kernel_projection",
+    "ffn_down.weight": "mlp/down",
+    "ffn_gate.weight": "mlp/gate",
+    "ffn_up.weight": "mlp/up",
+    "attn_q.weight": "attention/query",
+    "attn_k.weight": "attention/key",
+    "attn_v.weight": "attention/value",
+    "attn_output.weight": "attention/output",
+    "attn_q_norm.weight": "attention/query_norm",
+    "attn_k_norm.weight": "attention/key_norm",
+}
+
+
+def expand_dflash(objs: list, component: str) -> tuple:
+    """Bindings for a draft component's own tensor names (the DFlash2 layout)."""
+    bindings = {}
+    prefix = component + "."
+    for obj in objs:
+        name = obj.id[len(prefix):]
+        if name.startswith("blk."):
+            _, num, rest = name.split(".", 2)
+            suffix = DFLASH_LAYER.get(rest)
+            if suffix:
+                bindings[f"{component}/layers/{int(num)}/{suffix}"] = {"object": obj.id}
+            continue
+        suffix = DFLASH_TOP.get(name)
+        if suffix:
+            bindings[f"{component}/{suffix}"] = {"object": obj.id}
+    return objs, bindings
 
 
 def expand_text(objs: list, layer_types: list) -> tuple:
@@ -406,6 +487,8 @@ def main() -> int:
                     help="artifact to copy the text component config from (same model)")
     ap.add_argument("--resources-from", default="",
                     help="artifact to copy component resources (tokenizer/templates/PLE) from")
+    ap.add_argument("--uses-from", default="",
+                    help="artifact to copy the uses table from (same model)")
     ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()
 
@@ -430,7 +513,11 @@ def main() -> int:
                             ("mtp", "mtp", "Qwen3_5MTP")):
         for i, path in enumerate(getattr(args, flag)):
             name = comp if i == 0 else f"{comp}{i}"
-            objs += collect(source(path), name)
+            part = collect(source(path), name)
+            if comp == "dflash2":
+                part, draft_bindings = expand_dflash(part, name)
+                bindings.update(draft_bindings)
+            objs += part
             components[name] = {"config": {"architectures": [arc]}, "target": "text"}
     if args.resources_from:
         for comp, mapping in load_resources(args.resources_from).items():
@@ -460,7 +547,7 @@ def main() -> int:
         "components": components,
         "objects": [describe(o) for o in objs],
         "bindings": bindings,
-        "uses": [],
+        "uses": filter_uses(load_uses(args.uses_from), components) if args.uses_from else [],
         "files": files,
         "metadata": {"name": str(read_metadata(source(args.text[0])).get("general.name", "Qwen3.8-Flash-Next")),
                      "source": "gguf", "payload_bytes": payload_bytes},
