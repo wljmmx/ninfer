@@ -298,6 +298,33 @@ const char* qtype_name(QType type) noexcept {
         return "fp8_e4m3fn_block128x128_bf16";
     case QType::FP8_E4M3FN_BLOCK64X64_BF16:
         return "fp8_e4m3fn_block64x64_bf16";
+    // GGML encodings carried verbatim from the GGUF source. Named here as well, so a table that
+    // declares one this reader cannot serve is refused with its real encoding instead of
+    // "unknown/unknown", which says nothing about what to convert.
+    case QType::GGML_F16:
+        return "ggml_f16";
+    case QType::GGML_Q4_K:
+        return "ggml_q4_k";
+    case QType::GGML_Q5_K:
+        return "ggml_q5_k";
+    case QType::GGML_Q6_K:
+        return "ggml_q6_k";
+    case QType::GGML_IQ4_NL:
+        return "ggml_iq4_nl";
+    case QType::GGML_IQ4_XS:
+        return "ggml_iq4_xs";
+    case QType::GGML_IQ3_S:
+        return "ggml_iq3_s";
+    case QType::GGML_IQ3_XXS:
+        return "ggml_iq3_xxs";
+    case QType::GGML_IQ2_XXS:
+        return "ggml_iq2_xxs";
+    case QType::GGML_IQ2_XS:
+        return "ggml_iq2_xs";
+    case QType::GGML_IQ2_S:
+        return "ggml_iq2_s";
+    case QType::GGML_Q2_0:
+        return "ggml_q2_0";
     }
     return "unknown";
 }
@@ -320,6 +347,8 @@ const char* layout_name(QuantLayout layout) noexcept {
         return "block_scale_m128_k128_v1";
     case QuantLayout::BlockScaleM64K64:
         return "block_scale_m64_k64_v1";
+    case QuantLayout::GgmlBlock:
+        return "ggml_block_v1";
     }
     return "unknown";
 }
@@ -345,7 +374,8 @@ void require_supported_ple_table(const PleTableRequirement& requirement) {
         layout_name(requirement.layout) + "（" + std::to_string(requirement.rows) + " 行 × " +
         std::to_string(requirement.width) + "，每行 " + std::to_string(kPleRowElements) +
         " 个特征）不受支持，可选：转码 / 加解码器（读取器服务 nf4_g16_e4m3fn / "
-        "row_paged_g16_4k_v1，每行 90 B；以及 q4_g64_fp16 / row_split_k128_v1，每行 "
+        "row_paged_g16_4k_v1，每行 90 B；ggml_iq4_nl / ggml_block_v1，每行 90 B；"
+        "以及 q4_g64_fp16 / row_split_k128_v1，每行 "
         "128 B 码平面 + 8 B fp16 尺度平面）");
 }
 

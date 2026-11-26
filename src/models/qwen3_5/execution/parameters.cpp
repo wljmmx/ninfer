@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -377,9 +378,14 @@ public:
                 linear(w.down)};
     }
 
-    // Qwen4Exp's low-rank residual correction. The mix Op reads the quantized planes directly, so
-    // each matrix is bound as a native Weight: a dequantized BF16 copy would be 6.5 MiB per matrix
-    // per layer and the artifact keeps none.
+    // Qwen4Exp's low-rank residual correction. Two artifact forms are admitted:
+    //
+    //  * compact BF16: `down` and (in a block layer) `inject` are two row blocks of one parent, in
+    //    that order, and the Op reads the fused [kRank(+kStreams), H*C] matrix directly;
+    //  * q5_g64_fp16 row-split planes, where the Op decodes the groupwise planes itself.
+    //
+    // The form is a property of how the artifact was packed, so it is decided here from the weight
+    // metadata and carried as a variant; a pair that is neither is refused with both encodings named.
     HcParameters hc(const HcWeights& w) const {
         HcParameters out;
         out.down = with_context(model_.weight(w.down).name,
@@ -390,6 +396,41 @@ public:
             out.inject = with_context(
                 model_.weight(*w.inject).name,
                 [&] { return native_weight(model_.weight(*w.inject).view); });
+        if (out.down.qtype != QType::BF16 || out.down.layout != QuantLayout::Contiguous) {
+            return out;
+        }
+        // The compact down matrix is the whole parent when the layer has no injection stream.
+        if (!out.inject) {
+            out.down_fused = out.down;
+            return out;
+        }
+        const auto& down = model_.weight(w.down).view;
+        const auto& inject = model_.weight(*w.inject).view;
+        const bool fused = down.parts.size() == 1 && inject.parts.size() == 1 &&
+                           down.parts.front().parent != nullptr &&
+                           down.parts.front().parent == inject.parts.front().parent &&
+                           down.parts.front().begin == 0 &&
+                           down.parts.front().end == inject.parts.front().begin;
+        if (!fused) {
+            throw std::invalid_argument(
+                model_.weight(w.down).name +
+                ": a compact BF16 HC pair needs `down` and `inject` to be the first and second row "
+                "blocks of one parent");
+        }
+        const auto rows  = down.shape.at(0) + inject.shape.at(0);
+        const auto width = down.shape.at(1);
+        // The fused matrix is [kRank + streams, H*C] and `up` is [H*C, kRank]: the tail rows are one
+        // coefficient per stream, so the count comes from the config rather than a constant here.
+        const auto streams = std::size_t(model_.config().text.hc ? model_.config().text.hc->count : 0);
+        if (inject.shape.at(1) != width || inject.shape.at(0) != streams ||
+            out.up.ndim != 2 || std::size_t(out.up.shape[0]) != width ||
+            std::size_t(out.up.shape[1]) != down.shape.at(0)) {
+            throw std::invalid_argument(
+                model_.weight(w.down).name + ": the compact BF16 HC pair is not [rank+streams, H*C] "
+                                            "followed by [H*C, rank]");
+        }
+        out.down_fused = native_weight({{rows, width},
+                                        {{down.parts.front().parent, 0, rows * width}}});
         return out;
     }
 

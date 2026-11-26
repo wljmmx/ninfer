@@ -44,8 +44,8 @@ void TextContext::hc_mix_into(const HcParameters& weights, std::int32_t tokens) 
     // Produces the block's single-stream input and the four coefficients its correction applies.
     nan_probe_tensor("hc-mix-pre", hc_.input, 300, ctx_.stream);
     nan_probe_tensor("hc-normed", hc_.normalized, 400, ctx_.stream);
-    ops::hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
-                ctx_.execution_view());
+    hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
+           ctx_.execution_view());
     nan_probe_tensor("hc-mix-out", hc_.input, 200, ctx_.stream);
 }
 
@@ -86,8 +86,8 @@ void TextContext::hc_tap_publish(std::size_t layer, std::int32_t tokens) {
             tap_weights = &*parameters_.text.layers[layer + 1].input_hc;
         }
     }
-    ops::hc_mix(hc_.residual.view({width, streams, tokens}), tap_weights->block_form(), work_,
-                hc_.input, hc_.injection, ctx_.execution_view());
+    hc_mix(hc_.residual.view({width, streams, tokens}), tap_weights->block_form(), work_,
+           hc_.input, hc_.injection, ctx_.execution_view());
 }
 
 void TextContext::final_hidden(Tensor& x, Tensor& out, std::int32_t tokens) {
@@ -96,9 +96,9 @@ void TextContext::final_hidden(Tensor& x, Tensor& out, std::int32_t tokens) {
         return;
     }
     const auto& weights = *final_hc_;
-    ops::hc_mix(hc_.normalized.view({dimension(config_.hidden_size),
-                                     dimension(config_.hc->count), tokens}),
-                weights.final_form(), work_, out, ctx_.execution_view());
+    hc_mix(hc_.normalized.view({dimension(config_.hidden_size),
+                                dimension(config_.hc->count), tokens}),
+           weights.final_form(), work_, out, ctx_.execution_view());
     // The head's own input per rectangle column. Every mixer output on this pass measured healthy,
     // so if this fold is flat for the columns after the anchor the collapse is here, before the
     // projection, and not in any layer.

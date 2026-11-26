@@ -689,3 +689,52 @@ GGUF 的 `ffn_gate_exps` 是 3D `[512, 640, 2560]`，而 binder 通过 `banked` 
 `prepare_gdn_control_proj_weights` 要求 `a_projection`/`b_projection` 连续（`concatenate_rows`），
 即 GGUF 的 `ssm_alpha` + `ssm_beta` 必须合成一个 `[96, 2560]` 对象、用 parts 切两段
 （参考工件正是如此）。转换器需要新增“多来源合并成一个对象”的写入路径。
+
+**2026-11-26 合并父对象补齐（GDN control / PLE key-value / HC down-inject），加载推进到“缺 kernel”**：
+
+转换器把“模型要求同父对象”的两段参数统一成表驱动合并（`STACKED_PAIRS` + `merge_stacked_pairs`），
+每个父对象用 `segments` 按源文件区间顺序写出、binding 用**元素范围** `parts` 引用：
+
+| 合并对 | 父对象形状 | 依据 |
+|---|---|---|
+| `ssm_alpha` + `ssm_beta`（37 层） | `[96, 2560]` | `prepare_gdn_control_proj_weights` 要求连续（`concatenate_rows`）|
+| `ple_key` + `ple_value` | `[12800, 2560]` | PLE gate 读 `key`/`value` 为同一个 `[H*C+H,H]` 投影的两半 |
+| `hc_*_down` + `hc_*_inject`（48 层 × 2） | `[324, 10240]` | `hc_mix` 的 BF16 行尾形状，第 320–323 行是注入系数 |
+
+三处均与参考工件 `qwen3_8_flash_next_v5_e2.ninfer` 的 binding 逐一比对过（同一对象、同样的元素区间）。
+容器审计：1224 个源张量全部有归属（1150 同名 + 74 进入 37 组/1 组合并父对象），
+1273 个对象（text 1187 + dflash2 81 + resource 5）、71.75 GiB、25 抽样 sha256 全对、0 个未解析 binding。
+
+HC 的两种存储形态此前只在参数层假定一种（q5 分组），现在由**工件**决定、
+并在 `execution/hc_forms.cpp` 一处 `std::visit` 分发，`Model` 侧调用点不再各自判断：
+- compact：一个 BF16 `[rank(+streams), H*C]` 父对象，行尾是注入行（本工件）；
+- groupwise：q5_g64_fp16 的 row_split 三平面（原生 35B 工件）。
+
+同时修掉一个**假故障**：`table.h` 早在 11:26 加了 `GgmlBlock` 分支，但 `parameters.cpp.obj` /
+`ple_layer.cpp.obj` 是前一晚的产物——depfile 不跟头文件，导致 PLE 表被判成不支持。
+删 obj 重编后即刻通过（这正是仓库已知陷阱的又一实例）。顺带给 `ple_layer.cpp` 的
+`qtype_name`/`layout_name` 补上 12 个 `ggml_*` 与 `ggml_block_v1`，拒绝信息不再打印 `unknown/unknown`。
+
+当前前沿（`NINFER_PARAM_TRACE` 逐段探针定位后已全部移除）：
+
+```
+[ple] table text/layers/1/ple/table: encoding ggml_iq4_nl/ggml_block_v1, 320001536 rows x 160, supported
+warning: startup attempt failed | finalizing target
+exit = 0xC0000005
+```
+
+参数构建全部通过（48 层 × norms/ffn/两个 HC/混合器、`final_hc`、`output_head` 都建成），
+崩溃点落在 `startup.cpp` 的规划里 `execution::gdn_projection_workspace_bytes` →
+`ops::linear_workspace_capacity_bytes(ggml_iq3_s, ...)`，即 **该编码没有 Linear 计算路径**。
+两个问题要分开处理：
+
+1. **真实缺口（主线）**：`ggml_*` 11 种块编码没有 device 解码 → Linear / routed MoE 都跑不了。
+   本工件的实际类型分布（按角色核实）：注意力与 GDN 投影 = IQ4_XS/Q6_K/Q4_K/Q5_K/IQ3_S；
+   专家 gate/up = IQ2_XS/IQ2_XXS/IQ3_S/IQ2_S/IQ3_XXS；专家 down 与 shared down = IQ4_NL/Q2_0；
+   词表 IQ3_S、输出头 Q5_K。这 11 种全部已在 v3 注册表登记，缺的只是 kernel。
+2. **诊断缺陷（顺带记录）**：在 `layout.scope()` 存活期间抛出的 `invalid_argument` 不会变成
+   “error: ...” 而是 0xC0000005——同一异常在 scope 之外（如 PLE 表检查）能正常上报。
+   一旦 (1) 补齐，这条路径自然消失；若先修体验，应把 qtype 可运行性校验放到进入 scope 之前。
+
+下一步：按台账既定顺序写 host 参考解码（对齐 gguf-py `dequantize`）→ sm_89 device 解码 →
+routed MoE 新增 GGML profile + Linear 的 `ggml_*` 分发，最后才是 decode 速率。

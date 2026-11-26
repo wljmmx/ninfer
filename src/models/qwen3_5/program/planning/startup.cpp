@@ -29,6 +29,7 @@
 #include <initializer_list>
 #include <limits>
 #include <cstdlib>
+#include <cstdio>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -424,8 +425,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     // The low-rank pair's own scratch, sized by the same capacity query the Op calls.
     const auto hc_mix_scratch = [&](WorkspaceLayoutBuilder& layout,
                                     const execution::HcParameters& hc, int first, int last) {
-        scratch(layout, ops::hc_mix_workspace_capacity_bytes(hc.block_form(), first, last,
-                                                            device_execution));
+        scratch(layout, execution::hc_mix_workspace_capacity_bytes(hc.block_form(), first, last,
+                                                                  device_execution));
     };
     const auto linear_scratch = [&](WorkspaceLayoutBuilder& layout,
                                     const execution::LinearParameters& p, int first, int last) {
@@ -547,7 +548,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             linear_scratch(layout, parameters.text.output_head, first, last);
             if (parameters.text.final_hc) {
                 auto stage = layout.scope();
-                scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+                scratch(layout, execution::hc_mix_workspace_capacity_bytes(
                                     parameters.text.final_hc->final_form(), first, last,
                                     device_execution));
             }
@@ -599,19 +600,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (!mtp_hc) { return; }
         {
             auto stage = layout.scope();
-            scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+            scratch(layout, execution::hc_mix_workspace_capacity_bytes(
                                 parameters.mtp->input_hc->block_form(), first, last,
                                 device_execution));
         }
         {
             auto stage = layout.scope();
-            scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+            scratch(layout, execution::hc_mix_workspace_capacity_bytes(
                                 parameters.mtp->post_attention_hc->block_form(), first, last,
                                 device_execution));
         }
         {
             auto stage = layout.scope();
-            scratch(layout, ops::hc_mix_workspace_capacity_bytes(
+            scratch(layout, execution::hc_mix_workspace_capacity_bytes(
                                 parameters.mtp->final_hc->final_form(), first, last,
                                 device_execution));
         }

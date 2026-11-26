@@ -626,8 +626,8 @@ void TextContext::mtp_hc_stem(const Tensor& ids, const Tensor& hidden,
     Tensor normalized = roots.normalized.view({hidden_width, streams, T});
     ops::hc_grouped_rmsnorm(residual, mtp_->input_norm.view({hidden_width, streams}),
                             config_.rms_norm_eps, normalized, ctx_.execution_view());
-    ops::hc_mix(normalized, mtp_->input_hc->block_form(), work_, roots.input, roots.injection,
-                ctx_.execution_view());
+    hc_mix(normalized, mtp_->input_hc->block_form(), work_, roots.input, roots.injection,
+           ctx_.execution_view());
 }
 
 void TextContext::mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positions,
@@ -717,8 +717,8 @@ void TextContext::mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positi
     ops::hc_combine_norm(residual, roots.product, roots.injection,
                          mtp_->post_attention_norm.view({hidden_width, streams}),
                          config_.rms_norm_eps, residual, normalized, ctx_.execution_view());
-    ops::hc_mix(normalized, mtp_->post_attention_hc->block_form(), work_, roots.input,
-                roots.injection, ctx_.execution_view());
+    hc_mix(normalized, mtp_->post_attention_hc->block_form(), work_, roots.input,
+           roots.injection, ctx_.execution_view());
 
     CUDA_CHECK(cudaMemsetAsync(roots.product.data, 0, roots.product.bytes(), s));
     {
@@ -728,8 +728,8 @@ void TextContext::mtp_hc_tail(workspace::MtpHcRoots& roots, const Tensor& positi
     ops::hc_combine_norm(residual, roots.product, roots.injection,
                          mtp_->final_norm.view({hidden_width, streams}), config_.rms_norm_eps,
                          residual, normalized, ctx_.execution_view());
-    ops::hc_mix(normalized, mtp_->final_hc->final_form(), work_, mtp_hidden,
-                ctx_.execution_view());
+    hc_mix(normalized, mtp_->final_hc->final_form(), work_, mtp_hidden,
+           ctx_.execution_view());
     // The next draft step conditions on the pre-final-mixer residual, which is the model's second
     // tail feature; the head's 2560-wide sample cannot produce it.
     if (conditioning != nullptr && conditioning->data != nullptr) {
@@ -1100,8 +1100,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                  mtp_->post_attention_norm.view({width, streams}),
                                  config_.rms_norm_eps, residual, normalized,
                                  ctx_.execution_view());
-            ops::hc_mix(normalized, mtp_->post_attention_hc->block_form(), work_, tail_column.input,
-                        tail_column.injection, ctx_.execution_view());
+            hc_mix(normalized, mtp_->post_attention_hc->block_form(), work_, tail_column.input,
+                   tail_column.injection, ctx_.execution_view());
             CUDA_CHECK(cudaMemsetAsync(tail_column.product.data, 0, tail_column.product.bytes(), s));
             {
                 auto post_mixer_scope = work_.scope();
@@ -1111,8 +1111,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             ops::hc_combine_norm(residual, tail_column.product, tail_column.injection,
                                  mtp_->final_norm.view({width, streams}), config_.rms_norm_eps,
                                  residual, normalized, ctx_.execution_view());
-            ops::hc_mix(normalized, mtp_->final_hc->final_form(), work_, *final_hidden,
-                        ctx_.execution_view());
+            hc_mix(normalized, mtp_->final_hc->final_form(), work_, *final_hidden,
+                   ctx_.execution_view());
             if (conditioning != nullptr && conditioning->data != nullptr) {
                 if (conditioning->numel() != tail_column.residual.numel()) {
                     throw std::invalid_argument("MTP conditioning frame shape mismatch");

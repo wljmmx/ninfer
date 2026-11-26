@@ -71,8 +71,8 @@ PleRowEncoding row_encoding(const WeightGeometry& geometry) {
     if (geometry.format == QType::GGML_IQ4_NL && geometry.layout == QuantLayout::GgmlBlock)
         return PleRowEncoding::Iq4Nl;
     throw artifact::ArtifactError(
-        "PLE table: the declared encoding is neither nf4_g16_e4m3fn/row_paged_g16_4k_v1 nor "
-        "q4_g64_fp16/row_split_k128_v1");
+        "PLE table: the declared encoding is neither nf4_g16_e4m3fn/row_paged_g16_4k_v1, "
+        "ggml_iq4_nl/ggml_block_v1, nor q4_g64_fp16/row_split_k128_v1");
 }
 
 std::size_t encoded_row_bytes(PleRowEncoding encoding) {

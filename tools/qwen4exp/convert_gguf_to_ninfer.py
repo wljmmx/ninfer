@@ -73,6 +73,9 @@ class Obj:
     transpose: bool = False
     # F16 -> BF16: same two-byte width, but the model's conv kernels are bf16 operands.
     f16_to_bf16: bool = False
+    # Objects assembled from more than one source range (the GDN control pair, which the model
+    # addresses as one parent). Each entry is (source offset, byte count), written in order.
+    segments: list | None = None
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -279,6 +282,10 @@ def write_shard(path: str, shard: list, base: int, final_size: int, index: int,
                 f.write(bf)
                 h.update(bf)
                 written += len(bf)
+            elif obj.segments:
+                for src_off, src_len in obj.segments:
+                    copy_range(obj.src, src_off, src_len, f, h)
+                    written += src_len
             elif obj.transpose:
                 rows, cols = obj.shape          # target [kernel, channels]
                 src_elem = 4 if obj.f32_to_bf16 else (obj.bytes // (rows * cols))
@@ -510,6 +517,72 @@ def expand_dflash(objs: list, component: str) -> tuple:
     return objs, bindings
 
 
+# Logical parameters the model addresses as two row blocks of ONE parent. Each entry is
+# (first tensor suffix, second tensor suffix, merged object suffix, first binding, second binding).
+# Verified against the same-model reference artifact: its bindings are `parts` ranges over a single
+# object for exactly these pairs (gdn control [96,2560] and ple embedding [12800,2560]).
+#
+# The HC pairs are the compact form the Qwen4Exp path reads: `down` rows then `inject` rows of one
+# BF16 parent, which is the [rank+streams, H*C] matrix `hc_mix`'s row-tail schedule decodes. The
+# final HC has no injection stream, so it is not a pair and keeps `down` as its own object.
+STACKED_PAIRS = (
+    ("ssm_alpha", "ssm_beta", "gdn_control", "gdn/a_projection", "gdn/b_projection"),
+    ("ple_key", "ple_value", "ple_embedding", "ple/key", "ple/value"),
+    ("hc_attn_down", "hc_attn_inject", "hc_attn_pair", "attention_hc/down", "attention_hc/inject"),
+    ("hc_ffn_down", "hc_ffn_inject", "hc_ffn_pair", "moe_hc/down", "moe_hc/inject"),
+)
+
+
+def merge_stacked_pairs(objs: list, bindings: dict) -> tuple:
+    """Fold every two-block parameter into the single parent the model's ops require.
+
+    `prepare_gdn_control_proj_weights` concatenates its A/B pair, the PLE gate reads `key` and
+    `value` as two halves of one [H*C+H,H] projection, and `hc_mix` reads `down` plus its injection
+    rows as one row-tailed matrix; all three refuse a pair that lives in two objects. GGUF keeps
+    them apart, so each pair becomes one object holding the two byte ranges back to back, with the
+    bindings addressing them as `parts` - the same shape the reference artifact uses. The row split
+    is by element range, so it holds for quantised parents as long as both halves share one encoding
+    and one column count.
+    """
+    by_suffix: dict = {}
+    for obj in objs:
+        for tag in {t[0] for t in STACKED_PAIRS} | {t[1] for t in STACKED_PAIRS}:
+            if obj.id.endswith(f".{tag}.weight"):
+                by_suffix.setdefault(obj.id[: -len(f".{tag}.weight")], {})[tag] = obj
+    drop = set()
+    added = []
+    for prefix, parts in by_suffix.items():
+        # The layer is the `blk.N` component, not the last dotted field: an HC pair's prefix ends in
+        # `hc_attn`, which is what the tensor name carries after the block number.
+        if ".blk." not in prefix:
+            continue
+        layer = int(prefix.rsplit(".blk.", 1)[1].split(".", 1)[0])
+        for tag_a, tag_b, merged_name, key_a, key_b in STACKED_PAIRS:
+            a, b = parts.get(tag_a), parts.get(tag_b)
+            if a is None or b is None:
+                continue
+            if a.fmt != b.fmt or a.layout != b.layout or a.shape[1] != b.shape[1]:
+                # A mixed encoding cannot be one parent: refuse loudly instead of packing a pair the
+                # loader will reject later with a message that no longer names the cause.
+                raise ValueError(f"{prefix}: {tag_a}/{tag_b} differ in encoding or width, so they "
+                                 f"cannot be one parent ({a.fmt} {a.shape} vs {b.fmt} {b.shape})")
+            cols = a.shape[1]
+            span = a.shape[0] * cols
+            merged = Obj(id=f"{prefix}.{merged_name}.weight", kind="tensor",
+                         shape=[a.shape[0] + b.shape[0], cols], fmt=a.fmt, layout=a.layout,
+                         src=a.src, src_offset=a.src_offset, bytes=a.bytes + b.bytes,
+                         segments=[(a.src_offset, a.bytes), (b.src_offset, b.bytes)])
+            bindings[f"text/layers/{layer}/{key_a}"] = {
+                "parts": [{"object": merged.id, "range": [0, span]}]}
+            bindings[f"text/layers/{layer}/{key_b}"] = {
+                "parts": [{"object": merged.id, "range": [span, span + b.shape[0] * cols]}]}
+            added.append(merged)
+            drop.add(a.id)
+            drop.add(b.id)
+    kept = [o for o in objs if o.id not in drop] + added
+    return kept, bindings
+
+
 def expand_text(objs: list, layer_types: list, ple_layer_id: int = 1) -> tuple:
     """Cut merged tensors and return (objects, bindings) for the text component.
 
@@ -590,6 +663,7 @@ def main() -> int:
         text_cfg = text_config(read_metadata(source(args.text[0])))
     text_objs, bindings = expand_text(text_objs, text_cfg.get("layer_types", []),
                                       int((text_cfg.get("ple") or {}).get("layer_ids", [1])[0]))
+    text_objs, bindings = merge_stacked_pairs(text_objs, bindings)
     objs = list(text_objs)
     components = {"text": {"config": text_cfg}}
     for flag, comp, arc in (("dflash2", "dflash2", "Qwen3_8DFlash2"),

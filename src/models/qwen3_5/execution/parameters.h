@@ -158,20 +158,51 @@ struct GdnParameters {
     LinearParameters output;
 };
 
-// Qwen4Exp's low-rank correction around one grouped stream norm. The artifact stores the down
-// projection and the four injection rows as separate regions of one quantized object, so they are
-// two matrices here; the mix Op takes them in that form. The norm itself is the block's
+// Qwen4Exp's low-rank correction around one grouped stream norm. The norm itself is the block's
 // input_norm / post_attention_norm (the attention correction's norm is the former, the MoE
 // correction's the latter), and the final correction has no injection stream.
+//
+// Two storage forms exist and the artifact decides which one it carries, never the call site:
+//
+//  * compact: one BF16 parent holding `down` rows followed by the injection rows (`down_fused`),
+//    which is the [kRank+kStreams, H*C] matrix the Op's row-tail schedule reads directly;
+//  * groupwise: `down`, `inject` and `up` as q5_g64_fp16 planes in the row-split layout, each with
+//    its own scale plane, addressed as separate matrices.
+//
+// `block_form()`/`final_form()` answer with the variant so every consumer (execution, workspace
+// planning) is written once and both artifacts run through the same call.
 struct HcParameters {
     Weight down, up;
     std::optional<Weight> inject;
+    // Set when `down` and `inject` are two row blocks of one compact parent, in that order.
+    std::optional<Weight> down_fused;
 
-    [[nodiscard]] ops::HcSeparateMixWeights block_form() const {
-        return {down, *inject, up};
+    using BlockForm = std::variant<ops::HcSeparateMixWeights, ops::HcMixWeights>;
+    using FinalForm = std::variant<ops::HcFinalSeparateMixWeights, ops::HcFinalMixWeights>;
+
+    [[nodiscard]] bool compact() const noexcept { return down_fused.has_value(); }
+    [[nodiscard]] BlockForm block_form() const {
+        if (down_fused) { return ops::HcMixWeights{*down_fused, up}; }
+        return ops::HcSeparateMixWeights{down, *inject, up};
     }
-    [[nodiscard]] ops::HcFinalSeparateMixWeights final_form() const { return {down, up}; }
+    [[nodiscard]] FinalForm final_form() const {
+        if (compact()) { return ops::HcFinalMixWeights{down, up}; }
+        return ops::HcFinalSeparateMixWeights{down, up};
+    }
 };
+
+// One entry point per form, so a consumer never names the storage. Defined in execution/hc_forms.cpp.
+void hc_mix(const Tensor& normalized, const HcParameters::BlockForm& weights,
+            WorkspaceArena& workspace, Tensor& block_input, Tensor& injection,
+            DeviceExecutionView execution);
+void hc_mix(const Tensor& normalized, const HcParameters::FinalForm& weights,
+            WorkspaceArena& workspace, Tensor& sample_hidden, DeviceExecutionView execution);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcParameters::BlockForm& weights,
+                                                          std::int32_t first, std::int32_t last,
+                                                          DeviceExecutionView execution);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcParameters::FinalForm& weights,
+                                                          std::int32_t first, std::int32_t last,
+                                                          DeviceExecutionView execution);
 
 // Qwen4Exp's per-block n-gram embedding ("PLE"), in the form the PLE Ops consume.
 //
