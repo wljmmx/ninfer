@@ -1,4 +1,6 @@
 #include "ninfer/ops/moe.h"
+
+#include "core/ggml_types.h"
 #include "ops/common/host/operands.h"
 #include "ops/moe/routed_swiglu/cpu/dispatch.h"
 #include "ops/moe/routed_swiglu/cpu/split.h"
@@ -58,6 +60,23 @@ public:
         const auto& layout       = bank.layout;
         const auto& geometry     = bank.parent->geometry;
         const auto elements      = std::size_t(rows) * columns;
+        // GGML block banks carry no separate scale plane and no group: each row is a run of encoded
+        // blocks, so only the region, the format and the row width are checked here.
+        if (core::is_ggml_block(type)) {
+            const auto ggml = core::ggml_block_geometry(type);
+            const std::uint64_t row_bytes =
+                std::uint64_t(columns) / ggml.block * ggml.type_bytes;
+            require(layout.format == type && layout.layout == QuantLayout::GgmlBlock &&
+                        layout.region.count == unsigned(count) &&
+                        layout.region.rows == unsigned(rows) &&
+                        layout.columns == unsigned(columns) &&
+                        geometry.padded_columns == unsigned(columns) &&
+                        std::int64_t(columns) % std::int64_t(ggml.block) == 0,
+                    "routed_swiglu CPU: invalid GGML weight bank");
+            require(layout.codes.expert_stride == std::uint64_t(rows) * row_bytes,
+                    "routed_swiglu CPU: GGML bank stride disagrees with its row geometry");
+            return;
+        }
         const bool nvfp4         = type == QType::NVFP4;
         // port (sm_89, P4-B): Q8_G32_FP16 carries one plain int8 code per dimension (no high
         // plane) with an FP16 scale per 32-value group, so its code plane is elements bytes
@@ -259,7 +278,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     }
     // port (sm_89): the gate/up/down form. Each matrix is validated against its own row domain:
     // gate and up are I rows wide, down is H rows — the fused 2I row map is not this form's.
-    if (split_form) {
+    if (split_form && !core::is_ggml_block(profile.ffn.gate_up_type)) {
         require(experts.gate_up.parent == nullptr,
                 "routed_swiglu CPU: a split gate/up bank cannot carry a fused gate_up view");
         require(experts.up.parent != nullptr, "routed_swiglu CPU: split gate without an up bank");
@@ -288,6 +307,32 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         return;
     }
     const auto& shape = impl::shape_dispatch(profile);
+    // GGML banks are split (three objects) but have no bit-packed split kernel: they go through the
+    // shape policy, whose launch reads the stored blocks. The fused form below stays as it was.
+    if (split_form && core::is_ggml_block(profile.ffn.gate_up_type)) {
+        require(experts.gate_up.parent == nullptr,
+                "routed_swiglu CPU: a split gate/up bank cannot carry a fused gate_up view");
+        require(experts.up.parent != nullptr, "routed_swiglu CPU: split gate without an up bank");
+        require(experts.down.parent != nullptr,
+                "routed_swiglu CPU: split form without a down bank");
+        operands.bank(experts.gate, profile.ffn.gate_up_type, profile.ffn.gate_up_layout,
+                      profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
+        operands.bank(experts.up, profile.ffn.gate_up_type, profile.ffn.gate_up_layout,
+                      profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
+        operands.bank(experts.down, profile.ffn.down_type, profile.ffn.down_layout,
+                      profile.ffn.hidden, profile.ffn.intermediate, profile.experts, selected);
+        auto scope = scratch.scope();
+        const kernel::Invocation ggml_args{.input        = static_cast<const std::uint16_t*>(x.data),
+                                           .ids          = ids,
+                                           .coefficients = coefficients,
+                                           .experts      = experts,
+                                           .subset       = subset.kind,
+                                           .mask         = mask,
+                                           .output       = static_cast<float*>(destination.data),
+                                           .tokens       = tokens};
+        shape.launch(ggml_args, scratch, execution);
+        return;
+    }
     operands.bank(experts.gate_up, profile.ffn.gate_up_type, profile.ffn.gate_up_layout,
                   2 * profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
     operands.bank(experts.down, profile.ffn.down_type, profile.ffn.down_layout, profile.ffn.hidden,

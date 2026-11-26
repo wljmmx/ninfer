@@ -16,6 +16,8 @@ const ShapePolicy& q4_q5_h2048_i512_e256_k8();
 const ShapePolicy& q4_q6_h2048_i512_e256_k8();
 const ShapePolicy& q8_q8_h2048_i512_e256_k8();
 const ShapePolicy& nvfp4_h2560_i640_e512_k10();
+// The Qwen4Exp GGML row on the Host half of a split layer: H=2560, I=640, E=512, K=10.
+const ShapePolicy& ggml_h2560_i640_e512_k10();
 void validate_capacity(ExpertSubsetKind subset, int first, int last);
 
 } // namespace ninfer::ops::detail::moe_routed_cpu

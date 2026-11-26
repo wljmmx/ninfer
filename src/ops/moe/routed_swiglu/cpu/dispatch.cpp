@@ -1,5 +1,7 @@
 #include "ops/moe/routed_swiglu/cpu/dispatch.h"
 
+#include "core/ggml_types.h"
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail::moe_routed_cpu {
@@ -63,6 +65,16 @@ const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
         break;
     default:
         break;
+    }
+    // GGML block streams: the experts are read in their stored encoding on this half too, so the
+    // split path can hand either side of a layer to the Host.
+    if (core::is_ggml_block(ffn.gate_up_type)) {
+        if (ffn.hidden == 2560 && ffn.intermediate == 640 && profile.experts == 512 &&
+            profile.top_k == 10 && core::is_ggml_block(ffn.down_type) &&
+            ffn.gate_up_layout == QuantLayout::GgmlBlock &&
+            ffn.down_layout == QuantLayout::GgmlBlock) {
+            return ggml_h2560_i640_e512_k10();
+        }
     }
     throw std::invalid_argument("routed_swiglu CPU: unsupported profile");
 }
