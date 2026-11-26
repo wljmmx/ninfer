@@ -1040,3 +1040,41 @@ HEAD→重编”这一串之后**不再复现**（同一命令、干净重建、
    本模型 `unslotted=44574 of 73728` 说明大量 route 走这条腿，必须实现；
 5. **共享专家项**：`ScaledSwiGLUTerm`（需要转换器把 `ffn_gate_shexp|ffn_up_shexp` 合并成 `[2I,H]`，
    并给 dense SwiGLU 一个 GGML 分支）。
+
+**2026-11-26 设备侧 GGML 专家路径跑通；下一处是 split 的 CPU 半边**：
+
+本轮把 `entry.cpp` 的 GGML 分支真正接到内核，并按接口补了三件事：
+
+1. **子集语义**：`ExpertBank`/内核接 `ExpertSubsetKind` + `mask`，不参与的 route 贡献 0
+   （与 `moe_cpu::participates` 同一判据）；
+2. **epilogue 模式**：`Write` 覆盖、`AddResidual` 累加；每个 `(token,row)` 只由一个 CTA 写，无竞争；
+3. **银行寻址 + host 腿**：`bank_from(view, k, qtype)` 由 **K 与编码**算行宽
+   （`k/block*type_bytes`），而不是从 `code_stride` 推——后者在流式层是**专家池槽位步长**
+   （本机 512 KiB），这是本轮踩到的第一个真错。每专家基址为
+   `codes + (offsets[e] 或 e*expert_stride)`，`host_flags[e]` 非零时改走
+   `host_codes + host_offsets[e]`（本模型 `unslotted=44574 of 73728`，这条腿是主路径）。
+
+**顺带修掉一个真实约定错误**：`ExpertRoutes` 的存储是 **token-major**（assignment (r,t) 在 `t*K+r`，
+与 `topk_softmax_route` 的写入一致），我此前按 `k*T+t` 写。测试与内核都已改。
+
+另外修掉一个**定价/分配不一致**：`capacity()` 用 `peak_bytes(1)` 定价，而我在 launch 里用 256 对齐再分配，
+多出最多 255 字节导致 `bad allocation`；现改为与定价同形的 1 对齐（arena 基址已由调用方对齐）。
+同时把 ggml 分支移动到 `allocate()` **之前**——`allocate()` 的 ggml 臂只用于规划期定价，
+在执行期再调一次会把同一段字节分配两次（`[alloc] workspace wants 14380 at offset 14380, arena holds 14380`）。
+
+实测前沿（干净重建）：
+
+```
+engine ready | Qwen3.8-Flash-Next GSQ-RCO | total 4.6s | weights 3.83 GiB
+[ple] window: tokens=51 batch=1 first id=248045 slot=0 live=51, table rows=816
+[host] arena mapped bytes=20584595456 ... device_accessible=1 (preallocated)
+error: text/layers/0 prefill columns=51: routed_swiglu CPU: invalid weight geometry
+```
+
+即**设备侧专家已跑通**，现在卡在 split 路径的 **CPU 半边**：`ops::routed_swiglu`(CPU) 对
+`CpuSwiGLUExperts` 的 BankView 做几何校验时拒绝 `ggml_block_v1`（同一族缺 `ggml_*` 的 CPU 实现）。
+下一步就在 `ops/moe/routed_swiglu/cpu/`：`shape_dispatch` 增加 ggml 条目 +
+一个标量 SwiGLU（可直接复用 `core/ggml_dequant.h` 的 host 解码器），语义与本轮设备侧一致
+（子集判据、BF16 中间舍入、系数尾）。
+
+回归：`ctest -R 'ggml|moe'` **13/13** 通过（含 `ninfer_ggml_experts_test`、`ninfer_moe_qwen4exp_split_test`）。
