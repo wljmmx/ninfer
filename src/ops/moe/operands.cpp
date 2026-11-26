@@ -1,5 +1,7 @@
 #include "ops/moe/operands.h"
 
+#include "core/ggml_types.h"
+
 #include <array>
 #include <cmath>
 #include <stdexcept>
@@ -37,6 +39,19 @@ void validate_route_profile(const RouteProfile& p) {
 void validate_expert_profile(const RoutedSwiGLUProfile& p) {
     validate_route_profile({p.ffn.hidden, p.experts, p.top_k});
     const auto& f = p.ffn;
+    // GGML block streams: the container carries the experts exactly as the GGUF source encoded them,
+    // so gate/up and down name one of the block types and the row geometry is the bank's own. The
+    // decode happens in the kernel (ops/moe/ggml/ggml_experts.cu).
+    if (core::is_ggml_block(f.gate_up_type)) {
+        require(f.hidden == 2560 && f.intermediate == 640 && p.experts == 512 && p.top_k == 10,
+                "routed SwiGLU: unsupported GGML expert geometry");
+        require(core::is_ggml_block(f.down_type) &&
+                    f.gate_up_layout == QuantLayout::GgmlBlock &&
+                    f.down_layout == QuantLayout::GgmlBlock &&
+                    valid_linear_policy(f.gate_up_policy) && valid_linear_policy(f.down_policy),
+                "routed SwiGLU: unsupported GGML expert profile");
+        return;
+    }
     if (f.hidden == 2560) {
         const bool nvfp4 = f.gate_up_type == QType::NVFP4 &&
                            f.gate_up_layout == QuantLayout::BlockScaleK16M128x4 &&

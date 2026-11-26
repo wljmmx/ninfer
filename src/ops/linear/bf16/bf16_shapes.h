@@ -11,6 +11,9 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Bf16Launch select_bf16_n1664_k2560(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n256_k5120(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n256_k2560(std::int32_t tokens);
+// The Qwen4Exp MoE router: hidden (2560) onto the expert count (512).
+[[nodiscard]] Bf16Launch select_bf16_n512_k2560(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n128_k2560(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n324_k10240(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n320_k10240(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n10240_k320(std::int32_t tokens);

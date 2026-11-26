@@ -34,7 +34,10 @@ inline void with_shape(ShapeKind kind, Function&& function) {
     }
 }
 
-enum class ExpertImplementation { GroupwiseInt, BlockScaled };
+// GgmlBlock: the container stores the experts as GGML block streams, which the groupwise-int and
+// block-scaled kernels cannot read. Its scratch is a per-CTA staging area (top_k x intermediate
+// products), so it is priced by ops/moe/ggml/ggml_experts.h rather than here.
+enum class ExpertImplementation { GroupwiseInt, BlockScaled, GgmlBlock };
 
 inline void launch_zero(Tensor& destination, CudaExecutionView execution) {
     CUDA_CHECK(cudaMemsetAsync(destination.data, 0, destination.bytes(), execution.stream));

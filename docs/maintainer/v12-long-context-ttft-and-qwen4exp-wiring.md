@@ -920,3 +920,42 @@ allocation boundaries）、`ExpertSubsetKind` 四种子集的语义、共享专�
    跑一次，可直接定位释放后使用的分配点。
 
 模型加载仍停在 `routed SwiGLU: unsupported Qwen4Exp weight profile`（专家的 ggml 编码）。
+
+**2026-11-26 MoE 计划层接通：加载推进到 `initializing runtime`**：
+
+接上了 `routed_swiglu` 的第三种实现（计划层，执行层仍显式拒绝）：
+
+- `ExpertImplementation::GgmlBlock`（`moe/kernels/cuda/launch.h`）；
+- `Plan` 增加 `ggml{top_k, intermediate, shared}`（`routed_swiglu/cuda/dispatch.h`）；
+- 新策略 `ggml_h2560_i640_e512_k10()`（`routed_swiglu/cuda/ggml/shapes/h2560_i640_e512_k10/dispatch.cpp`），
+  暂存区只依赖 `top_k × intermediate`（每 CTA 一份，与 token 数无关），boundaries 只有 `{1}`；
+- `entry.cpp`：`allocate` 分支按 `routed_swiglu_workspace_bytes()` 定价（两种 arena 的 span 类型不同，
+  此处只计价、地址留到接线时再取）；`execute` 分支**逐条命名拒绝**——`missed_routes`、
+  共享专家项、非全集子集，以及最后的“银行视图尚未转成内核的行寻址”；
+- `operands.cpp` 的 `validate_expert_profile` 接受 GGML 专家（要求 H=2560/I=640/E=512/K=10、
+  gate/up 与 down 都是 `ggml_*` 且 layout 为 `GgmlBlock`）。
+
+顺带补了两个本模型需要、但 BF16 形状表里没有的形状（`linear/bf16/shapes/`）：
+
+| 形状 | 谁 | 依据 |
+|---|---|---|
+| `n512_k2560` | MoE router（`ffn_gate_inp` … 及 `indexer.q_proj`）| GGUF 中 `ffn_gate_inp.weight [512,2560]` BF16 |
+| `n128_k2560` | QSA indexer 的 key 投影（`indexer.k_proj`）| GGUF 中 `indexer.k_proj.weight [128,2560]` BF16 |
+
+两者都复用 `n256_k2560` 的 K 阶梯（同一 K），因为在这些行数上瓶颈不在 tile 选择。
+
+结果：**TargetFinalize（规划）通过**，加载推进到 `ProgramInitialize`：
+
+```
+[graph] skipped: layer needs host fetch (pool cannot hold every layer; ...)
+[budget] experts: gpu=29154 MiB host_cache=18367 slots, unslotted=44574 of 73728, slot 1024 KiB; kv: 32 pages
+warning: startup attempt failed | initializing runtime | 698 ms
+error: vector too long
+```
+
+`error: vector too long` 是 `std::length_error`，来自某处按一个荒谬长度 `resize` 的 vector；位置在
+程序构建阶段（不是规划）。下一步就在 `ProgramInitialize` 里定位这个尺寸（很可能是某个布局/批表
+用一个与 token 数无关的量当成了长度，或 `ggml` 计划里的 `top_k * intermediate` 被当成了 token 数）。
+
+回归：`ctest -R 'moe|swiglu'` 11/11 通过（含 `ninfer_moe_qwen4exp_split_test` 47.9 s），
+`ctest -R ggml` 5/5 通过。

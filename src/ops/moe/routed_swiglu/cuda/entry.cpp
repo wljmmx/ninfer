@@ -1,5 +1,6 @@
 #include "core/nvtx.h"
 #include "ninfer/ops/moe.h"
+#include "ops/moe/ggml/ggml_experts.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
 #include "ops/moe/workspace.h"
@@ -23,6 +24,14 @@ struct CallStorage {
 template <class Arena>
 CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSubsetKind subset,
                      bool shared, bool split_activation, kernel::ShapeKind kind) {
+    if (plan.implementation == kernel::ExpertImplementation::GgmlBlock) {
+        // One CTA's staging area: it does not depend on `tokens`. The span is priced here and taken
+        // again at launch time, because the two arenas this template serves hand back different span
+        // types and the core is not wired to the banks yet.
+        (void)arena.alloc_bytes(
+            detail::ggml::routed_swiglu_workspace_bytes(plan.ggml.top_k, plan.ggml.intermediate), 256);
+        return CallStorage{};
+    }
     if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
         CallStorage out;
         out.block_scaled = block_scaled::allocate(arena, plan.block_scaled, tokens,
@@ -58,9 +67,13 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
         subset == ExpertSubsetKind::None ? std::span<const int>{} : shape.allocation_boundaries;
     return detail::interval_capacity(first, last, boundaries, impl::kSliceTokens, [&](int tokens) {
         WorkspaceLayoutBuilder layout;
-        (void)allocate(layout, shape.select(tokens, shared != nullptr), tokens, subset,
-                       shared != nullptr, profile.ffn.gate_up_type == QType::Q8_G32_FP16,
-                       kernel::shape_kind(profile));
+        const auto plan = shape.select(tokens, shared != nullptr);
+        // `shape_kind` answers in terms of the groupwise-int shapes, which a GGML plan does not have;
+        // only the branches that need it are allowed to ask.
+        const bool ggml = plan.implementation == kernel::ExpertImplementation::GgmlBlock;
+        (void)allocate(layout, plan, tokens, subset, shared != nullptr,
+                       profile.ffn.gate_up_type == QType::Q8_G32_FP16,
+                       ggml ? kernel::ShapeKind::H2560 : kernel::shape_kind(profile));
         return layout.peak_bytes(1);
     });
 }
@@ -111,9 +124,40 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         }
         auto scope         = scratch.scope();
         const auto plan    = shape.select(count, shared != nullptr);
+        const bool ggml    = plan.implementation == kernel::ExpertImplementation::GgmlBlock;
         const auto buffers = allocate(scratch, plan, count, subset.kind, shared != nullptr,
                                       profile.ffn.gate_up_type == QType::Q8_G32_FP16,
-                                      kernel::shape_kind(profile));
+                                      ggml ? kernel::ShapeKind::H2560
+                                           : kernel::shape_kind(profile));
+        if (ggml) {
+            // The GGML expert core (ops/moe/ggml/ggml_experts.cu) is verified against a host
+            // reference but is not wired to the router, the subset masks or the shared term yet.
+            // Saying which of those is missing is the whole point of this arm: the alternative is
+            // falling into the groupwise-int path with a plan that has no integer shape.
+            if (missed != nullptr) {
+                throw std::invalid_argument(
+                    "routed_swiglu: missed_routes is not implemented for the GGML expert path");
+            }
+            if (term) {
+                throw std::invalid_argument(
+                    "routed_swiglu: the GGML expert path does not carry the shared-expert term yet "
+                    "(the converter has to fuse ffn_gate_shexp|ffn_up_shexp into one [2I,H] parent, "
+                    "and the dense SwiGLU needs its own GGML arm)");
+            }
+            if (subset.kind != ExpertSubsetKind::All) {
+                throw std::invalid_argument(
+                    "routed_swiglu: the GGML expert path implements the full expert set only; the "
+                    "masked subsets are not wired yet");
+            }
+            // Reached only for the full expert set with no shared term: the verified core exists
+            // (ops/moe/ggml/ggml_experts.cu) but the device bank views still have to be turned into
+            // its per-row addressing, which is the next step. Refusing here keeps the failure named
+            // instead of running the groupwise-int kernels on a plan that has no integer shape.
+            throw std::invalid_argument(
+                "routed_swiglu: the GGML expert path is planned and priced, but its bank views are "
+                "not converted into the core's row addressing yet");
+            continue;
+        }
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
             // The block-scaled kernels skip a masked-out route without counting it. Reporting a zero
             // there would be worse than refusing: a predicted skip would read "no miss" from a path

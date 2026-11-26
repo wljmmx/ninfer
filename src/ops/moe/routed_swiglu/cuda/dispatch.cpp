@@ -1,10 +1,17 @@
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
 #include "ops/moe/operands.h"
 
+#include "core/ggml_types.h"
+
 namespace ninfer::ops::detail::moe_routed {
 
 const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
     validate_expert_profile(profile);
+    // GGML-encoded experts: the container stores the three banks as block streams. Qwen4Exp's GGUF
+    // artifact is the only source of that shape so far, so the policy is the one row it has.
+    if (core::is_ggml_block(profile.ffn.gate_up_type)) {
+        return ggml_h2560_i640_e512_k10();
+    }
     // port (sm_89): the q4/q5 and q4/q6 families now name two geometries. validate_expert_profile
     // has already refused anything that is not one of the two rows, so the hidden size alone picks
     // the policy; a third q4 row would add its case here.
