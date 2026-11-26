@@ -17,6 +17,8 @@
 #include <stdexcept>
 #include <span>
 
+#include "core/ggml_types.h"
+
 namespace ninfer::core {
 
 // The codebooks are included *inside* the namespace so they stay out of the global one; the file is
@@ -346,5 +348,8 @@ inline void decode_ggml(const std::uint8_t* data, std::uint64_t elements, std::u
         decode(data + b * type_bytes, out.subspan(b * block, block));
     }
 }
+
+// Elements per block and encoded bytes per block live in core/ggml_types.h; this header owns the
+// decoding algorithms only.
 
 } // namespace ninfer::core

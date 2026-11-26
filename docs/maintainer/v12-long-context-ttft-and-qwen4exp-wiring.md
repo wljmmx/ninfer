@@ -776,3 +776,57 @@ routed MoE 新增 GGML profile + Linear 的 `ggml_*` 分发，最后才是 decod
 decode 阶段用 warp-per-row 的 GEMV（块内联解码，权重保持编码态，不落 BF16 副本），
 prefill 阶段把 K 瓦片解到 shared 后接现有 BF16 MMA；MoE 侧需要新增 GGML profile
 （`routed SwiGLU` 目前只认 Q4_G64/Q5_G64/Q6_G64、NVFP4、FP8 三种 profile）。
+
+**2026-11-26 参考实现比对（上游 / strata）与 Linear 打通**：
+
+按用户提示比对了三处参考：本仓上游 `infer-upstream` 没有 GGML 解码（它是 Linux 线、自有原生格式，
+可参考的只是“新增量化族”的接入形状）；**strata** 有现成实现，且路线与 llama.cpp 一致：
+
+- `Strata-main/include/strata/artifact/dequant.hpp`：host 参考解码，覆盖 Q2_0/Q4_0/Q5_0/Q5_1/Q8_0/
+  Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS（**不含** IQ2/IQ3 族，因为它们的模型专家全是 Q2_0）；
+- `Strata-main/src/kernels/cuda/dequant_bf16.cu`：设备解码按 **32 值组**（`group32<TYPE>`）输出，
+  正是喂 GEMV/MMA 的接缝；`__constant__` 码表 + `f2bf` 的 RNE 舍入；
+- `Strata-main/src/kernels/cuda/iq_kernels.cu`：**llama.cpp 的 `vec_dot_*_q8_1` 全族**（含 IQ2_XXS/
+  IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS/Q4_K/Q5_K/Q2_0，DP4A 实现）+ Q8_1 激活量化；
+- `include/strata/kernels/native_mmvq.hpp`：`native_<type>_mmvq(weights, x_q8_1, y, n_in, n_out,
+  ncols, stream)` 的 API 形状与“每 32 值 36 B Q8_1 scratch”的约定。
+
+结论：**最终性能路线应是 Q8_1 激活 × 量化权重点积（DP4A）**，strata 的 `vec_dot` 可直接转写；
+本轮先把**正确性路径**打通（块内联解码 + BF16 激活的点积），因为它复用已经对拍过的解码器，
+DP4A 版作为后续替换（同接缝、同数值基准）。
+
+**本轮落地：`ggml_*` 的 Linear 家族**
+
+- `src/ops/linear/ggml/ggml_gemv.cuh`：**warp-per-row**，lane 拥有整 32 值组，
+  `dot32<TYPE>(block, group_in_block, x)` 直接在寄存器里累加（不物化块、不物化元素数组），
+  与 strata 的 `group32` 同分解；激活是 BF16，每个激活值在每个参与的行里只转换一次。
+- `src/ops/linear/ggml/ggml_linear.cu`：一个 kernel，`row_of(type,...)` 用 11 个模板实例分发；
+  `launch_linear`（写入）与 `launch_linear_add`（累加进 residual，供 `linear_add` 用）。
+- `src/ops/linear/linear.cpp`：`dispatch_linear` 与 `linear_workspace_capacity_bytes` 覆盖 11 种
+  `ggml_*`（容量 0：无 scratch）；`src/ops/wrapper/linear_add.cpp` 同样接上（累加形式）。
+- `src/core/ggml_types.h`：块几何（每块元素/字节）与 `is_ggml_block` 从 `weight_view.cpp` 抽出，
+  容器几何与 kernel 共用一张表，`weight_view.cpp` 改为委托。
+- `tests/ops/test_ggml_linear.cu`：K=两块的宽度、N=3、两列激活，kernel 结果与 host
+  参考（`core/ggml_dequant.h` 解码后 float 点积）逐值比对；输出是 BF16，参考也按 BF16 舍入后
+  比较（允许 1 ulp = 1/256），实测 **11/11 通过**。
+
+`ctest -R ggml`：`ninfer_ggml_dequant_test` 0.01 s、`ninfer_ggml_block_decode_test` 0.15 s、
+`ninfer_ggml_linear_test` 1.48 s，**3/3 通过**。
+
+模型仍不能运行，但前沿已经越过“GDN 投影无计算路径”。剩余缺口（按依赖排序）：
+
+1. **共享专家 SwiGLU**：`linear_swiglu` 只认 Q4/Q5/Q6/Q8/BF16/FP8/NVFP4，且要求 gate/up 是**一个
+   融合父对象**；本工件的 `ffn_gate_shexp` / `ffn_up_shexp` 是 IQ3_S/Q4_K/IQ4_XS/Q6_K/Q5_K 等独立对象，
+   所以需要（a）转换器把两者合成 `[2I,H]` 父对象（同 STACKED_PAIRS 模式），（b）SwiGLU 支持 `ggml_*`；
+2. **routed MoE**：`routed SwiGLU` 目前只认 Q4_G64/Q5_G64/Q6_G64、NVFP4、FP8 三种 profile，
+   本工件的专家 gate/up 是 IQ2_XS/IQ2_XXS/IQ3_S/IQ2_S/IQ3_XXS、down 是 IQ4_NL/Q2_0，
+   需要新增 GGML profile 与对应 kernel（这是最大的一块，也是 decode 吞吐的主战场）；
+3. **词表/输出头**：`token_embd`（IQ3_S）走 embedding 取行、`output`（Q5_K）已是 Linear，
+   需确认 embedding op 能按 `ggml_block_v1` 取行；
+4. 之后再把 decode 路径换成 strata/llama.cpp 的 **Q8_1 + DP4A** 版本，并与本轮的
+   `test_ggml_linear` 同一参考对拍（同接缝，只换内层）。
+
+诊断缺陷仍在：在 `layout.scope()` 存活期间抛出的异常表现为 0xC0000005 而不是 `error: ...`，
+因此上面第 1/2 项的缺口目前看不到参数名。修法：把“编码是否有计算路径”的校验放在进入
+layout builder **之前**（一次遍历所有将被算子消费的权重），或让 `WorkspaceLayoutBuilder::scope()`
+的析构在异常路径上不触碰已被移走的状态。

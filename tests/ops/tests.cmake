@@ -40,6 +40,12 @@ ninfer_add_op_test(ninfer_ggml_block_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_block_decode.cu"
   LIBRARIES ninfer_ops)
 
+# The GGML-encoded Linear itself: the kernel reads the stored blocks and must reproduce the Host
+# reference's decode-and-dot for every carried encoding.
+ninfer_add_op_test(ninfer_ggml_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)

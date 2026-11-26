@@ -1,6 +1,9 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
+#include "core/ggml_types.h"
+#include "ops/linear/ggml/ggml_linear.h"
+
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -137,6 +140,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
     }
+    // GGML: the decode accumulates in registers and writes the residual in place, so no scratch.
+    if (core::is_ggml_block(qtype)) { return 0; }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -241,6 +246,14 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    // GGML block encodings: the kernel accumulates the product into the residual in place, so the
+    // only requirement is that both sides are the BF16 tensors the caller already validated.
+    if (core::is_ggml_block(w.qtype)) {
+        (void)ws;
+        detail::ggml::launch_linear_add(x, w, residual_out, stream);
         return;
     }
 

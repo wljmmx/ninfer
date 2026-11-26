@@ -3,6 +3,7 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/ggml/ggml_linear.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
@@ -106,6 +107,21 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    // GGML block encodings read their stored blocks in the kernel; see ops/linear/ggml/ggml_gemv.cuh.
+    case QType::GGML_Q4_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q6_K:
+    case QType::GGML_Q2_0:
+    case QType::GGML_IQ4_NL:
+    case QType::GGML_IQ4_XS:
+    case QType::GGML_IQ2_XXS:
+    case QType::GGML_IQ2_XS:
+    case QType::GGML_IQ2_S:
+    case QType::GGML_IQ3_XXS:
+    case QType::GGML_IQ3_S:
+    case QType::GGML_F16:
+        detail::ggml::launch_linear(x, w, out, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -150,6 +166,20 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    // GGML: the decode streams the blocks in registers, so a launch needs no scratch.
+    case QType::GGML_Q4_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q6_K:
+    case QType::GGML_Q2_0:
+    case QType::GGML_IQ4_NL:
+    case QType::GGML_IQ4_XS:
+    case QType::GGML_IQ2_XXS:
+    case QType::GGML_IQ2_XS:
+    case QType::GGML_IQ2_S:
+    case QType::GGML_IQ3_XXS:
+    case QType::GGML_IQ3_S:
+    case QType::GGML_F16:
+        return 0;
     case QType::FP32:
     case QType::INT32:
         break;
