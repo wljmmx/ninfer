@@ -532,3 +532,39 @@ R 盘同时有对照件：`Qwen3.8-Flash-Next-DFlash2-strata1-tuned-BF16.gguf`�
 `inject` 共享一个 bf16 对象）。新容器每个 GGUF 张量本来就是独立对象，所以**不需要 parts**：
 只需要在转换器里把 `attn_qkv` 这类合并张量**按行切成独立对象**（row_bytes = n_bytes / rows），
 其余一一对应即可生成 binds。这是下一项的具体工作。
+
+**2026-11-26 bindings 已生成，错误链走到最后一步（解码）**：
+
+转换器现在按映射表生成 `bindings`，并把合并张量按行切成独立对象：
+GDN 层 `attn_qkv [10240]` → `query`(2048) + `key`(2048) + `value`(6144)；
+full-attention 层 `attn_q [12288]` → `query`(6144) + `output_gate`(6144)。
+切分后每条 binding 都是 1:1 的 `{"object": ...}`，不需要 `parts`。
+
+用引擎加载新容器的错误链最终停在：
+
+```
+error: text.token_embd.weight: unknown quantized weight layout
+```
+
+即 `text/token_embedding` 已经绑定到 GGUF 的 `token_embd.weight`（IQ3_S），
+`weight_view.cpp:217` 的兜底抛出说明现在缺的是 `ggml_block_v1` 的视图与解码，而不是容器或绑定。
+
+下一步需要的 GGML 块参数（来自 gguf-py `GGML_QUANT_SIZES`，sm89 kernel 按此实现）：
+
+| 类型 | block | 每块字节 | bits/权重 |
+|---|---:|---:|---:|
+| Q4_K | 256 | 144 | 4.5000 |
+| Q5_K | 256 | 176 | 5.5000 |
+| Q6_K | 256 | 210 | 6.5625 |
+| IQ4_NL | 32 | 18 | 4.5000 |
+| IQ4_XS | 256 | 136 | 4.2500 |
+| IQ3_S | 256 | 110 | 3.4375 |
+| IQ3_XXS | 256 | 98 | 3.0625 |
+| IQ2_XXS | 256 | 66 | 2.0625 |
+| IQ2_XS | 256 | 74 | 2.3125 |
+| IQ2_S | 256 | 82 | 2.5625 |
+| Q2_0 | 64 | 18 | 2.2500 |
+
+实现顺序建议：先在 `weight_view.cpp` 加 `GgmlBlock` 分支（`code_bytes = elements × type_bytes / block`，
+无独立 scale 平面），让加载通过；再按类型补 host 参考解码（对齐数值），最后写 sm_89 device 反量化
+（`__nv_bfloat16`、DP4A、`__ldg`，CUDA 13.4 工具链）。

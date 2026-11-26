@@ -286,6 +286,115 @@ def load_resources(path: str) -> dict:
     return out
 
 
+# Layer-level GGUF suffix -> logical parameter suffix. Verified against text/layers/0 (GDN) and
+# text/layers/3 (indexed attention) of the same-model artifact.
+COMMON_LAYER = {
+    "hc_attn_norm.weight": "attention_hc/norm",
+    "hc_attn_down.weight": "attention_hc/down",
+    "hc_attn_up.weight": "attention_hc/up",
+    "hc_attn_inject.weight": "attention_hc/inject",
+    "hc_ffn_norm.weight": "moe_hc/norm",
+    "hc_ffn_down.weight": "moe_hc/down",
+    "hc_ffn_up.weight": "moe_hc/up",
+    "hc_ffn_inject.weight": "moe_hc/inject",
+    "ffn_gate_inp.weight": "moe/router",
+    "ffn_gate_inp_shexp.weight": "moe/shared_score",
+    "ffn_gate_exps.weight": "moe/experts/gate",
+    "ffn_up_exps.weight": "moe/experts/up",
+    "ffn_down_exps.weight": "moe/experts/down",
+    "ffn_gate_shexp.weight": "moe/shared/gate",
+    "ffn_up_shexp.weight": "moe/shared/up",
+    "ffn_down_shexp.weight": "moe/shared/down",
+}
+GDN_LAYER = {
+    "ssm_a": "gdn/a_log",
+    "ssm_alpha.weight": "gdn/a_projection",
+    "ssm_beta.weight": "gdn/b_projection",
+    "ssm_conv1d.weight": "gdn/convolution",
+    "ssm_dt.bias": "gdn/dt_bias",
+    "ssm_norm.weight": "gdn/norm",
+    "ssm_out.weight": "gdn/output",
+    "attn_gate.weight": "gdn/z",
+}
+FULL_LAYER = {
+    "attn_k.weight": "attention/key",
+    "attn_v.weight": "attention/value",
+    "attn_output.weight": "attention/output",
+    "attn_q_norm.weight": "attention/query_norm",
+    "attn_k_norm.weight": "attention/key_norm",
+    "indexer.q_proj.weight": "attention/index_query",
+    "indexer.k_proj.weight": "attention/index_key",
+    "indexer.q_norm.weight": "attention/index_query_norm",
+    "indexer.k_norm.weight": "attention/index_key_norm",
+}
+# Merged GGUF tensors, cut by rows. Ratios follow the element counts the reference artifact uses
+# (GDN: 2048/2048/6144 of 10240; full attention: 6144/6144 of 12288).
+MERGED = {
+    "attn_qkv.weight": (("query", 0.2), ("key", 0.2), ("value", 0.6)),
+    "attn_q.weight": (("query", 0.5), ("output_gate", 0.5)),
+}
+
+
+def split_rows(obj: Obj, pieces) -> list:
+    rows = obj.shape[0]
+    row_bytes = obj.bytes // rows
+    out = []
+    start = 0
+    for name, ratio in pieces:
+        n = rows - start if name == pieces[-1][0] else int(rows * ratio)
+        out.append(Obj(id=f"{obj.id}/{name}", kind="tensor", shape=[n, obj.shape[1]],
+                       fmt=obj.fmt, layout=obj.layout, src=obj.src,
+                       src_offset=obj.src_offset + start * row_bytes, bytes=n * row_bytes))
+        start += n
+    return out
+
+
+def expand_text(objs: list, layer_types: list) -> tuple:
+    """Cut merged tensors and return (objects, bindings) for the text component.
+
+    A merged GGUF tensor becomes one object per logical parameter, so the bindings are plain
+    1:1 references and the container needs no `parts` ranges.
+    """
+    out = []
+    bindings = {}
+    for obj in objs:
+        name = obj.id[len("text."):]
+        if name.startswith("blk."):
+            _, num, rest = name.split(".", 2)
+            layer = int(num)
+            full = str(layer_types[layer]).lower() not in ("linear_attention", "gdn", "mamba")
+            if rest in MERGED:
+                rows = obj.shape[0]
+                row_bytes = obj.bytes // rows
+                start = 0
+                pieces = MERGED[rest]
+                for i, (piece, ratio) in enumerate(pieces):
+                    n = rows - start if i == len(pieces) - 1 else int(rows * ratio)
+                    child = Obj(id=f"{obj.id}/{piece}", kind="tensor",
+                                shape=[n, obj.shape[1]], fmt=obj.fmt, layout=obj.layout,
+                                src=obj.src, src_offset=obj.src_offset + start * row_bytes,
+                                bytes=n * row_bytes)
+                    out.append(child)
+                    bindings[f"text/layers/{layer}/{piece}"] = {"object": child.id}
+                    start += n
+                continue
+            suffix = dict(COMMON_LAYER, **(FULL_LAYER if full else GDN_LAYER)).get(rest)
+            out.append(obj)
+            if suffix:
+                bindings[f"text/layers/{layer}/{suffix}"] = {"object": obj.id}
+            continue
+        out.append(obj)
+        if name == "token_embd.weight":
+            bindings["text/token_embedding"] = {"object": obj.id}
+        elif name == "output.weight":
+            bindings["text/output_head"] = {"object": obj.id}
+        elif name.startswith("output_hc_"):
+            bindings["text/final_hc/" + name[len("output_hc_"):].split(".")[0]] = {"object": obj.id}
+        elif name.startswith("per_layer_token_embd"):
+            bindings["text/ple/table"] = {"object": obj.id}
+    return out, bindings
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Qwen4Exp GGUF -> NInfer v3")
     ap.add_argument("--text", nargs="+", required=True)
@@ -307,13 +416,15 @@ def main() -> int:
             sources[path] = Source(path, gguf.GGUFReader(path))
         return sources[path]
 
-    objs = []
+    text_objs = []
     for path in args.text:
-        objs += collect(source(path), "text")
+        text_objs += collect(source(path), "text")
     if args.config_from:
         text_cfg = load_component_config(args.config_from)
     else:
         text_cfg = text_config(read_metadata(source(args.text[0])))
+    text_objs, bindings = expand_text(text_objs, text_cfg.get("layer_types", []))
+    objs = list(text_objs)
     components = {"text": {"config": text_cfg}}
     for flag, comp, arc in (("dflash2", "dflash2", "Qwen3_8DFlash2"),
                             ("mtp", "mtp", "Qwen3_5MTP")):
@@ -348,7 +459,7 @@ def main() -> int:
     directory = {
         "components": components,
         "objects": [describe(o) for o in objs],
-        "bindings": {},
+        "bindings": bindings,
         "uses": [],
         "files": files,
         "metadata": {"name": str(read_metadata(source(args.text[0])).get("general.name", "Qwen3.8-Flash-Next")),
