@@ -1114,3 +1114,34 @@ CPU 半边新增 `ops/moe/routed_swiglu/cpu/ggml.cpp`：`GgmlLayer<TopK,I,H>` �
 确认与参考工件的输出方向一致；② 设备侧 decode 换成 **Q8_1 + DP4A**（strata/llama.cpp 的 `vec_dot`），
 prefill 换成“K 瓦片解码进 shared + BF16 MMA”；③ CPU 半边向量化（AVX2/AVX512-BF16）；
 ④ 共享专家（`ffn_gate_shexp|ffn_up_shexp` → `[2I,H]` 合并 + dense SwiGLU 的 ggml 分支）。
+
+**2026-11-26 端到端能跑但数值未对：输出不连贯（对照组正常）**：
+
+同一 prompt、同一 CLI 的对照实测：
+
+| 工件 | 生成的 token id（前 8 个）| 判读 |
+|---|---|---|
+| `qwen3_8_flash_next_v5_e2.ninfer`（原生 q4/q5，已知正常）| 760 1156 369 9859 364 279 6511 314 | 连贯（常用词区）|
+| `qwen4exp-iq3_xxs.ninfer`（本容器，ggml 编码）| 185229 95210 12470 40791 40666 … | **落在词表尾部，明显不对** |
+
+两者都 `exit=0`，所以 CLI、prompt、混合/分派等共享代码没问题；**差异在 ggml 这一侧的数值**。
+
+本轮顺带修掉一个真实类型缺陷：split 路径的项缓冲是 **FP32**（其 CPU 半边就是 `float*`），
+我的内核原先按 BF16 写；现在内核按 `out.dtype` 写入（`out_fp32` 分支，累加形式同样按类型读）。
+这修完仍有错，说明还有其他偏差，需要按算子逐一对照。
+
+**已排除**：解码器（host/device 11/11 vs gguf-py）、Linear、linear_add、embedding、
+routed-SwiGLU 核心（两种组合 vs host 参考）、PLE 表 IQ4_NL 行解码、容器字节（1224 张量全覆盖、
+抽样哈希全对）。也就是说**单个算子的实现是对拍的，错在“把它们按真实层序拼起来”的某一处**。
+
+下一步（按信息量排序，全部可离线做）：
+
+1. **词表两端**：给定固定 token id，比较 `token_embd` 取行 + `output` 投影的 logits 与 host 参考
+   （两者都已通过对拍，若这一步错，就是视图/步长而非解码）；
+2. **一层 GDN**：attention/GDN 的 `attn_qkv` 合并父对象用 `parts` 切分，检查 `qdata` 是否指向
+   正确的 part 起点（我的 Linear 直接用 `w.qdata`，part 视图的偏移来自 `Weight` 构造）；
+3. **一层 MoE**：把 device 半边与 CPU 半边的结果分别与 host 计算比对（现在两侧都跑，若一侧漏/重
+   就会表现为“半份贡献”）；
+4. **HC / PLE 的残差路径**：这两条只在 Qwen4Exp 里跑，参考工件没有等价物，没有对照就会一直沉默。
+
+回归：`ctest -R 'ggml|moe'` **13/13**。
