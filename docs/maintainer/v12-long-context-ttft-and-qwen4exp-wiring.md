@@ -87,7 +87,7 @@
 | 项 | 状态 | 问题 | 做法 | 判据 |
 |---|---|---|---|---|
 | P1-1 SplitKv 是否启用 | 已完成 | 27B 32k 2,643 vs 4k 3,215（−18%），不知是注意力还是调度 | 代码：`dense/context/launch.cu` 的 `direct = (envelope.max_context == 0)`，服务跑 262k 上限时必然走 `SplitKv`，**没有 env 开关**。同会话串行探针 `tools/serve/p11_context_probe.ps1`（unique 前缀、单条、chunk 1024、rk4v4-e8、MTP7） | 3,546 tok → 2.74/2.79k；13,947 → 2.78/2.79k；27,818 → 2.59/2.60k。两轮重复一致，**8× 长度只掉 5.5%**，与 23k 的 2.66k 同量级。−18% 不能复现：4k 的 3,215 与 32k 的 2,643 不是同一口径。注意力不是长上下文瓶颈，P1-2 继续查精度 |
-| P1-2 32k 的 KV 精度 | 已完成 | 4k 有 fp8 +0.13% / rk4v4-e8 +3.33%，32k 空白 | 32k 补测 fp8 / rk4v4-e8（`tools/serve/p12_kv_precision_probe.ps1`：upstream 文档拼接的 313 KB 真实语料、context 32768、stride 16384，与 4k 用同一 `infer-perplexity` 口径） | bf16 9.410566；fp8 9.41285（**+0.024%**）；rk4v4-e8 9.729298（+3.39%）。fp8 远优于 ≤+0.5% 判据，32k 可直接用 fp8 换更大池；rk4v4-e8 的 3.39% 与 4k 的 3.33% 一致，是固定量化损失、不随长度放大 |
+| P1-2 32k 的 KV 精度 | 已完成 | 4k 有 fp8 +0.13% / rk4v4-e8 +3.33%，32k 空白 | 32k 补测 fp8 / rk4v4-e8（`tools/serve/p12_kv_precision_probe.ps1`：upstream 文档拼接的 313 KB 真实语料、context 32768、stride 16384，与 4k 用同一 `ninfer-perplexity` 口径） | bf16 9.410566；fp8 9.41285（**+0.024%**）；rk4v4-e8 9.729298（+3.39%）。fp8 远优于 ≤+0.5% 判据，32k 可直接用 fp8 换更大池；rk4v4-e8 的 3.39% 与 4k 的 3.33% 一致，是固定量化损失、不随长度放大 |
 
 ### P2：不投入
 
@@ -1166,19 +1166,19 @@ CPU 半边确实排除残差加法（`out_cpu` 是 FP32 项），与设备半边
 
 纪律：在 1–4 任一环节给出“与 host 一致”的证据前，不再做性能改动（当前 2.3/0.9 tok/s 只是标量实现的产物）。
 
-**2026-11-26 `infer-perplexity` 对 PLE 模型是坏的（两个工件同点崩溃）**：
+**2026-11-26 `ninfer-perplexity` 对 PLE 模型是坏的（两个工件同点崩溃）**：
 
 想用 PPL 做强判据（同模型不同量化，PPL 应接近），实测：
 
 | 命令 | 结果 |
 |---|---|
-| `infer-perplexity <v5_e2 参考工件> --text q4exp_corpus_small.txt --context 256 --stride 200` | `0xC0000005`，停在 `[ple] table … supported` 与 `[kv-plan]` 之后 |
+| `ninfer-perplexity <v5_e2 参考工件> --text q4exp_corpus_small.txt --context 256 --stride 200` | `0xC0000005`，停在 `[ple] table … supported` 与 `[kv-plan]` 之后 |
 | 同上换成本容器 `qwen4exp-iq3_xxs.ninfer` | `0xC0000005`，停在**同一点** |
 
-两个工件、同一条命令、同一位置 → **是 `infer-perplexity` 自己的 PLE 路径坏了**，不是容器问题
+两个工件、同一条命令、同一位置 → **是 `ninfer-perplexity` 自己的 PLE 路径坏了**，不是容器问题
 （`infer.exe` 对两个工件都能正常加载与生成）。这也说明台账里的 PPL 门禁值（7.359779 / e95cacb864d8b1ab）
 来自**非 PLE** 的 35B 模型——PLE 模型从未走过这条工具链。
 
 因此数值核对不能依赖 CLI，必须走**树内算子级工装**（与 `test_ggml_*` 同一方法）。附带一项待修：
-`infer-perplexity` 的 PLE 分支（与 `infer.exe` 的差异点：是否传入 `PleTableBinding`/`ple_eos`，
+`ninfer-perplexity` 的 PLE 分支（与 `infer.exe` 的差异点：是否传入 `PleTableBinding`/`ple_eos`，
 以及 options 的 PLE 相关默认值）。
