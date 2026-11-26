@@ -1205,3 +1205,35 @@ CPU 半边确实排除残差加法（`out_cpu` 是 FP32 项），与设备半边
 旧工件与参考工件的 HC 结构不同却都能跑，说明 HC 那条路径的两种形态在真实权重上没有被任何一种方式验证过。
 下一步：给 `verify_probe.h` 加一个**张量落盘**出口（`NINFER_VERIFY_DUMP=<dir>`，只在该变量存在时写），
 先 dump `stem` 之后的 hidden，用 Python 从 GGUF 复算 embedding 行做对照；再 dump 第 0 层之后做层内对照。
+
+**2026-11-26 数值缺陷定位到第一次 HC 混合（四流 norm + hc_mix）**：
+
+新增 `NINFER_VERIFY_DUMP=<dir>` 张量落盘探针（`verify_probe.h::verify_dump`，逐列拷回、按
+`<layer>-<label>.bin` 写出，BF16 原样），同一 prompt 分别在容器与参考工件上 dump 后逐列余弦：
+
+| 阶段 | 列 | cos | ‖容器‖ | ‖参考‖ |
+|---|---|---|---|---|
+| `stem-embedding`（取行）| 0 | **+0.9875** | 0.418 | 0.401 |
+| 同上 | 1 | **+0.9763** | 0.0807 | 0.0763 |
+| `hc-input`（hc_mix 输出）| 0 | **+0.0139** | **69.4** | 31.1 |
+| 同上 | 1 | −0.0009 | **59.1** | 30.5 |
+| `layer-normed`（hc_combine 后）| 0 | −0.0077 | 111.9 | 62.6 |
+
+结论：**取行正确**（0.99，差异只是 IQ3_S vs q4 的量化差），**第 0 层一进来就偏**，
+且容器范数约为参考的 **2 倍**——不是随机噪声，而是一个**系统性比例**。逐层看 0–11 层全都 ≈0
+（下游是继承误差，不是新缺陷）。
+
+`hc_mix` 的两种形态都有单测（`ninfer_hc_mix_test` / `hc_mix_q5_test` 均通过），所以问题在
+**喂给它的东西**或**它之前的四流 norm**，而不是它自己的算术：
+
+1. `hc_expand_norm`（stem）：用 `input_norm.view({width, streams})`（= GGUF `hc_attn_norm`，F32→BF16）
+   对 4 条流做分组 norm；
+2. `HcMixWeights.down_injection` = 我合并的 `[324,10240]` 父对象（0..319 down、320..323 inject）；
+   **行序/行选中**若错，g/b 全错，sigmoid 饱和后输出退化成"平均后再乘个增益"——与"范数 2 倍"的现象吻合；
+3. `up` = `[10240,320]`，op 约定 `row = s*2560+d`，需要确认 GGUF 的行序与该约定一致。
+
+下一步（很窄，一次就能定性）：把 `normalized`（hc_expand_norm 之后）也 dump 出来，在 Python 里用
+**同一份合并父对象字节**（BF16 直接可读）复算 `a = down@x`、`b = inject@x`、`g = up@silu(a/4)`，
+与内核输出逐值比较；哪一步先偏就很清楚（norm 还是 A/B 行序）。
+
+回归：`ctest -R 'ggml|moe|mix|gated'` **18/18**。
