@@ -29,6 +29,8 @@ void TextContext::hc_stem(Tensor& embedding, std::int32_t tokens) {
     }
     const auto roots = workspace::text_hc_roots(work_, config_, tokens);
     hc_              = roots;
+    // A new pass: the dump step index restarts so every stage of this pass names its own file.
+    verify_dump_step() = 0;
     // The four-stream stem is the first place the artifact's embedding meets the model, so a dump
     // here is the cheapest check of the gather (ids, dtype, row width) against the GGUF's own decode.
     verify_dump("stem-embedding", embedding, dimension(config_.hidden_size),
@@ -48,14 +50,16 @@ void TextContext::hc_mix_into(const HcParameters& weights, std::int32_t tokens) 
     // Produces the block's single-stream input and the four coefficients its correction applies.
     nan_probe_tensor("hc-mix-pre", hc_.input, 300, ctx_.stream);
     nan_probe_tensor("hc-normed", hc_.normalized, 400, ctx_.stream);
+    // Both dumps of this mix carry the same step, so the input below is provably the mix of the
+    // normalized above rather than of some other call that happened to reuse the buffer.
+    const int step = verify_dump_step()++;
+    verify_dump("hc-normalized", hc_.normalized,
+                dimension(config_.hidden_size) * dimension(config_.hc->count),
+                static_cast<std::int32_t>(hc_.normalized.nb[1]), tokens, step, ctx_.stream);
     hc_mix(normalized, weights.block_form(), work_, hc_.input, hc_.injection,
            ctx_.execution_view());
-    {
-        static thread_local int block = 0;
-        verify_dump("hc-input", hc_.input, dimension(config_.hidden_size),
-                    static_cast<std::int32_t>(hc_.input.nb[1]), tokens, block, ctx_.stream);
-        block = (block + 1) % 48;
-    }
+    verify_dump("hc-input", hc_.input, dimension(config_.hidden_size),
+                static_cast<std::int32_t>(hc_.input.nb[1]), tokens, step, ctx_.stream);
     nan_probe_tensor("hc-mix-out", hc_.input, 200, ctx_.stream);
 }
 
@@ -74,10 +78,9 @@ void TextContext::hc_combine(const Tensor& product, const Tensor& norm_weight,
     // layer whose column cosine against a known-good artifact collapses is where a numeric defect
     // starts, which no single-op test can say.
     {
-        static thread_local int block = 0;
+        const int step = verify_dump_step()++;
         verify_dump("layer-normed", normed, dimension(config_.hidden_size),
-                    static_cast<std::int32_t>(normed.nb[1]), tokens, block, ctx_.stream);
-        block = (block + 1) % 48;
+                    static_cast<std::int32_t>(normed.nb[1]), tokens, step, ctx_.stream);
     }
 }
 

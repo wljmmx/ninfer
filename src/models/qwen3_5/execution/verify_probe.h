@@ -67,6 +67,15 @@ inline void verify_column_probe(const char* label, const Tensor& tensor, std::in
     std::fflush(stderr);
 }
 
+// One counter shared by every dump site inside a pass, reset by the stem. Two corrections per block
+// both mix, so a per-block index alone would let block 0's attention dump and block 1's MoE dump
+// land on the same file; a monotonically increasing step keeps every stage on its own name, and the
+// two dumps of one mix share it, which is what makes "this normalized produced that input" checkable.
+inline int& verify_dump_step() {
+    static int step = 0;
+    return step;
+}
+
 // Dumps one tensor's columns to <NINFER_VERIFY_DUMP>/<layer>-<label>.bin.
 //
 // The column probe answers "did this collapse"; this answers "is this the number it should be", which
@@ -91,8 +100,14 @@ inline void verify_dump(const char* label, const Tensor& tensor, std::int32_t el
             stream);
         if (status != cudaSuccess) { return; }
     }
-    const std::string path =
-        std::string(dir) + "/" + std::to_string(layer) + "-" + label + ".bin";
+    // The pass number and the token count are part of the name. A stem dump opens a pass, so the
+    // stages of one pass carry the same `pN` and compare without having to guess which pass - or
+    // which chunk width - wrote them.
+    static int pass = 0;
+    if (std::strcmp(label, "stem-embedding") == 0) { ++pass; }
+    const std::string path = std::string(dir) + "/p" + std::to_string(pass) + "-" +
+                             std::to_string(layer) + "-w" + std::to_string(width) + "-" + label +
+                             ".bin";
     if (FILE* file = std::fopen(path.c_str(), "wb")) {
         std::fwrite(host.data(), 1, host.size(), file);
         std::fclose(file);
