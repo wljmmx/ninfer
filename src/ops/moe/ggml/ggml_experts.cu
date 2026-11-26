@@ -92,8 +92,12 @@ __global__ void routed_swiglu_kernel(const __nv_bfloat16* x, int hidden, int int
                                      ExpertBanks banks, const std::int32_t* ids,
                                      const float* coefficients, int top_k, int tokens, int experts,
                                      ExpertSubsetKind subset_kind, const std::int32_t* mask,
-                                     MoeEpilogue mode, SharedExpert shared, __nv_bfloat16* out,
-                                     float* scratch) {
+                                     MoeEpilogue mode, SharedExpert shared, void* out_any,
+                                     int out_fp32, float* scratch) {
+    // The split path's term buffer is FP32 (its Host half writes float), while a resident layer's
+    // output is BF16. `out` is typed once here rather than at every store.
+    __nv_bfloat16* out_bf16 = static_cast<__nv_bfloat16*>(out_any);
+    float* out_f32          = static_cast<float*>(out_any);
     // Scratch layout: top_k * intermediate BF16 products, then top_k coefficients, then (when the
     // layer has a shared expert) intermediate products and one coefficient for it.
     const int slots        = top_k + (shared.gate_up != nullptr ? 1 : 0);
@@ -177,9 +181,13 @@ __global__ void routed_swiglu_kernel(const __nv_bfloat16* x, int hidden, int int
                                            banks.down.type_bytes);
         }
         const std::size_t index = std::size_t(token) * std::size_t(hidden) + d;
-        out[index] = mode == MoeEpilogue::Write
-                         ? __float2bfloat16(acc)
-                         : __float2bfloat16(__bfloat162float(out[index]) + acc);
+        const bool add          = mode == MoeEpilogue::AddResidual;
+        if (out_fp32) {
+            out_f32[index] = add ? out_f32[index] + acc : acc;
+        } else {
+            out_bf16[index] = add ? __float2bfloat16(__bfloat162float(out_bf16[index]) + acc)
+                                  : __float2bfloat16(acc);
+        }
     }
 }
 
@@ -250,7 +258,8 @@ void launch_routed_swiglu(const Tensor& x, const ExpertBanks& banks, int hidden,
         static_cast<const std::int32_t*>(ids.data), static_cast<const float*>(coefficients.data),
         top_k, tokens, experts, subset.kind,
         subset.mask.data != nullptr ? static_cast<const std::int32_t*>(subset.mask.data) : nullptr,
-        mode, prepared, static_cast<__nv_bfloat16*>(out.data), static_cast<float*>(scratch.data));
+        mode, prepared, out.data,
+        out.dtype == DType::FP32 ? 1 : 0, static_cast<float*>(scratch.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
