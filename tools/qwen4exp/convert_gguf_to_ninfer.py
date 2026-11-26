@@ -37,6 +37,7 @@ GGUF_PY = r"H:\TeleAgentWorks\.temp\repos\llama-latest\gguf-py"
 if GGUF_PY not in sys.path:
     sys.path.insert(0, GGUF_PY)
 import gguf  # noqa: E402
+import gguf.quants  # noqa: E402  (dequantize, for the one site whose permutation is inside a row)
 
 ENTRY_MAGIC = b"NINFER\x00\x03"
 PART_MAGIC = b"NINPRT\x00\x03"
@@ -73,6 +74,19 @@ class Obj:
     transpose: bool = False
     # F16 -> BF16: same two-byte width, but the model's conv kernels are bf16 operands.
     f16_to_bf16: bool = False
+    # `w - 1`: a gamma the GGUF stores folded as `1 + w` while the engine's unit-offset norm adds
+    # the one itself. The source element size and encoding are kept so the writer (and the verify
+    # pass) can decode, subtract and re-round without inferring them from the target format.
+    minus_one: bool = False
+    src_elem: int = 0
+    src_type: str = ""
+    # Rows written in a permuted order: target row i takes source row row_map[i]-th of the source
+    # rows (resolved across `segments`, so a merged parent rows-map works too). A row-permutation of
+    # a block-quantised matrix moves whole rows, so the encoding survives untouched.
+    row_map: list | None = None
+    # A payload this tool authors rather than copies (value transforms a row permutation cannot
+    # express: log(-A_log), a conv transpose, a column permutation inside quantised rows).
+    blob: bytes | None = None
     # Objects assembled from more than one source range (the GDN control pair, which the model
     # addresses as one parent). Each entry is (source offset, byte count), written in order.
     segments: list | None = None
@@ -100,6 +114,44 @@ def describe_format(tensor_type: int) -> tuple:
     if name in NATIVE_EQUIVALENT:
         return NATIVE_EQUIVALENT[name]
     return ggml_format_name(tensor_type), "ggml_block_v1"
+
+
+# Gammas llama.cpp folds to `1 + w` on disk. The engine's unit-offset norms add that one back
+# (`gain = 1 + weight`), so an artifact that copied these vectors verbatim would run every one of
+# them at `2 + w` - roughly twice the model's gain on the residual streams. `gguf_views.Minus1` and
+# `tools/convert/gguf_qwen4exp.py::_norm` are the same rule for the native converter, and the
+# same-model artifact `qwen3_8_flash_next_v5_e2` stores exactly `bf16(gguf - 1)` for each of them
+# (verified bit-exact at every spelling site). `ssm_norm` is deliberately absent: upstream's fold
+# skips `linear_attn.norm.weight`, and that artifact matches the GGUF bit for bit.
+FOLDED_NORMS = (
+    "hc_attn_norm.weight",
+    "hc_ffn_norm.weight",
+    "output_hc_norm.weight",
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+    "indexer.q_norm.weight",
+    "indexer.k_norm.weight",
+    "ple_norm_key.weight",
+    "ple_norm_query.weight",
+    "ple_norm_conv.weight",
+)
+
+
+def bf16_round(values) -> bytes:
+    """float32 -> bf16 bytes, round-to-nearest-even on the tie bit (the top half of the word)."""
+    u32 = np.asarray(values, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    return ((u32 + 0x7FFF + ((u32 >> 16) & 1)) >> 16).astype(np.uint16).tobytes()
+
+
+def decode_float(raw: bytes, kind: str):
+    """Decode a GGML float payload to float32 so a value transform can run on it."""
+    if kind == "F32":
+        return np.frombuffer(raw, dtype="<f4")
+    if kind == "F16":
+        return np.frombuffer(raw, dtype="<f2").astype(np.float32)
+    if kind == "BF16":
+        return (np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
+    raise ValueError(f"a folded norm is a float vector, not {kind}")
 
 
 def plain(value):
@@ -144,6 +196,28 @@ def collect(source: Source, component: str) -> list:
         f16_cast = fmt == "ggml_f16"
         if f16_cast:
             fmt, layout = "bf16", "contiguous_le_v1"
+        # A folded gamma is stored `1 + w` in the GGUF and `w` in the artifact, at whichever float
+        # width the quantiser chose for it; the writer decodes that width, subtracts and re-rounds.
+        # The draft shares the text blocks' `attn_q_norm`/`attn_k_norm` spelling but its own norms are
+        # plain (`tools/convert/gguf_dflash.py`: `w * x / sqrt(mean + eps)`, no unit offset), so the
+        # component decides, not the tensor name.
+        folded = component == "text" and t.name.endswith(FOLDED_NORMS)
+        # The source width of one element, before any cast: the transforms that read the payload back
+        # (folded norms, the conv transpose, A_log) need to know how many bytes one element occupies
+        # in the file, which the target format no longer says.
+        source_elements = 1
+        for d in shape_c:
+            source_elements *= d
+        src_elem = int(t.n_bytes) // max(1, source_elements)
+        if folded:
+            if len(shape_c) != 1:
+                raise ValueError(f"{t.name}: a folded norm is a rank-1 vector, not {shape_c}")
+            if fmt not in ("fp32", "bf16", "ggml_f16"):
+                raise ValueError(f"{t.name}: folded norm has an unexpected encoding {fmt}")
+            if src_elem * source_elements != int(t.n_bytes):
+                raise ValueError(f"{t.name}: folded norm is not a whole number of elements")
+            fmt, layout, n_bytes = "bf16", "contiguous_le_v1", source_elements * 2
+            cast = False
         transpose = False
         if (t.name.endswith("conv1d.weight") and len(shape_c) == 2
                 and shape_c[0] > shape_c[1] and 1 < shape_c[1] <= 8):
@@ -159,7 +233,8 @@ def collect(source: Source, component: str) -> list:
             shape_c = [shape_c[0] * shape_c[1], shape_c[2]]
         objs.append(Obj(id=f"{component}.{t.name}", kind="tensor", shape=shape_c,
                         fmt=fmt, layout=layout, f32_to_bf16=cast, transpose=transpose,
-                        f16_to_bf16=f16_cast,
+                        f16_to_bf16=f16_cast, minus_one=folded, src_elem=src_elem,
+                        src_type=gguf.GGMLQuantizationType(t.tensor_type).name,
                         src=source, src_offset=int(t.data_offset), bytes=n_bytes))
     return objs
 
@@ -269,7 +344,29 @@ def write_shard(path: str, shard: list, base: int, final_size: int, index: int,
                 f.write(b"\x00" * (local - written))
                 written = local
             h = hashlib.sha256()
-            if obj.f32_to_bf16:
+            if obj.blob is not None:
+                f.write(obj.blob)
+                h.update(obj.blob)
+                written += len(obj.blob)
+            elif obj.row_map is not None:
+                data = permuted_rows(obj)
+                f.write(data)
+                h.update(data)
+                written += len(data)
+            elif obj.minus_one:
+                src_len = obj.shape[0] * obj.src_elem
+                with open(obj.src.path, "rb", buffering=0) as sf:
+                    sf.seek(obj.src_offset)
+                    raw = sf.read(src_len)
+                if len(raw) != src_len:
+                    raise IOError(f"short read for {obj.id}")
+                # `w = (1 + w) - 1` before the bf16 rounding: the unit-offset norm adds the one
+                # back, so the stored vector is the offset the model's gain was folded from.
+                data = bf16_round(decode_float(raw, obj.src_type) - 1.0)
+                f.write(data)
+                h.update(data)
+                written += len(data)
+            elif obj.f32_to_bf16:
                 src_len = obj.shape[0] * 4
                 with open(obj.src.path, "rb", buffering=0) as sf:
                     sf.seek(obj.src_offset)
@@ -314,6 +411,65 @@ def write_shard(path: str, shard: list, base: int, final_size: int, index: int,
         # file length against it, so the tail must be written out.
         if written < final_size:
             f.write(b"\x00" * (final_size - written))
+
+
+def permuted_rows(obj: Obj) -> bytes:
+    """Read the object's source rows and return them in `row_map` order.
+
+    Whole rows move, so a block-quantised matrix keeps its encoding: a row is one or more complete
+    blocks, and the object's declared byte count divides by its row count. The map is resolved over
+    `segments` when the parent was assembled from more than one source range (the a|b control pair),
+    which is why the lookup is a (segment, row) pair rather than a flat source offset.
+    """
+    rows = obj.shape[0]
+    if obj.bytes % rows:
+        raise ValueError(f"{obj.id}: {obj.bytes} bytes over {rows} rows is not row aligned")
+    row_bytes = obj.bytes // rows
+    spans = obj.segments if obj.segments else [(obj.src_offset, obj.bytes)]
+    starts = []
+    total = 0
+    for _offset, length in spans:
+        starts.append(total)
+        if length % row_bytes:
+            raise ValueError(f"{obj.id}: segment of {length} bytes is not row aligned")
+        total += length // row_bytes
+    if total != rows:
+        raise ValueError(f"{obj.id}: segments hold {total} rows, the shape says {rows}")
+    out = bytearray(obj.bytes)
+    if obj.bytes <= (64 << 20):
+        # One read per segment: a per-row seek over a 14 MiB matrix is ~10k syscalls for no reason.
+        planes = []
+        for offset, length in spans:
+            planes.append(read_source_at(obj, offset, length))
+        for target, source_row in enumerate(obj.row_map):
+            segment = 0
+            while segment + 1 < len(spans) and source_row >= starts[segment + 1]:
+                segment += 1
+            begin = (source_row - starts[segment]) * row_bytes
+            out[target * row_bytes:(target + 1) * row_bytes] = \
+                planes[segment][begin:begin + row_bytes]
+        return bytes(out)
+    with open(obj.src.path, "rb", buffering=0) as f:
+        for target, source_row in enumerate(obj.row_map):
+            segment = 0
+            while segment + 1 < len(spans) and source_row >= starts[segment + 1]:
+                segment += 1
+            offset = spans[segment][0] + (source_row - starts[segment]) * row_bytes
+            f.seek(offset)
+            chunk = f.read(row_bytes)
+            if len(chunk) != row_bytes:
+                raise IOError(f"short read for {obj.id} row {source_row}")
+            out[target * row_bytes:(target + 1) * row_bytes] = chunk
+    return bytes(out)
+
+
+def read_source_at(obj: Obj, offset: int, length: int) -> bytes:
+    with open(obj.src.path, "rb", buffering=0) as f:
+        f.seek(offset)
+        raw = f.read(length)
+    if len(raw) != length:
+        raise IOError(f"short read for {obj.id}")
+    return raw
 
 
 def load_component_config(path: str, component: str = "text") -> dict:
@@ -583,6 +739,170 @@ def merge_stacked_pairs(objs: list, bindings: dict) -> tuple:
     return kept, bindings
 
 
+def gdn_tiling(cfg: dict) -> tuple:
+    """The heads whose order llama.cpp and the engine disagree on, and the rows that carry them.
+
+    `nk != nv` makes llama.cpp write the value-head axis tiled (llama.cpp's own
+    `_LinearAttentionVReorderBase` reshapes it to `[key_head, head_in_group, head_dim]` and
+    transposes the first two axes), while the engine indexes it grouped. `grouped_from_tiled` in
+    `tools/convert/gguf_views.py` states the map: grouped head `g` sits at tiled position
+    `(g % per_key) * key_heads + g // per_key`. Only the GDN layers of a tiled family need it; a
+    model with `nk == nv` has one head per key head and the permutation is the identity.
+    """
+    nk = int(cfg.get("linear_num_key_heads", 0))
+    nv = int(cfg.get("linear_num_value_heads", 0))
+    dv = int(cfg.get("linear_value_head_dim", 0))
+    if not nk or not nv or nk == nv:
+        return None
+    per_key = nv // nk
+    heads = [(h % per_key) * nk + h // per_key for h in range(nv)]
+    rows = [(h * dv + i) for h in heads for i in range(dv)]
+    return heads, rows
+
+
+def quantize_q5_row_split(values) -> bytes:
+    """Encode a float matrix as `q5_g64_fp16` / `row_split_k128_v1`.
+
+    Used for the one site whose permutation is inside a quantised row (the GDN out projection):
+    reordering 4-bit codes inside a block would mean decoding and re-encoding anyway, and a 5-bit
+    re-encode keeps the tensor in a format the engine already runs for that projection - the
+    same-model artifact stores this tensor as q5 - while its step is finer than the 4-bit codes the
+    values came from. Symmetric per-group scale, codes in [-16,15], the group size and plane order
+    the engine's own reader and writer use (`tools/artifact/codecs/row_split.py`).
+    """
+    import torch
+    # The codec lives in this repo's `tools` package; the converter is run from anywhere, so the
+    # repository root (two levels above this file) is put on the path instead of assuming a cwd.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from tools.artifact.codecs.row_split import encode_row_split
+
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    rows, width = values.shape
+    groups = width // 64
+    if groups * 64 != width:
+        raise ValueError(f"q5 groups of 64 do not divide width {width}")
+    blocks = values.reshape(rows, groups, 64)
+    scale = np.abs(blocks).max(axis=2, keepdims=True) / 15.0
+    scale = np.where(scale > 0.0, scale, 1.0).astype(np.float32)
+    codes = np.clip(np.rint(blocks / scale), -16, 15).astype(np.int8)
+    return encode_row_split(torch.from_numpy(codes), torch.from_numpy(scale[:, :, 0].astype(np.float16)),
+                            "q5_g64_fp16", (rows, width))
+
+
+def apply_gdn_tiling(objs: list, cfg: dict, layer_types: list) -> None:
+    """Put the GDN value-head axis back in the order the engine's kernels index.
+
+    Seven sites carry it, exactly the ones the native converter rewrites (`_gdn` in
+    `tools/convert/gguf_qwen4exp.py`): the V rows of the fused q|k|v matrix, the z rows, the a/b
+    control rows, A_log, dt_bias, the conv kernel's V channels and the out projection's columns.
+    A row permutation moves whole rows, so those stay their original GGML encoding; the three sites
+    that need a value transform (A_log is stored as `-exp(A_log)`, the conv needs a transpose, and
+    the out projection permutes inside a row) are authored here.
+    """
+    tiling = gdn_tiling(cfg)
+    if tiling is None:
+        return
+    heads, rows = tiling
+    nv = len(heads)
+    dv = len(rows) // nv
+    nk = int(cfg["linear_num_key_heads"])
+    q = nk * dv
+    v = nv * dv
+    hidden = int(cfg["hidden_size"])
+    by_id = {o.id: o for o in objs}
+
+    for layer, kind in enumerate(layer_types):
+        if str(kind).lower() not in ("linear_attention", "gdn", "mamba"):
+            continue
+        prefix = f"text.blk.{layer}."
+
+        # q | k | v: only the V block is tiled.
+        obj = by_id.get(prefix + "attn_qkv.weight")
+        if obj is not None:
+            total = obj.shape[0]
+            if total != 2 * q + v:
+                raise ValueError(f"{obj.id}: q|k|v is {total} rows, expected {2 * q + v}")
+            obj.row_map = list(range(2 * q)) + [2 * q + r for r in rows]
+
+        obj = by_id.get(prefix + "attn_gate.weight")
+        if obj is not None:
+            if obj.shape[0] != v:
+                raise ValueError(f"{obj.id}: z is {obj.shape[0]} rows, expected {v}")
+            obj.row_map = list(rows)
+
+        # The a|b control parent is [a(48) | b(48)] rows; each half is permuted on its own.
+        obj = by_id.get(prefix + "gdn_control.weight")
+        if obj is not None:
+            if obj.shape[0] != 2 * nv:
+                raise ValueError(f"{obj.id}: control is {obj.shape[0]} rows, expected {2 * nv}")
+            obj.row_map = list(heads) + [nv + h for h in heads]
+
+        # A_log: llama.cpp stores `-exp(A_log)`, the engine applies `-exp(A_log)` itself.
+        obj = by_id.get(prefix + "ssm_a")
+        if obj is not None:
+            raw = read_source(obj, obj.bytes)
+            values = np.frombuffer(raw, dtype=np.float32)
+            if not np.all(values < 0):
+                raise ValueError(f"{obj.id}: ssm_a is not negative, so it is not -exp(A_log)")
+            obj.blob = np.log(-values)[heads].astype(np.float32).tobytes()
+            obj.bytes = len(obj.blob)
+
+        obj = by_id.get(prefix + "ssm_dt.bias")
+        if obj is not None:
+            raw = read_source(obj, obj.bytes)
+            values = np.frombuffer(raw, dtype=np.float32)
+            obj.blob = values[heads].astype(np.float32).tobytes()
+            obj.bytes = len(obj.blob)
+
+        # The conv kernel is [channels, taps] in the GGUF and [taps, channels] in the model, with the
+        # V channels tiled; bf16 is the operand type the conv kernels accept.
+        obj = by_id.get(prefix + "ssm_conv1d.weight")
+        if obj is not None:
+            elements = obj.shape[0] * obj.shape[1]
+            raw = read_source(obj, elements * obj.src_elem)
+            values = np.frombuffer(raw, dtype=np.float32).reshape(2 * q + v, -1)
+            taps = values.shape[1]
+            tiled = np.concatenate([values[: 2 * q], values[2 * q:][rows]])
+            obj.blob = bf16_round(tiled.T.reshape(-1))
+            obj.fmt, obj.layout = "bf16", "contiguous_le_v1"
+            obj.shape = [taps, 2 * q + v]
+            obj.bytes = len(obj.blob)
+            obj.transpose = False
+            obj.src_elem = 0
+
+        # The out projection's reduction axis is the value-head axis, so its permutation happens
+        # inside each row: a block-quantised row cannot be reordered without re-encoding, and
+        # re-encoding 4-bit codes would change the values. The decoded rows are stored bf16, which
+        # is strictly wider than the codes they came from.
+        obj = by_id.get(prefix + "ssm_out.weight")
+        if obj is not None:
+            if obj.fmt.startswith("ggml_"):
+                raw = read_source(obj, obj.bytes)
+                kind = gguf.GGMLQuantizationType[obj.src_type]
+                values = gguf.quants.dequantize(np.frombuffer(raw, dtype=np.uint8), kind)
+            else:
+                raw = read_source(obj, obj.bytes)
+                values = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32) \
+                    if obj.fmt == "bf16" else np.frombuffer(raw, dtype=np.float32)
+            values = np.asarray(values, dtype=np.float32).reshape(obj.shape[0], obj.shape[1])
+            if values.shape[1] != v:
+                raise ValueError(f"{obj.id}: out projection width {values.shape[1]}, expected {v}")
+            obj.blob = quantize_q5_row_split(values[:, rows])
+            obj.fmt, obj.layout = "q5_g64_fp16", "row_split_k128_v1"
+            obj.bytes = len(obj.blob)
+
+
+def read_source(obj: Obj, length: int) -> bytes:
+    with open(obj.src.path, "rb", buffering=0) as f:
+        f.seek(obj.src_offset)
+        raw = f.read(length)
+    if len(raw) != length:
+        raise IOError(f"short read for {obj.id}")
+    return raw
+
+
 def expand_text(objs: list, layer_types: list, ple_layer_id: int = 1) -> tuple:
     """Cut merged tensors and return (objects, bindings) for the text component.
 
@@ -664,6 +984,9 @@ def main() -> int:
     text_objs, bindings = expand_text(text_objs, text_cfg.get("layer_types", []),
                                       int((text_cfg.get("ple") or {}).get("layer_ids", [1])[0]))
     text_objs, bindings = merge_stacked_pairs(text_objs, bindings)
+    # After the merge, so the a|b control parent is permuted as one 96-row object rather than as two
+    # halves that the merge would then copy verbatim.
+    apply_gdn_tiling(text_objs, text_cfg, text_cfg.get("layer_types", []))
     objs = list(text_objs)
     components = {"text": {"config": text_cfg}}
     for flag, comp, arc in (("dflash2", "dflash2", "Qwen3_8DFlash2"),
@@ -734,10 +1057,12 @@ def main() -> int:
 
     if args.verify:
         bad = checked = skipped = 0
-        # Objects the writer transformed (bf16 casts, conv transpose) do not round-trip to a simple
-        # byte copy of the source, and their on-disk bytes are produced by that transform; the
-        # sampler reports them separately instead of pretending the copy check covers them.
-        plain = [o for o in objs if not (o.transpose or o.f32_to_bf16 or o.f16_to_bf16)]
+        # Objects the writer transformed (bf16 casts, conv transpose, folded norms) do not round-trip
+        # to a simple byte copy of the source, and their on-disk bytes are produced by that transform;
+        # the sampler reports them separately instead of pretending the copy check covers them.
+        plain = [o for o in objs if not (o.transpose or o.f32_to_bf16 or o.f16_to_bf16
+                                        or o.minus_one or o.row_map is not None
+                                        or o.blob is not None)]
         skipped = len(objs) - len(plain)
         # The merged parents (gdn control, ple key|value, hc down|inject) are the objects this tool
         # authors rather than copies, so every one of them is checked, not just the periodic sample:
@@ -769,7 +1094,44 @@ def main() -> int:
             if h.hexdigest() != obj.sha256:
                 bad += 1
                 print(f"  MISMATCH {obj.id}", file=sys.stderr)
-        print(f"verify: {checked} sampled objects, {bad} mismatched, {skipped} transformed objects not sampled")
+        # The folded gammas are the only objects whose value is rewritten rather than copied, so
+        # every one of them is recomputed from its source and compared with the volume. A gain that
+        # keeps its `1 +` is invisible in the shapes and fatal to every layer that consumes it.
+        folded = [o for o in objs if o.minus_one]
+        for obj in folded:
+            src_len = obj.shape[0] * obj.src_elem
+            with open(obj.src.path, "rb", buffering=0) as sf:
+                sf.seek(obj.src_offset)
+                raw = sf.read(src_len)
+            expected = bf16_round(decode_float(raw, obj.src_type) - 1.0)
+            vol, base = placement[obj.id]
+            start = payload_start if vol == 0 else ENTRY_ALIGN
+            with open(part_paths[vol], "rb") as f:
+                f.seek(start + (obj.offset - base))
+                got = f.read(len(expected))
+            checked += 1
+            if got != expected:
+                bad += 1
+                print(f"  MISMATCH {obj.id} (folded norm)", file=sys.stderr)
+        # The GDN tiling rows are recomputed from the source and compared with the volume: the
+        # permutation is invisible in the shapes and fatal to every linear-attention layer, so it gets
+        # a content check, not just the placement the sampler checks.
+        tiled = [o for o in objs if o.row_map is not None]
+        for obj in tiled:
+            expected = permuted_rows(obj)
+            vol, base = placement[obj.id]
+            start = payload_start if vol == 0 else ENTRY_ALIGN
+            with open(part_paths[vol], "rb") as f:
+                f.seek(start + (obj.offset - base))
+                got = f.read(len(expected))
+            checked += 1
+            if got != expected:
+                bad += 1
+                print(f"  MISMATCH {obj.id} (row permutation)", file=sys.stderr)
+        authored = len([o for o in objs if o.blob is not None])
+        print(f"verify: {checked} sampled objects ({len(folded)} folded norms, {len(tiled)} row "
+              f"permutations), {bad} mismatched, {skipped} transformed objects not sampled "
+              f"({authored} authored payloads)")
         return 1 if bad else 0
     return 0
 
