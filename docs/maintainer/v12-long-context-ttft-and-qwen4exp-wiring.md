@@ -602,3 +602,28 @@ dflash2 的对象，或确认 context_key/context_value 是否与 key/value 共�
 这不是量化格式问题，而是**非量化参数的精度约定**：GGUF 把 norm 存成 F32，ninfer 的数学要求 BF16。
 两条路：转换器对这类 norm 做 F32→BF16（元素级转换，不是重新量化），或让 binder 接受 F32 norm。
 下一位接手时应先确认 `final_correction` 是否允许 F32，再决定是转换还是放宽。
+
+**2026-11-26 结构问题清零，进入解码层**：本轮连续解决了 7 个问题，错误链从「未知格式」走到
+「需要解码器」：
+
+1. `weight_view.cpp` 加 `GgmlBlock` 分支（12 种块的 block/type_bytes 表）；
+2. `uses` 表从同模型工件复制（1262 条），并按实际组件过滤；
+3. 合并张量 binding 名补层族前缀（`gdn/query` / `attention/query`）；
+4. PLE 层映射与 dflash2 顶层/层内映射；
+5. dflash2 的 `context_key`/`context_value` 是 `key`/`value` 的**别名**（参考工件里 range 完全相同）；
+6. norm 向量与 conv1d 内核 F32→BF16（`rmsnorm/operands.cpp:38` 与 `causal_conv1d` 明确只收
+   BF16，这是 kernel 既有约束，不是本次新增）；`shared_score` 补成 `[1,N]`；`conv1d` 转置成
+   `[kernel, channels]`；PLE 表绑到 `text/layers/1/ple/table`；
+7. 现在停在：`PLE requires a supported encoding with width 160` —— 这是**第一个真正的解码需求**，
+   不是结构问题。
+
+**剩余工作（按依赖顺序）**：
+
+1. PLE 表：`ple/table.cpp` 只认 `q4_g64_fp16/row_split_k128_v1`，需要接受 `ggml_iq4_nl`
+   （block 32 / 18 字节，26.82 GB 流式读取，不能整表展开）；
+2. 权重解码：`ggml_*` 各类型在 matmul 侧的反量化（IQ3_S 3.4375 bpw、IQ3_XXS 3.0625、IQ4_XS 4.25、
+   Q4_K 4.5、Q5_K 5.5、Q6_K 6.5625、IQ2_* 2.06–2.56、Q2_0 2.25、IQ4_NL 4.5）；
+3. 统一在 sm_89 + CUDA 13.4 下实现（`__nv_bfloat16`、DP4A、`__ldg`），host 参考实现先行对齐数值。
+
+注意：验证里仍有 1 个抽样对象 hash 不匹配（`verify: 25 sampled, 1 mismatched`），需要单独查
+（很可能是 conv1d 转置后 write 与 verify 的 offset 计算不一致），不影响加载但必须修掉。

@@ -29,6 +29,8 @@ import os
 import struct
 import sys
 import uuid
+
+import numpy as np
 from dataclasses import dataclass, field
 
 GGUF_PY = r"H:\TeleAgentWorks\.temp\repos\llama-latest\gguf-py"
@@ -62,6 +64,15 @@ class Obj:
     bytes: int
     offset: int = 0
     sha256: str = ""
+    # Rank-1 F32 norms become bf16 on the way in: GGUF stores them F32, while the model's math asks
+    # for bf16 (binder exact_format). This is a precision cast of a non-quantised vector, not a
+    # requantisation, and it keeps the norm vectors in the representation the kernels expect.
+    f32_to_bf16: bool = False
+    # GGUF stores a conv1d kernel as [channels, kernel] (kernel values contiguous), while the model
+    # wants [kernel, channels] in C order, so the element order has to be transposed on the way in.
+    transpose: bool = False
+    # F16 -> BF16: same two-byte width, but the model's conv kernels are bf16 operands.
+    f16_to_bf16: bool = False
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -116,9 +127,33 @@ def collect(source: Source, component: str) -> list:
     for t in source.reader.tensors:
         shape_c = [int(x) for x in reversed(list(t.shape))]  # GGML ne is column-major
         fmt, layout = describe_format(t.tensor_type)
+        n_bytes = int(t.n_bytes)
+        # Only norm vectors and conv1d kernels are cast: both are bf16 operands in the model
+        # (rmsnorm / causal_conv1d accept BF16 only). Other rank-1 F32 vectors (gdn a_log, dt_bias)
+        # are fp32 by contract and stay as they are.
+        cast = fmt == "fp32" and ((len(shape_c) == 1 and "norm" in t.name)
+                                  or t.name.endswith("conv1d.weight"))
+        if cast:
+            elements = 1
+            for d in shape_c:
+                elements *= d
+            fmt, layout, n_bytes = "bf16", "contiguous_le_v1", elements * 2
+        f16_cast = fmt == "ggml_f16"
+        if f16_cast:
+            fmt, layout = "bf16", "contiguous_le_v1"
+        transpose = False
+        if (t.name.endswith("conv1d.weight") and len(shape_c) == 2
+                and shape_c[0] > shape_c[1] and 1 < shape_c[1] <= 8):
+            # GGUF conv1d is [channels, kernel]; the model wants [kernel, channels].
+            shape_c = [shape_c[1], shape_c[0]]
+            transpose = True
+        if t.name.endswith("ffn_gate_inp_shexp.weight") and len(shape_c) == 1:
+            # The gate vector is a one-row matrix in the model's parameter shape.
+            shape_c = [1, shape_c[0]]
         objs.append(Obj(id=f"{component}.{t.name}", kind="tensor", shape=shape_c,
-                        fmt=fmt, layout=layout,
-                        src=source, src_offset=int(t.data_offset), bytes=int(t.n_bytes)))
+                        fmt=fmt, layout=layout, f32_to_bf16=cast, transpose=transpose,
+                        f16_to_bf16=f16_cast,
+                        src=source, src_offset=int(t.data_offset), bytes=n_bytes))
     return objs
 
 
@@ -227,9 +262,43 @@ def write_shard(path: str, shard: list, base: int, final_size: int, index: int,
                 f.write(b"\x00" * (local - written))
                 written = local
             h = hashlib.sha256()
-            copy_range(obj.src, obj.src_offset, obj.bytes, f, h)
+            if obj.f32_to_bf16:
+                src_len = obj.shape[0] * 4
+                with open(obj.src.path, "rb", buffering=0) as sf:
+                    sf.seek(obj.src_offset)
+                    raw = sf.read(src_len)
+                if len(raw) != src_len:
+                    raise IOError(f"short read for {obj.id}")
+                # bf16 is the top half of the fp32 word (round-to-nearest-even on the tie bit).
+                u32 = np.frombuffer(raw, dtype=np.uint32).astype(np.uint64)
+                bf = ((u32 + 0x7FFF + ((u32 >> 16) & 1)) >> 16).astype(np.uint16).tobytes()
+                f.write(bf)
+                h.update(bf)
+                written += len(bf)
+            elif obj.transpose:
+                rows, cols = obj.shape          # target [kernel, channels]
+                src_elem = 4 if obj.f32_to_bf16 else (obj.bytes // (rows * cols))
+                src_bytes = rows * cols * src_elem
+                with open(obj.src.path, "rb", buffering=0) as sf:
+                    sf.seek(obj.src_offset)
+                    raw = sf.read(src_bytes)
+                if len(raw) != src_bytes:
+                    raise IOError(f"short read for {obj.id}")
+                src = np.frombuffer(raw, dtype={2: np.uint16, 4: np.uint32}[src_elem])
+                arr = src.reshape(cols, rows).T
+                if obj.f32_to_bf16 or obj.f16_to_bf16:
+                    f32 = (arr.view(np.float32) if src_elem == 4
+                           else arr.view(np.float16).astype(np.float32))
+                    u32 = f32.view(np.uint32).astype(np.uint64)
+                    arr = ((u32 + 0x7FFF + ((u32 >> 16) & 1)) >> 16).astype(np.uint16)
+                data = arr.tobytes()
+                f.write(data)
+                h.update(data)
+                written += len(data)
+            else:
+                copy_range(obj.src, obj.src_offset, obj.bytes, f, h)
+                written += obj.bytes
             obj.sha256 = h.hexdigest()
-            written += obj.bytes
         # The volume's declared payload covers the trailing alignment gap, and the reader checks the
         # file length against it, so the tail must be written out.
         if written < final_size:
@@ -437,7 +506,7 @@ def expand_dflash(objs: list, component: str) -> tuple:
     return objs, bindings
 
 
-def expand_text(objs: list, layer_types: list) -> tuple:
+def expand_text(objs: list, layer_types: list, ple_layer_id: int = 1) -> tuple:
     """Cut merged tensors and return (objects, bindings) for the text component.
 
     A merged GGUF tensor becomes one object per logical parameter, so the bindings are plain
@@ -479,7 +548,8 @@ def expand_text(objs: list, layer_types: list) -> tuple:
         elif name.startswith("output_hc_"):
             bindings["text/final_hc/" + name[len("output_hc_"):].split(".")[0]] = {"object": obj.id}
         elif name.startswith("per_layer_token_embd"):
-            bindings["text/ple/table"] = {"object": obj.id}
+            # The PLE table belongs to the layer the config names as carrying it (layer 1 here).
+            bindings[f"text/layers/{ple_layer_id}/ple/table"] = {"object": obj.id}
     return out, bindings
 
 
@@ -513,7 +583,8 @@ def main() -> int:
         text_cfg = load_component_config(args.config_from)
     else:
         text_cfg = text_config(read_metadata(source(args.text[0])))
-    text_objs, bindings = expand_text(text_objs, text_cfg.get("layer_types", []))
+    text_objs, bindings = expand_text(text_objs, text_cfg.get("layer_types", []),
+                                      int((text_cfg.get("ple") or {}).get("layer_ids", [1])[0]))
     objs = list(text_objs)
     components = {"text": {"config": text_cfg}}
     for flag, comp, arc in (("dflash2", "dflash2", "Qwen3_8DFlash2"),
@@ -616,5 +687,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
