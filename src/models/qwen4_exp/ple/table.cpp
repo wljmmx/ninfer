@@ -30,6 +30,37 @@ std::uint64_t paged_row_offset(const WeightGeometry& geometry, std::uint64_t row
                        (row % geometry.rows_per_page) * geometry.row_bytes, "PLE row offset");
 }
 
+// IEEE binary16 -> binary32, for the IQ4_NL block scale. Written out rather than included, so the
+// host reference decoder stays independent of any CUDA header.
+float half_to_float(std::uint16_t h) noexcept {
+    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
+    const std::uint32_t exp  = (h >> 10) & 0x1Fu;
+    const std::uint32_t mant = h & 0x3FFu;
+    std::uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            int shift = 0;
+            std::uint32_t m = mant;
+            while ((m & 0x400u) == 0) { m <<= 1; ++shift; }
+            bits = sign | (static_cast<std::uint32_t>(127 - 15 - shift) << 23) |
+                   ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    return std::bit_cast<float>(bits);
+}
+
+std::uint16_t float_to_bf16(float value) noexcept {
+    const std::uint32_t u = std::bit_cast<std::uint32_t>(value);
+    const std::uint64_t wide = u;
+    return static_cast<std::uint16_t>((wide + 0x7FFF + ((wide >> 16) & 1)) >> 16);
+}
+
 // The encoding a shard's declared geometry names. One table is one encoding: the reader decodes
 // every row of every shard the same way, so a mixed table is refused here instead of half-decoded.
 PleRowEncoding row_encoding(const WeightGeometry& geometry) {
@@ -37,6 +68,8 @@ PleRowEncoding row_encoding(const WeightGeometry& geometry) {
         return PleRowEncoding::Nf4PagedG16;
     if (geometry.format == QType::Q4_G64_FP16 && geometry.layout == QuantLayout::RowSplit)
         return PleRowEncoding::Q4G64RowSplit;
+    if (geometry.format == QType::GGML_IQ4_NL && geometry.layout == QuantLayout::GgmlBlock)
+        return PleRowEncoding::Iq4Nl;
     throw artifact::ArtifactError(
         "PLE table: the declared encoding is neither nf4_g16_e4m3fn/row_paged_g16_4k_v1 nor "
         "q4_g64_fp16/row_split_k128_v1");
@@ -62,6 +95,30 @@ void decode_ple_row(const PleRowSource& source, std::span<const std::byte> encod
         if (source.parts != 2 || encoded.size() < code_bytes)
             throw std::logic_error("PLE row: q4 row is not a code plane followed by its scales");
         ops::q4::decode_q4_g64_row(encoded.first(code_bytes), encoded.subspan(code_bytes), output);
+        return;
+    }
+    case PleRowEncoding::Iq4Nl: {
+        // Upstream GGML IQ4_NL: 18-byte blocks of [binary16 d][16 bytes of nibble pairs], values
+        // drawn from a fixed non-linear codebook. The low nibble of each byte is lane i and the high
+        // nibble is lane i + 16, which is the order llama.cpp's dequantiser uses.
+        static constexpr float kCodebook[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+               1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f};
+        const std::size_t blocks = output.size() / 32;
+        if (encoded.size() < blocks * 18)
+            throw std::logic_error("PLE row: short IQ4_NL row");
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::byte* block = encoded.data() + b * 18;
+            const auto d_bits = static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(block[0])) |
+                                (static_cast<std::uint16_t>(
+                                     std::to_integer<std::uint8_t>(block[1])) << 8);
+            const float d = half_to_float(d_bits);
+            for (std::size_t i = 0; i < 16; ++i) {
+                const auto pair = std::to_integer<std::uint8_t>(block[2 + i]);
+                output[b * 32 + i]      = float_to_bf16(d * kCodebook[pair & 0x0Fu]);
+                output[b * 32 + i + 16] = float_to_bf16(d * kCodebook[pair >> 4]);
+            }
+        }
         return;
     }
     }
@@ -125,6 +182,12 @@ PleTableSource::PleTableSource(const artifact::Reader& reader,
                 lut = make_nf4_bf16_lut(divisor);
             } catch (const std::invalid_argument& e) {
                 throw ArtifactError(reader.directory().tensor(object).id + ": " + e.what());
+            }
+        } else if (encoding == PleRowEncoding::Iq4Nl) {
+            // GGML blocks carry their scale inside the block, so there is no separate scale plane.
+            if (g.code_bytes_per_row != 90 || g.scale_bytes_per_row != 0) {
+                throw ArtifactError(reader.directory().tensor(object).id +
+                                    ": IQ4_NL PLE rows are not 90-byte blocks");
             }
         } else if (g.code_bytes_per_row != 128 || g.scale_bytes_per_row != 8 ||
                    g.group_size != 64) {

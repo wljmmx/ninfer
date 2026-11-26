@@ -649,3 +649,29 @@ dflash2 的对象，或确认 context_key/context_value 是否与 key/value 共�
 
 下一步实现顺序：`IQ4_NL`（PLE 表 26.82 GB，最先卡住）→ `IQ3_S`/`IQ5_K`/`Q6_K` 等主权重 →
 `IQ3_XXS`/`IQ2_*`/`Q2_0`。每类先写 host 参考解码对齐数值，再写 sm_89 device kernel。
+
+**2026-11-26 IQ4_NL 解码落地，PLE 表通过，权重开始加载**：
+
+`ple/table.h` 新增 `PleRowEncoding::Iq4Nl` 并纳入 `supported_ple_table`
+（`GGML_IQ4_NL` + `ggml_block_v1`，width 160）；`table.cpp` 新增
+- `row_encoding()` 分支与 `code_bytes_per_row == 90 / scale_bytes_per_row == 0` 的行几何校验；
+- IQ4_NL 的 host 参考解码：18 字节块 = 1 个 binary16 `d` + 16 字节 nibble 对，
+  低 nibble 是 lane i、高 nibble 是 lane i+16，查 16 项非线性码本
+  （-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113）；
+- 自带的 `half_to_float` / `float_to_bf16`，不引入 CUDA 头，保持 host 参考实现独立。
+
+加载链因此再前进两层：
+
+```
+[budget] resident weights need 43.8 GiB of Device memory, 22.5 GiB is free
+         streaming the routed experts keeps 3.8 GiB resident
+loading weights | 3.83 GiB | 729 ms | 5.25 GiB/s
+error: text/layers/0/moe/experts/0/gate: gate bank is not a 2560-column matrix
+```
+
+即 **PLE 表（26.82 GB，冷区流式）已经可读**，正常权重也在加载；现在缺的是**专家银行的按行切分**：
+GGUF 的 `ffn_gate_exps` 是 3D `[512, 640, 2560]`，而 binder 通过 `banked` 把它切成每个专家一个
+`[640,2560]` 矩阵。现有工件正是用 `banked` + 行偏移实现的，新容器需要提供同样的行切分
+（`first_row/rows`），或者把 3D 对象拆成 512 个 2D 对象。
+
+三层结构保持不变：专家银行仍然是**一个对象 + 行区间**，由 `ExpertCache` 按驻留策略取用。

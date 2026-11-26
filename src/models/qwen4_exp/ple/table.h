@@ -26,6 +26,10 @@ enum class PleRowEncoding : std::uint8_t {
     Nf4PagedG16,
     // q4_g64_fp16 in row_split_k128_v1: signed nibbles against one binary16 scale per 64 lanes.
     Q4G64RowSplit,
+    // GGML IQ4_NL blocks carried verbatim: 32-wide blocks of one binary16 scale plus sixteen
+    // nibble pairs indexed into the 16-entry non-linear codebook. 160 lanes = 5 blocks = 90 bytes,
+    // so a row keeps the same width as the NF4 page format.
+    Iq4Nl,
 };
 
 // The encodings `PleTableSource` serves, so the loader's refusal and the reader cannot drift apart.
@@ -33,7 +37,8 @@ enum class PleRowEncoding : std::uint8_t {
                                                  std::uint64_t width) noexcept {
     if (width != kPleRowElements) return false;
     return (format == QType::NF4_G16_E4M3FN && layout == QuantLayout::RowPagedG16_4K) ||
-           (format == QType::Q4_G64_FP16 && layout == QuantLayout::RowSplit);
+           (format == QType::Q4_G64_FP16 && layout == QuantLayout::RowSplit) ||
+           (format == QType::GGML_IQ4_NL && layout == QuantLayout::GgmlBlock);
 }
 
 struct PleHashControls {
