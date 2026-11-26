@@ -152,8 +152,8 @@ int main() {
         std::vector<float> coefficients(std::size_t(kTopK) * kTokens);
         for (int t = 0; t < kTokens; ++t) {
             for (int r = 0; r < kTopK; ++r) {
-                ids[std::size_t(r) * kTokens + t]          = (t * 2 + r * 3) % kExperts;
-                coefficients[std::size_t(r) * kTokens + t] = 0.75f / float(r + 1);
+                ids[std::size_t(t) * kTopK + r] = (t * 2 + r * 3) % kExperts;
+                coefficients[std::size_t(t) * kTopK + r] = 0.75f / float(r + 1);
             }
         }
 
@@ -163,7 +163,7 @@ int main() {
         for (int t = 0; t < kTokens; ++t) {
             std::vector<float> products(std::size_t(kTopK) * kInter, 0.0f);
             for (int r = 0; r < kTopK; ++r) {
-                const int expert = ids[std::size_t(r) * kTokens + t];
+                const int expert = ids[std::size_t(t) * kTopK + r];
                 for (int i = 0; i < kInter; ++i) {
                     const int row_index = expert * kInter + i;
                     const int gate_offset =
@@ -193,7 +193,7 @@ int main() {
             for (int drow = 0; drow < kHidden; ++drow) {
                 double acc = 0.0;
                 for (int r = 0; r < kTopK; ++r) {
-                    const int expert    = ids[std::size_t(r) * kTokens + t];
+                    const int expert    = ids[std::size_t(t) * kTopK + r];
                     const int row_index = expert * kHidden + drow;
                     const int offset =
                         row_index * (kInter / int(test.down.block) * int(test.down.type_bytes));
@@ -207,7 +207,7 @@ int main() {
                         dot += double(w[std::size_t(i)]) *
                                double(products[std::size_t(r) * kInter + i]);
                     }
-                    acc += double(coefficients[std::size_t(r) * kTokens + t]) * dot;
+                    acc += double(coefficients[std::size_t(t) * kTopK + r]) * dot;
                 }
                 expected[std::size_t(t) * kHidden + drow] = acc;
             }
@@ -247,7 +247,23 @@ int main() {
         const auto gate_weight = make_weight(gate_on_device, test.gate.format, gate_rows, kHidden);
         const auto up_weight   = make_weight(up_on_device, test.up.format, gate_rows, kHidden);
         const auto down_weight = make_weight(down_on_device, test.down.format, down_rows, kInter);
-        const ninfer::ops::detail::ggml::ExpertBanks banks{&gate_weight, &up_weight, &down_weight};
+        // The test's banks are one dense run of experts, so the view's per-expert stride is that
+        // run's encoded width; `bank_from` derives the row width from K and the encoding.
+        const auto bank_view = [](const ninfer::Weight& weight, int per_expert_rows, int row_bytes) {
+            ninfer::ExpertMatrixDeviceView view{};
+            view.codes       = static_cast<const std::byte*>(weight.qdata);
+            view.code_stride = std::uint64_t(per_expert_rows) * std::uint64_t(row_bytes);
+            return view;
+        };
+        const int gate_row_bytes = kHidden / int(test.gate.block) * int(test.gate.type_bytes);
+        const int inter_row_bytes = kInter / int(test.down.block) * int(test.down.type_bytes);
+        const ninfer::ops::detail::ggml::ExpertBanks banks{
+            ninfer::ops::detail::ggml::bank_from(
+                bank_view(gate_weight, kInter, gate_row_bytes), kHidden, test.gate.format),
+            ninfer::ops::detail::ggml::bank_from(
+                bank_view(up_weight, kInter, gate_row_bytes), kHidden, test.up.format),
+            ninfer::ops::detail::ggml::bank_from(
+                bank_view(down_weight, kHidden, inter_row_bytes), kInter, test.down.format)};
 
         ninfer::Tensor x{};
         x.data  = x_on_device.p;
@@ -281,10 +297,14 @@ int main() {
         out.nb[0] = 2;
         out.nb[1] = std::int64_t(kHidden) * 2;
 
-        ninfer::DeviceArena workspace(
+        ninfer::DeviceBuffer scratch_buffer(
             ninfer::ops::detail::ggml::routed_swiglu_workspace_bytes(kTopK, kInter) + 512);
-        ninfer::ops::detail::ggml::launch_routed_swiglu(x, banks, kExperts, kTopK, id_tensor,
-                                                        coef_tensor, out, workspace, stream);
+        ninfer::MemoryArena workspace(
+            ninfer::MemorySpan{scratch_buffer.p, scratch_buffer.bytes, ninfer::Device::cuda(0)});
+        const ninfer::ops::ExpertSubset subset{};  // All: every routed expert participates
+        ninfer::ops::detail::ggml::launch_routed_swiglu(
+            x, banks, kHidden, kInter, kExperts, kTopK, subset, ninfer::ops::MoeEpilogue::Write,
+            id_tensor, coef_tensor, nullptr, out, workspace, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::vector<std::uint16_t> got(std::size_t(kHidden) * kTokens, 0);

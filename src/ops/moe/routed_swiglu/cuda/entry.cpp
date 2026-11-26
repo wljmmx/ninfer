@@ -125,39 +125,40 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         auto scope         = scratch.scope();
         const auto plan    = shape.select(count, shared != nullptr);
         const bool ggml    = plan.implementation == kernel::ExpertImplementation::GgmlBlock;
-        const auto buffers = allocate(scratch, plan, count, subset.kind, shared != nullptr,
-                                      profile.ffn.gate_up_type == QType::Q8_G32_FP16,
-                                      ggml ? kernel::ShapeKind::H2560
-                                           : kernel::shape_kind(profile));
         if (ggml) {
-            // The GGML expert core (ops/moe/ggml/ggml_experts.cu) is verified against a host
-            // reference but is not wired to the router, the subset masks or the shared term yet.
-            // Saying which of those is missing is the whole point of this arm: the alternative is
-            // falling into the groupwise-int path with a plan that has no integer shape.
+            // Handled before `allocate()`: that helper's ggml arm exists to PRICE the scratch during
+            // planning, and calling it here would hand the same byte range out twice.
             if (missed != nullptr) {
                 throw std::invalid_argument(
                     "routed_swiglu: missed_routes is not implemented for the GGML expert path");
             }
             if (term) {
                 throw std::invalid_argument(
-                    "routed_swiglu: the GGML expert path does not carry the shared-expert term yet "
-                    "(the converter has to fuse ffn_gate_shexp|ffn_up_shexp into one [2I,H] parent, "
-                    "and the dense SwiGLU needs its own GGML arm)");
+                    "routed_swiglu: the GGML expert path does not carry the shared-expert term yet");
             }
-            if (subset.kind != ExpertSubsetKind::All) {
+            if (experts.gate.codes == nullptr || experts.up.codes == nullptr ||
+                experts.bank.down.codes == nullptr) {
                 throw std::invalid_argument(
-                    "routed_swiglu: the GGML expert path implements the full expert set only; the "
-                    "masked subsets are not wired yet");
+                    "routed_swiglu: the GGML expert path needs the split gate/up views");
             }
-            // Reached only for the full expert set with no shared term: the verified core exists
-            // (ops/moe/ggml/ggml_experts.cu) but the device bank views still have to be turned into
-            // its per-row addressing, which is the next step. Refusing here keeps the failure named
-            // instead of running the groupwise-int kernels on a plan that has no integer shape.
-            throw std::invalid_argument(
-                "routed_swiglu: the GGML expert path is planned and priced, but its bank views are "
-                "not converted into the core's row addressing yet");
+            const auto& routed = profile.ffn;
+            detail::ggml::ExpertBanks banks{
+                detail::ggml::bank_from(experts.gate, routed.hidden, routed.gate_up_type),
+                detail::ggml::bank_from(experts.up, routed.hidden, routed.gate_up_type),
+                detail::ggml::bank_from(experts.bank.down, routed.intermediate, routed.down_type)};
+            try {
+                detail::ggml::launch_routed_swiglu(input, banks, routed.hidden, routed.intermediate,
+                                                   profile.experts, profile.top_k, subset, mode,
+                                                   selection.ids, selection.coefficients, nullptr,
+                                                   output, scratch, execution.stream);
+            } catch (const std::bad_alloc&) {
+                throw std::runtime_error("routed_swiglu: the GGML expert branch ran out of memory");
+            }
             continue;
         }
+        const auto buffers = allocate(scratch, plan, count, subset.kind, shared != nullptr,
+                                      profile.ffn.gate_up_type == QType::Q8_G32_FP16,
+                                      kernel::shape_kind(profile));
         if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
             // The block-scaled kernels skip a masked-out route without counting it. Reporting a zero
             // there would be worse than refusing: a predicted skip would read "no miss" from a path
